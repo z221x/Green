@@ -1,0 +1,9 @@
+# Local reference checkout supplied for research; source is not part of Green.
+tmp/
+
+# Build outputs
+build/
+*.o
+*.kpm
+
+compile_commands.json

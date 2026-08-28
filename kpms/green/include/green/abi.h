@@ -1,0 +1,12 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#ifndef _GREEN_ABI_H_
+#define _GREEN_ABI_H_
+
+#define PR_GREEN_SHADOW_BASE      0x47524800UL /* "GRH" */
+#define PR_GREEN_SHADOW_PATCH     (PR_GREEN_SHADOW_BASE + 1)
+#define PR_GREEN_SHADOW_RELEASE   (PR_GREEN_SHADOW_BASE + 2)
+#define PR_GREEN_SHADOW_COUNT     (PR_GREEN_SHADOW_BASE + 3)
+
+#define GREEN_SHADOW_MAX_PATCH_LEN 4096UL
+
+#endif /* _GREEN_ABI_H_ */
