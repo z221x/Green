@@ -6,7 +6,6 @@
 #define GREEN_ESR_EC(esr) (((esr) >> GREEN_ESR_EC_SHIFT) & 0x3f)
 #define GREEN_ESR_EC_IABT_LOW 0x20
 #define GREEN_ESR_EC_DABT_LOW 0x24
-#define GREEN_ESR_EC_DABT_CUR 0x25
 #define GREEN_ESR_FSC(esr) ((esr) & 0x3f)
 #define GREEN_ESR_WNR (1U << 6)
 #define GREEN_ESR_S1PTW (1U << 7)
@@ -17,39 +16,6 @@
 #define GREEN_FAULT_EXEC  1
 #define GREEN_FAULT_READ  2
 #define GREEN_FAULT_WRITE 3
-
-/*
- * No-progress guard: if the exact same (pc, far) pair keeps faulting, the
- * emulation is not advancing and the thread would spin forever.  After
- * GREEN_SHADOW_REPEAT_LIMIT identical faults the shadow page is released
- * (fail-open): the hook is dropped for that page and the process unwedges
- * (usually by taking a real SIGSEGV) instead of burning a CPU.
- */
-#define GREEN_SHADOW_REPEAT_LIMIT 200000
-
-static void green_shadow_note_repeat(struct green_shadow_page *page,
-                                      unsigned long pc, unsigned long far)
-{
-    green_lock(&green_shadow_pages_busy);
-    if (pc == page->repeat_pc && far == page->repeat_far) {
-        page->repeat_count++;
-    } else {
-        page->repeat_pc = pc;
-        page->repeat_far = far;
-        page->repeat_count = 1;
-    }
-    green_unlock(&green_shadow_pages_busy);
-}
-
-static bool green_shadow_repeat_exceeded(struct green_shadow_page *page)
-{
-    bool exceeded;
-
-    green_lock(&green_shadow_pages_busy);
-    exceeded = page->repeat_count > GREEN_SHADOW_REPEAT_LIMIT;
-    green_unlock(&green_shadow_pages_busy);
-    return exceeded;
-}
 
 /*
  * SIMD load write-back: stores the loaded bytes into the low lanes of V
@@ -286,35 +252,8 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
         return;
 
     kind = green_shadow_fault_kind(esr);
-    if (kind == GREEN_FAULT_NONE) {
-        /* A kernel uaccess instruction (EC=0x25) can fault on the
-         * execute-only PTE.  Expose the original read-only page and retry
-         * the exact kernel instruction; the resulting bytes are the
-         * original bytes, never the shadow patch. */
-        if (GREEN_ESR_EC(esr) == GREEN_ESR_EC_DABT_CUR &&
-            (GREEN_ESR_FSC(esr) & 0x3c) == 0x0c &&
-            !(esr & GREEN_ESR_S1PTW) && !(esr & GREEN_ESR_WNR)) {
-            atomic_inc(&green_shadow_hooks_busy);
-            mm = green_k_get_task_mm(current);
-            if (mm) {
-                page = green_shadow_get_page(mm, far);
-                if (page) {
-                    ret = green_shadow_map_read(page);
-                    if (ret == 0) {
-                        args->ret = 0;
-                        args->skip_origin = 1;
-                    }
-                    green_shadow_put_page(page);
-                }
-                green_k_mmput(mm);
-            }
-            atomic_dec(&green_shadow_hooks_busy);
-        }
-
-        /* EL1-origin instruction/data aborts not handled above remain under
-         * the normal kernel fault path. */
+    if (kind == GREEN_FAULT_NONE)
         return;
-    }
 
     atomic_inc(&green_shadow_hooks_busy);
 
@@ -340,19 +279,17 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
             /* The instruction and data use the same VA/PTE.  Switching the
              * whole page to original would immediately cause an instruction
              * abort and replay this data abort forever. */
-            green_shadow_note_repeat(page, regs->pc, far);
-            if (green_shadow_repeat_exceeded(page)) {
-                pr_err("green_shadow: no-progress fault loop pc=%lx far=%lx, releasing shadow page va=%lx (fail-open)\n",
-                       regs->pc, far, page->va);
-                green_shadow_release_page(page, true);
-                green_k_mmput(mm);
-                atomic_dec(&green_shadow_hooks_busy);
-                return;
-            }
             ret = green_shadow_emulate_same_page(page, regs, far);
             if (ret == GREEN_EMU_OK) {
                 args->ret = 0;
                 args->skip_origin = 1;
+            } else {
+                pr_err("green_shadow: unsupported same-page instruction pc=%lx far=%lx ret=%d; releasing va=%lx\n",
+                       regs->pc, far, ret, page->va);
+                green_shadow_release_page(page, true);
+                green_k_mmput(mm);
+                atomic_dec(&green_shadow_hooks_busy);
+                return;
             }
         } else {
             ret = green_shadow_map_read(page);

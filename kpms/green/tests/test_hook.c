@@ -88,29 +88,6 @@ static __attribute__((noinline)) void direct_read(uint8_t *dst, const volatile u
         dst[i] = src[i];
 }
 
-/*
- * Kernel uaccess read: write() -> copy_from_user reads the page while it is
- * in the EXEC state.  On EPAN hardware PAN blocks this (EFAULT); without
- * EPAN the read succeeds and observes whatever the PTE maps — the leak the
- * hard requirement guards against.
- */
-static ssize_t uaccess_read(uint8_t *dst, const void *src, size_t len)
-{
-    int fds[2];
-    ssize_t n;
-
-    if (pipe(fds) != 0)
-        return -1;
-    n = write(fds[1], src, len);
-    if (n > 0) {
-        ssize_t got = read(fds[0], dst, (size_t)n);
-        (void)got;
-    }
-    close(fds[0]);
-    close(fds[1]);
-    return n;
-}
-
 static int failures;
 
 #define CHECK(cond, msg)                     \
@@ -187,32 +164,6 @@ int main(void)
         CHECK(bytes != NULL && memcmp(before, bytes, PATCH_LEN) == 0,
               "gum_memory_read() sees ORIGINAL bytes (GUP path)");
         g_free(bytes);
-    }
-
-    /* --- kernel uaccess read while in EXEC state ----------------------- */
-
-    value = target_fn(1); /* leave the page in the EXEC (execute-only) view */
-    (void)value;
-    {
-        ssize_t n = uaccess_read(during, target_fn, PATCH_LEN);
-
-        if (n < 0) {
-            printf("  info uaccess read faulted errno=%d (EPAN/PAN blocked)\n",
-                   errno);
-        } else {
-            printf("  info uaccess read got %zd bytes: ", n);
-            for (size_t i = 0; i < (size_t)n && i < PATCH_LEN; i++)
-                printf("%02x ", during[i]);
-            printf("\n         expected original: ");
-            for (size_t i = 0; i < PATCH_LEN; i++)
-                printf("%02x ", before[i]);
-            printf("\n");
-            if (memcmp(before, during, (size_t)n) == 0) {
-                printf("  info uaccess read sees ORIGINAL (no leak)\n");
-            } else {
-                printf("  LEAK uaccess read sees SHADOW bytes without EPAN\n");
-            }
-        }
     }
 
     /* --- restore --------------------------------------------------------- */

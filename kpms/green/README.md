@@ -170,9 +170,9 @@ green_shadow_release_task(pid, addr);
 
 ## 限制
 
-- **FEAT_EPAN（`ID_AA64MMFR1_EL1.PAN`=3，即 FEAT_PAN3）为推荐条件，非硬性**：实测（Cortex-A710，PAN=2）证明 AP[2:1]=10 + UXN=0 的 execute-only 视图在无 EPAN 硬件上 EL0 取指/跷跷板/模拟器均正常工作。EPAN 的作用是让 PAN 覆盖 exec-only 页，堵住 EL1 侧 uaccess 读（`write()`/`send()` 等系统调用会把 shadow 字节读出去）——无 EPAN 设备存在该泄露面，KPM 检测到缺失时打警告并继续上线。
+- **硬性条件：FEAT_EPAN 必须存在**（`ID_AA64MMFR1_EL1.PAN`=3，即 FEAT_PAN3；建议 Linux 5.13+ 且开启 `CONFIG_ARM64_EPAN`）。普通 EL1 uaccess 不被 Green 全局接管；只有 Green 内部需要读取 shadow 内容时，直接使用 `page->shadow_kva`，避免修改用户 PTE 和暴露读取窗口。缺少 EPAN 时 KPM 拒绝上线。
 - 当前只支持 ARM64 + 4K 用户页粒度。
-- `emu/` 第一版支持常见 GPR 标量 `LDR/STR`、`LDUR/STUR`、寄存器偏移、前/后索引、`LDRSB/LDRSH/LDRSW`、literal load，以及 `LDP/STP`；SIMD、exclusive、跨页访问暂不模拟。
+- `emu/` 支持常见 GPR 标量 `LDR/STR`、`LDUR/STUR`、寄存器偏移、前/后索引、`LDRSB/LDRSH/LDRSW`、literal load、`LDP/STP`，以及 SIMD/FP `LDR B/H/S/D/Q`、literal load、`LDP S/D/Q`；exclusive、跨页访问暂不模拟。
 - `patch` 不能跨目标页。
 - 当前拒绝 ARM64 contiguous PTE 页面。
 - 直接修改目标进程页表；测试前请保证设备可恢复。
