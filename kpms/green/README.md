@@ -23,12 +23,17 @@ kpms/green/
 │   ├── shadow.c             # shadow 工具生命周期、prctl ABI、页对象管理
 │   ├── shadow_pgtable.c     # 页表切换、TLB/cache 维护
 │   └── shadow_fault.c       # page fault / GUP / exit_mmap 处理与同页模拟
-├── hook/                    # green_hook：gum 源码级接入
+├── green_hook/              # green_hook：gum 源码级接入
 │   ├── IO_MAP.md            # gum 内存 I/O 与调用点梳理、替换映射
 │   ├── gummemory-green.c    # gum 内存后端：hook 读写走 shadow
 │   ├── green_gum.h          # green 扩展（release）声明
 │   ├── vendor/gum/          # frida-gum 源码（逐字未改）：GumArm64Writer 等
 │   └── shim/                # glib/capstone 最小垫片（仅外部依赖）
+├── agent/
+│   ├── green_agent.c        # 注入目标进程后的代理与工具分发 socket
+│   ├── green_agent_ctl.c    # root 侧 AArch64 ptrace/dlopen 注入器与客户端
+│   ├── green_agent.h        # 可扩展 agent 协议和工具注册接口
+│   └── README.md            # 注入、协议和扩展说明
 ├── common/
 │   ├── common.c             # CLI 公共解析、solist、prctl、process_vm helpers
 │   └── symbol.c             # KPM 内核符号提取与地址解析
@@ -51,7 +56,7 @@ Green 的 shadow 工具重新实现了一个 patch-oriented 的 R^X / W^X shadow
 - 代码和数据位于同一页时，使用 `emu/` 中的单指令 ARM64 模拟器从 original page 读取数据并推进 `pt_regs->pc`，避免整页切换造成 fault 循环。
 - hook `follow_page_pte` 时临时暴露 original PTE，覆盖 `/proc/pid/mem`、`process_vm_readv`、`ptrace` 等 GUP 读取路径。
 - hook `exit_mmap` 自动释放进程退出时遗留的 shadow 页。
-- 控制入口是 `prctl`，只允许 root uid 调用。
+- 控制入口是 `prctl`；普通 root 客户端可直接控制，注入 agent 的目标 mm 需先由 root 侧显式启用 agent 权限。
 
 内核符号统一由 `common/symbol.c` 提取和解析，地址变量及公共声明集中在 `include/green/symbol.h`；其他 KPM 工具只通过该头文件使用已解析地址。
 
@@ -68,6 +73,7 @@ cd kpms/green
 make TARGET_COMPILE=aarch64-elf-
 make client
 make testhook
+make agent
 ```
 
 所有构建产物统一输出到 `build/`：
@@ -77,6 +83,8 @@ build/
 ├── green.kpm              # KPM
 ├── green                  # Android ARM64 CLI
 ├── test_hook              # green_hook 端到端用例（需 root + 已加载 KPM）
+├── libgreen_agent.so      # 注入目标进程的 agent payload
+├── green_agent_ctl        # root 侧注入器与 agent 客户端
 └── *.o                    # KPM 中间目标文件
 ```
 
@@ -88,7 +96,7 @@ make TARGET_COMPILE=aarch64-elf- KP_DIR=/path/to/KernelPatch-0.13.3
 
 ## green_hook（gum 源码级接入）
 
-`hook/` 直接编译 frida-gum 源码（`hook/vendor/gum/`，未修改），hook 时的内存读写全部替换为 shadow 操作（详见 `hook/IO_MAP.md`）：
+`green_hook/` 直接编译 frida-gum 源码（`green_hook/vendor/gum/`，未修改），hook 时的内存读写全部替换为 shadow 操作（详见 `green_hook/IO_MAP.md`）：
 
 - `gum_memory_patch_code()`：gum via_remap 骨架，remap 对实现为快照/提交 —— apply 回调由真实 `GumArm64Writer` 发射重定向，提交时逐页 `prctl(PR_GREEN_SHADOW_PATCH)`；执行看到补丁，读取看到原始字节。
 - `gum_memory_read()`：仍走 `process_vm_readv`，GUP hook 返回原始页。
@@ -170,7 +178,6 @@ green_shadow_release_task(pid, addr);
 
 ## 限制
 
-- **FEAT_EPAN 非必需**：execute-only shadow 映射允许具备内核权限的代码按系统策略读取。Green 内部需要读取 shadow 内容时，直接使用 `page->shadow_kva`，不修改用户 PTE、不需要额外 uaccess hook；设备不具备 FEAT_EPAN 时 KPM 仍可正常上线。
 - 当前只支持 ARM64 + 4K 用户页粒度。
 - `emu/` 支持常见 GPR 标量 `LDR/STR`、`LDUR/STUR`、寄存器偏移、前/后索引、`LDRSB/LDRSH/LDRSW`、literal load、`LDP/STP`，以及 SIMD/FP `LDR B/H/S/D/Q`、literal load、`LDP S/D/Q`；exclusive、跨页访问暂不模拟。
 - `patch` 不能跨目标页。

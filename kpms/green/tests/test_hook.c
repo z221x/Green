@@ -4,7 +4,7 @@
  *
  * The hook redirect is emitted by the VENDORED frida-gum GumArm64Writer
  * (vendor/gum/arch-arm64/gumarm64writer.c) and committed through
- * gum_memory_patch_code() whose backend (hook/gummemory-green.c) writes via
+ * gum_memory_patch_code() whose backend (green_hook/gummemory-green.c) writes via
  * the green shadow pager — no mprotect, no hand-encoded instructions.
  *
  * Verifies gum hook-time semantics on a live RX page:

@@ -71,9 +71,9 @@ $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)
 TESTHOOK := $(BUILD_DIR)/test_hook
 
 # green_hook 用例：验证 patch 执行 / 读原始 / 恢复 三条 gum 语义。
-GUM_VENDOR_DIR := hook/vendor/gum
-GUM_SHIM_FLAGS := -Ihook/vendor -Ihook/vendor/gum -Ihook/shim
-GUM_SRCS := hook/gummemory-green.c \
+GUM_VENDOR_DIR := green_hook/vendor/gum
+GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
+GUM_SRCS := green_hook/gummemory-green.c \
             $(GUM_VENDOR_DIR)/gumlibc.c \
             $(GUM_VENDOR_DIR)/gummetalarray.c \
             $(GUM_VENDOR_DIR)/gummetalhash.c \
@@ -81,11 +81,38 @@ GUM_SRCS := hook/gummemory-green.c \
 
 testhook: $(TESTHOOK)
 
-$(TESTHOOK): tests/test_hook.c hook/green_gum.h $(GUM_SRCS) include/green/abi.h
+$(TESTHOOK): tests/test_hook.c green_hook/green_gum.h $(GUM_SRCS) include/green/abi.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -mbranch-protection=none \
-		-Iinclude $(GUM_SHIM_FLAGS) -Ihook -o $@ tests/test_hook.c $(GUM_SRCS)
+		-Iinclude $(GUM_SHIM_FLAGS) -Igreen_hook -o $@ tests/test_hook.c $(GUM_SRCS)
+
+.PHONY: agent
+AGENT_PAYLOAD := $(BUILD_DIR)/libgreen_agent.so
+AGENT_CTL := $(BUILD_DIR)/green_agent_ctl
+AGENT_GUM_VENDOR_DIR := green_hook/vendor/gum
+AGENT_GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
+AGENT_GUM_SRCS := green_hook/gummemory-green.c \
+                 $(AGENT_GUM_VENDOR_DIR)/gumlibc.c \
+                 $(AGENT_GUM_VENDOR_DIR)/gummetalarray.c \
+                 $(AGENT_GUM_VENDOR_DIR)/gummetalhash.c \
+                 $(AGENT_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
+
+agent: $(AGENT_PAYLOAD) $(AGENT_CTL)
+
+$(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h green_hook/green_gum.h \
+                 $(AGENT_GUM_SRCS) include/green/abi.h
+	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
+	mkdir -p $(dir $@)
+	$(ANDROID_CC) -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
+		-Iagent -Iinclude $(AGENT_GUM_SHIM_FLAGS) -Igreen_hook \
+		-o $@ agent/green_agent.c $(AGENT_GUM_SRCS) -pthread
+
+$(AGENT_CTL): agent/green_agent_ctl.c agent/green_agent.h include/green/abi.h
+	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
+	mkdir -p $(dir $@)
+	$(ANDROID_CC) -D_GNU_SOURCE -O2 -Wall -Wextra \
+		-Iagent -Iinclude -o $@ agent/green_agent_ctl.c -ldl
 
 .PHONY: clean
 clean:

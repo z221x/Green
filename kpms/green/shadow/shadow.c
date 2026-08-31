@@ -7,6 +7,7 @@
 #endif
 
 struct list_head green_shadow_pages = LIST_HEAD_INIT(green_shadow_pages);
+struct list_head green_shadow_agent_mms = LIST_HEAD_INIT(green_shadow_agent_mms);
 atomic_t green_shadow_pages_busy = ATOMIC_INIT(0);
 atomic_t green_shadow_hooks_busy = ATOMIC_INIT(0);
 int green_shadow_online;
@@ -308,6 +309,152 @@ void *green_shadow_mm_from_pid(pid_t pid)
     return mm;
 }
 
+int green_shadow_agent_allowed_current(void)
+{
+    struct list_head *pos;
+    void *mm;
+    int allowed = 0;
+
+    mm = green_k_get_task_mm(current);
+    if (!mm)
+        return 0;
+
+    green_lock(&green_shadow_pages_busy);
+    list_for_each(pos, &green_shadow_agent_mms) {
+        struct green_shadow_agent_mm *agent =
+            container_of(pos, struct green_shadow_agent_mm, node);
+        if (agent->mm == mm) {
+            allowed = 1;
+            break;
+        }
+    }
+    green_unlock(&green_shadow_pages_busy);
+    green_k_mmput(mm);
+    return allowed;
+}
+
+int green_shadow_agent_enable(pid_t pid)
+{
+    struct green_shadow_agent_mm *agent;
+    struct list_head *pos;
+    void *mm;
+    unsigned long meta;
+
+    if (pid <= 0)
+        return -EINVAL;
+    mm = green_shadow_mm_from_pid(pid);
+    if (!mm)
+        return -ESRCH;
+
+    green_lock(&green_shadow_pages_busy);
+    list_for_each(pos, &green_shadow_agent_mms) {
+        struct green_shadow_agent_mm *cur =
+            container_of(pos, struct green_shadow_agent_mm, node);
+        if (cur->mm == mm) {
+            green_unlock(&green_shadow_pages_busy);
+            green_k_mmput(mm);
+            return 0;
+        }
+    }
+    green_unlock(&green_shadow_pages_busy);
+
+    meta = green_k_get_free_pages(GREEN_GFP_KERNEL, 0);
+    if (!meta) {
+        green_k_mmput(mm);
+        return -ENOMEM;
+    }
+    memset((void *)meta, 0, GREEN_PAGE_SIZE);
+    agent = (struct green_shadow_agent_mm *)meta;
+    agent->mm = mm;
+    INIT_LIST_HEAD(&agent->node);
+
+    green_lock(&green_shadow_pages_busy);
+    list_for_each(pos, &green_shadow_agent_mms) {
+        struct green_shadow_agent_mm *cur =
+            container_of(pos, struct green_shadow_agent_mm, node);
+        if (cur->mm == mm) {
+            green_unlock(&green_shadow_pages_busy);
+            green_k_free_pages(meta, 0);
+            green_k_mmput(mm);
+            return 0;
+        }
+    }
+    list_add_tail(&agent->node, &green_shadow_agent_mms);
+    green_unlock(&green_shadow_pages_busy);
+    return 0;
+}
+
+int green_shadow_agent_disable(pid_t pid)
+{
+    struct list_head *pos;
+    void *mm;
+
+    if (pid <= 0)
+        return -EINVAL;
+    mm = green_shadow_mm_from_pid(pid);
+    if (!mm)
+        return -ESRCH;
+
+    green_lock(&green_shadow_pages_busy);
+    list_for_each(pos, &green_shadow_agent_mms) {
+        struct green_shadow_agent_mm *agent =
+            container_of(pos, struct green_shadow_agent_mm, node);
+        if (agent->mm == mm) {
+            list_del_init(&agent->node);
+            green_unlock(&green_shadow_pages_busy);
+            green_k_mmput(agent->mm);
+            green_k_free_pages((unsigned long)agent, 0);
+            green_k_mmput(mm);
+            return 0;
+        }
+    }
+    green_unlock(&green_shadow_pages_busy);
+    green_k_mmput(mm);
+    return -ENOENT;
+}
+
+void green_shadow_agent_drop_mm(void *mm)
+{
+    struct list_head *pos;
+    struct list_head *next;
+
+    if (!mm)
+        return;
+    green_lock(&green_shadow_pages_busy);
+    list_for_each_safe(pos, next, &green_shadow_agent_mms) {
+        struct green_shadow_agent_mm *agent =
+            container_of(pos, struct green_shadow_agent_mm, node);
+        if (agent->mm == mm) {
+            list_del_init(&agent->node);
+            green_unlock(&green_shadow_pages_busy);
+            green_k_mmput(agent->mm);
+            green_k_free_pages((unsigned long)agent, 0);
+            green_lock(&green_shadow_pages_busy);
+        }
+    }
+    green_unlock(&green_shadow_pages_busy);
+}
+
+void green_shadow_agent_release_all(void)
+{
+    for (;;) {
+        struct green_shadow_agent_mm *agent = 0;
+        struct list_head *pos;
+
+        green_lock(&green_shadow_pages_busy);
+        list_for_each(pos, &green_shadow_agent_mms) {
+            agent = container_of(pos, struct green_shadow_agent_mm, node);
+            list_del_init(&agent->node);
+            break;
+        }
+        green_unlock(&green_shadow_pages_busy);
+        if (!agent)
+            return;
+        green_k_mmput(agent->mm);
+        green_k_free_pages((unsigned long)agent, 0);
+    }
+}
+
 int green_shadow_copy_from_user(void *dst, const void __user *src,
                                 unsigned long len)
 {
@@ -474,12 +621,26 @@ void green_shadow_prctl_before(hook_fargs5_t *args, void *udata)
 
     (void)udata;
 
-    if (option < PR_GREEN_SHADOW_PATCH || option > PR_GREEN_SHADOW_COUNT)
+    if (option < PR_GREEN_SHADOW_PATCH || option > PR_GREEN_SHADOW_AGENT_DISABLE)
         return;
 
     atomic_inc(&green_shadow_hooks_busy);
 
-    if (current_uid() != 0) {
+    if (option == PR_GREEN_SHADOW_AGENT_ENABLE ||
+        option == PR_GREEN_SHADOW_AGENT_DISABLE) {
+        if (current_uid() != 0) {
+            ret = -EPERM;
+            goto out;
+        }
+        if (option == PR_GREEN_SHADOW_AGENT_ENABLE)
+            ret = green_shadow_agent_enable(pid);
+        else
+            ret = green_shadow_agent_disable(pid);
+        goto out;
+    }
+
+    if (current_uid() != 0 &&
+        (!green_shadow_agent_allowed_current() || pid != 0)) {
         ret = -EPERM;
         goto out;
     }
@@ -617,6 +778,7 @@ static long green_shadow_exit(void __user *reserved)
         green_cpu_relax();
 
     count = green_shadow_release_all(true);
+    green_shadow_agent_release_all();
     pr_info("green_shadow: offline released=%d\n", count);
     return 0;
 }

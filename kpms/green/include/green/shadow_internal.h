@@ -31,6 +31,11 @@
 #define GREEN_SHADOW_STATE_EXEC 1
 #define GREEN_SHADOW_STATE_READ 2
 
+struct green_shadow_agent_mm {
+    struct list_head node;
+    void *mm;
+};
+
 struct green_shadow_page {
     struct list_head node;
     void *mm;
@@ -46,6 +51,7 @@ struct green_shadow_page {
 };
 
 extern struct list_head green_shadow_pages;
+extern struct list_head green_shadow_agent_mms;
 extern atomic_t green_shadow_pages_busy;
 extern atomic_t green_shadow_hooks_busy;
 extern int green_shadow_online;
@@ -161,6 +167,11 @@ int green_shadow_release_mm(void *mm, bool restore);
 int green_shadow_release_all(bool restore);
 int green_shadow_count_mm(void *mm);
 void *green_shadow_mm_from_pid(pid_t pid);
+int green_shadow_agent_enable(pid_t pid);
+int green_shadow_agent_disable(pid_t pid);
+int green_shadow_agent_allowed_current(void);
+void green_shadow_agent_release_all(void);
+void green_shadow_agent_drop_mm(void *mm);
 int green_shadow_copy_from_user(void *dst, const void __user *src, unsigned long len);
 long green_shadow_patch_mm(void *mm, unsigned long addr, const void *buf,
                            unsigned long len, bool from_user);

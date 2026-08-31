@@ -399,5 +399,6 @@ void green_shadow_exit_mmap_before(hook_fargs1_t *args, void *udata)
     /* Restore before exit_mmap drops the PTE; do not leave a freed shadow
      * page for the normal unmap path to inspect. */
     green_shadow_release_mm(mm, true);
+    green_shadow_agent_drop_mm(mm);
     atomic_dec(&green_shadow_hooks_busy);
 }

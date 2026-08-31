@@ -1,9 +1,9 @@
 # green_hook — gum 源码级接入与 shadow 内存 I/O 替换
 
-`green_hook` 直接编译 frida-gum 的源码（`hook/vendor/gum/`，逐字未改），
+`green_hook` 直接编译 frida-gum 的源码（`green_hook/vendor/gum/`，逐字未改），
 把 gum 在 hook 时的内存读写替换为 green shadow 页操作。替换发生在
 **源码层面**：gum 的平台后端接缝（`gummemory-linux.c` 在上游扮演的角色）
-由 `hook/gummemory-green.c` 承担；指令编码完全来自 gum 自己的
+由 `green_hook/gummemory-green.c` 承担；指令编码完全来自 gum 自己的
 `GumArm64Writer`，没有任何手写二进制 hook。
 
 ## 一、编译的 gum 源码（vendor，未修改）
