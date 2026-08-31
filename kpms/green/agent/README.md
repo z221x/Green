@@ -6,8 +6,8 @@
   Unix socket and dispatches registered tools. The first registered tool is
   `green_hook`, which uses the real GumArm64Writer and the Green shadow
   backend.
-- `green_agent_ctl`: root-side controller. It injects the payload with an
-  AArch64 `ptrace` remote `dlopen` and sends protocol requests to the payload.
+- The `green agent` subcommand (in `kpms/green/cli`): root-side injector,
+  broker and protocol client.  There is a single CLI binary.
 
 ## Privilege model
 

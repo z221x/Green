@@ -76,6 +76,14 @@ make testhook
 make agent
 ```
 
+CLI 工具示例（单二进制）：
+
+```sh
+adb push build/green /data/local/tmp/green
+adb shell su -c "/data/local/tmp/green shadow count -p <pid>"
+adb shell su -c "/data/local/tmp/green agent inject --pid <pid> --so .../libgreen_agent.so"
+```
+
 所有构建产物统一输出到 `build/`：
 
 ```text
@@ -84,7 +92,6 @@ build/
 ├── green                  # Android ARM64 CLI
 ├── test_hook              # green_hook 端到端用例（需 root + 已加载 KPM）
 ├── libgreen_agent.so      # 注入目标进程的 agent payload
-├── green_agent_ctl        # root 侧注入器与 agent 客户端
 └── *.o                    # KPM 中间目标文件
 ```
 

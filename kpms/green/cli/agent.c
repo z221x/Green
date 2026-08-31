@@ -1,35 +1,36 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Root-side Green agent controller.
+ * `green agent` CLI tool: injector, broker and agent client.
  *
- * `inject` attaches to one AArch64 thread, calls the target's dlopen() with
- * the payload path, restores all registers, and detaches.  The controller
- * then talks to the payload over its per-pid abstract Unix socket.
+ * - inject:  ptrace + remote dlopen of the agent payload into the target.
+ * - broker:  attach to the agent as root and serve its privileged
+ *            page-table requests (snapshot + GumArm64Writer + prctl).
+ * - ping/self-test/hook/release: protocol requests to the agent.
  */
-#include "green_agent.h"
+
+#include <green/cli.h>
+#include <green/abi.h>
+#include <green_agent.h>
 
 #include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-
-#include <green/abi.h>
-#include <sys/prctl.h>
 #include <linux/ptrace.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <linux/un.h>
 #include <sys/uio.h>
-
-#include <gum/arch-arm64/gumarm64writer.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <gum/arch-arm64/gumarm64writer.h>
 struct map_entry {
     uintptr_t start;
     uintptr_t end;
@@ -216,11 +217,21 @@ static int remote_dlopen(pid_t pid, const char *payload)
     int result = -1;
 
     local_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
-    if (!local_dlopen || find_map_containing(getpid(), (uintptr_t)local_dlopen,
-                                             &local_map) != 0 ||
-        find_target_library_map(pid, &local_map, &target_map) != 0 ||
-        find_stack(pid, &stack) != 0) {
-        fprintf(stderr, "cannot resolve target dlopen/stack\n");
+    if (!local_dlopen) {
+        fprintf(stderr, "inject: dlsym(dlopen) failed\n");
+        return -1;
+    }
+    if (find_map_containing(getpid(), (uintptr_t)local_dlopen, &local_map) != 0) {
+        fprintf(stderr, "inject: local dlopen map not found\n");
+        return -1;
+    }
+    if (find_target_library_map(pid, &local_map, &target_map) != 0) {
+        fprintf(stderr, "inject: target map for %s not found\n",
+                local_map.path[0] ? local_map.path : "(anon)");
+        return -1;
+    }
+    if (find_stack(pid, &stack) != 0) {
+        fprintf(stderr, "inject: target stack not found\n");
         return -1;
     }
 
@@ -450,17 +461,18 @@ static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
     return response.status == 0 ? 0 : 1;
 }
 
-static void usage(const char *program)
+static void agent_usage(const char *prog)
 {
     fprintf(stderr,
-            "usage:\n"
-            "  %s inject --pid PID --so /path/in/target/libgreen_agent.so\n"
-            "  %s ping --pid PID\n"
-            "  %s self-test --pid PID\n"
-            "  %s broker --pid PID\n"
-            "  %s hook --pid PID --target ADDR --replacement ADDR [--len N]\n"
-            "  %s release --pid PID --target ADDR\n", program, program,
-            program, program, program, program);
+            "Green agent tool (injector, broker, client)\n\n"
+            "Usage:\n"
+            "  %s agent inject --pid PID --so /path/in/target/libgreen_agent.so\n"
+            "  %s agent broker --pid PID\n"
+            "  %s agent ping --pid PID\n"
+            "  %s agent self-test --pid PID\n"
+            "  %s agent hook --pid PID --target ADDR --replacement ADDR\n"
+            "  %s agent release --pid PID --target ADDR\n",
+            prog, prog, prog, prog, prog, prog);
 }
 
 static int parse_ulong(const char *text, uintptr_t *value)
@@ -476,39 +488,36 @@ static int parse_ulong(const char *text, uintptr_t *value)
     return 0;
 }
 
-int main(int argc, char **argv)
+int green_agent_main(int argc, char **argv)
 {
     const char *command;
     const char *so = NULL;
-    uintptr_t pid_value = 0;
+    unsigned long pid_value = 0;
     uintptr_t target = 0;
     uintptr_t replacement = 0;
-    uintptr_t length = 16;
     int i;
 
     if (argc < 2) {
-        usage(argv[0]);
-        return 2;
+        agent_usage("green");
+        return argc < 2 ? 1 : 0;
     }
     command = argv[1];
     for (i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--pid") && i + 1 < argc)
-            parse_ulong(argv[++i], &pid_value);
+            green_cli_parse_pid(argv[++i], (pid_t *)&pid_value);
         else if (!strcmp(argv[i], "--so") && i + 1 < argc)
             so = argv[++i];
         else if (!strcmp(argv[i], "--target") && i + 1 < argc)
             parse_ulong(argv[++i], &target);
         else if (!strcmp(argv[i], "--replacement") && i + 1 < argc)
             parse_ulong(argv[++i], &replacement);
-        else if (!strcmp(argv[i], "--len") && i + 1 < argc)
-            parse_ulong(argv[++i], &length);
         else {
-            usage(argv[0]);
+            agent_usage("green");
             return 2;
         }
     }
-    if (!pid_value || pid_value > 0x7fffffffU) {
-        usage(argv[0]);
+    if (!pid_value || pid_value > 0x7fffffffUL) {
+        agent_usage("green");
         return 2;
     }
 
@@ -523,20 +532,20 @@ int main(int argc, char **argv)
         printf("injected; socket=@%s\n", socket_name);
         return 0;
     }
+    if (!strcmp(command, "broker"))
+        return broker_serve((pid_t)pid_value);
     if (!strcmp(command, "ping"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_CORE,
                              GREEN_AGENT_CMD_PING, 0, 0, 0);
-    if (!strcmp(command, "broker"))
-        return broker_serve((pid_t)pid_value);
     if (!strcmp(command, "self-test"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
                              GREEN_AGENT_HOOK_SELF_TEST, 0, 0, 0);
     if (!strcmp(command, "hook")) {
-        if (!target || !replacement || length < 16 || length > 4096)
+        if (!target || !replacement)
             return 2;
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
                              GREEN_AGENT_HOOK_REDIRECT, target, replacement,
-                             length);
+                             16);
     }
     if (!strcmp(command, "release")) {
         if (!target)
@@ -544,6 +553,13 @@ int main(int argc, char **argv)
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
                              GREEN_AGENT_HOOK_RELEASE, target, 0, 0);
     }
-    usage(argv[0]);
+    agent_usage("green");
     return 2;
 }
+
+const struct green_cli_tool green_cli_agent_tool = {
+    .name = "agent",
+    .summary = "inject/serve/hook through the in-process green agent",
+    .main = green_agent_main,
+    .usage = agent_usage,
+};
