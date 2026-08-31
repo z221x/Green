@@ -6,6 +6,7 @@
 #define GREEN_ESR_EC(esr) (((esr) >> GREEN_ESR_EC_SHIFT) & 0x3f)
 #define GREEN_ESR_EC_IABT_LOW 0x20
 #define GREEN_ESR_EC_DABT_LOW 0x24
+#define GREEN_ESR_EC_DABT_CUR 0x25
 #define GREEN_ESR_FSC(esr) ((esr) & 0x3f)
 #define GREEN_ESR_WNR (1U << 6)
 #define GREEN_ESR_S1PTW (1U << 7)
@@ -16,23 +17,6 @@
 #define GREEN_FAULT_EXEC  1
 #define GREEN_FAULT_READ  2
 #define GREEN_FAULT_WRITE 3
-
-/* Fault-path tracing is removed: normal execution is verified silent.
- * Only genuine failures speak, with a tiny budget so a wedged loop
- * cannot flood dmesg. */
-#define GREEN_SHADOW_EMU_FAIL_BUDGET 16
-static atomic_t green_shadow_emu_fail_budget = ATOMIC_INIT(GREEN_SHADOW_EMU_FAIL_BUDGET);
-
-static bool green_shadow_emu_fail_log_want(void)
-{
-    int left = atomic_sub_return(1, &green_shadow_emu_fail_budget);
-
-    if (left < 0) {
-        atomic_add(1, &green_shadow_emu_fail_budget);
-        return false;
-    }
-    return true;
-}
 
 /*
  * No-progress guard: if the exact same (pc, far) pair keeps faulting, the
@@ -302,8 +286,35 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
         return;
 
     kind = green_shadow_fault_kind(esr);
-    if (kind == GREEN_FAULT_NONE)
+    if (kind == GREEN_FAULT_NONE) {
+        /* A kernel uaccess instruction (EC=0x25) can fault on the
+         * execute-only PTE.  Expose the original read-only page and retry
+         * the exact kernel instruction; the resulting bytes are the
+         * original bytes, never the shadow patch. */
+        if (GREEN_ESR_EC(esr) == GREEN_ESR_EC_DABT_CUR &&
+            (GREEN_ESR_FSC(esr) & 0x3c) == 0x0c &&
+            !(esr & GREEN_ESR_S1PTW) && !(esr & GREEN_ESR_WNR)) {
+            atomic_inc(&green_shadow_hooks_busy);
+            mm = green_k_get_task_mm(current);
+            if (mm) {
+                page = green_shadow_get_page(mm, far);
+                if (page) {
+                    ret = green_shadow_map_read(page);
+                    if (ret == 0) {
+                        args->ret = 0;
+                        args->skip_origin = 1;
+                    }
+                    green_shadow_put_page(page);
+                }
+                green_k_mmput(mm);
+            }
+            atomic_dec(&green_shadow_hooks_busy);
+        }
+
+        /* EL1-origin instruction/data aborts not handled above remain under
+         * the normal kernel fault path. */
         return;
+    }
 
     atomic_inc(&green_shadow_hooks_busy);
 
@@ -342,9 +353,6 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
             if (ret == GREEN_EMU_OK) {
                 args->ret = 0;
                 args->skip_origin = 1;
-            } else if (green_shadow_emu_fail_log_want()) {
-                pr_err("green_shadow: emu rejected pc=%lx far=%lx ret=%d\n",
-                       regs->pc, far, ret);
             }
         } else {
             ret = green_shadow_map_read(page);

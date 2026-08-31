@@ -80,7 +80,7 @@ static ssize_t gup_read_self(void *dst, const void *remote, size_t len)
 }
 
 /* byte-wise volatile read (ldrb): always supported by the same-page emu */
-static void direct_read(uint8_t *dst, const volatile uint8_t *src, size_t len)
+static __attribute__((noinline)) void direct_read(uint8_t *dst, const volatile uint8_t *src, size_t len)
 {
     size_t i;
 

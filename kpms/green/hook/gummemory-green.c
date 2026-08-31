@@ -601,5 +601,5 @@ green_gum_release_page (gconstpointer address)
     return FALSE;
 
   page = ((unsigned long) GPOINTER_TO_SIZE (address)) & ~4095UL;
-  return prctl ((int) PR_GREEN_SHADOW_RELEASE, 0, page, 0, 0) == 0;
+  return prctl ((int) PR_GREEN_SHADOW_RELEASE, 0, page, 0, 0) >= 0;
 }
