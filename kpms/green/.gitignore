@@ -12,4 +12,5 @@ compile_commands.json
 vendor/frida-gum/
 vendor/prefix/
 vendor/meson14/
+vendor/quickjs/
 vendor/scratch/
