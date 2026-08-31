@@ -398,7 +398,9 @@ int green_emu_step(struct green_emu_cpu *cpu, u32 insn,
     if (ret)
         return ret;
 
-    next = *cpu;
+    /* Struct assignments would be lowered to a plain memcpy() call, which
+     * the KPM loader cannot resolve; route through the kf_memcpy inline. */
+    memcpy (&next, cpu, sizeof (next));
     if (d.load) {
         value = green_emu_load_le(data, d.size);
         if (d.sign)
@@ -422,8 +424,8 @@ int green_emu_step(struct green_emu_cpu *cpu, u32 insn,
     out.reg2 = d.kind == GREEN_EMU_KIND_PAIR ? d.rt2 : 0;
     out.writeback = d.writeback;
 
-    *cpu = next;
+    memcpy (cpu, &next, sizeof (next));
     if (result)
-        *result = out;
+        memcpy (result, &out, sizeof (out));
     return GREEN_EMU_OK;
 }
