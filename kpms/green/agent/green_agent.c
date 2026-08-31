@@ -262,14 +262,19 @@ static int green_agent_dispatch(int fd, const struct green_agent_request *reques
 
     if (request->tool == GREEN_AGENT_TOOL_CORE) {
         if (request->command == GREEN_AGENT_CMD_BROKER_ATTACH) {
-            /* Only root may become the broker.  The caller keeps this
-             * connection open and serves forwarded requests on it. */
+            /* Only root may become the broker.  dup() the connection so it
+             * survives this handler thread exiting; nobody but
+             * green_agent_broker_request() ever reads or writes it (two
+             * readers would steal each other's bytes). */
             if (green_agent_peer_uid(fd, &uid) != 0 || uid != 0)
                 return -EPERM;
+            int dupfd = dup(fd);
+            if (dupfd < 0)
+                return -EIO;
             pthread_mutex_lock(&green_agent_broker_lock);
             if (green_agent_broker_fd >= 0)
                 close(green_agent_broker_fd);
-            green_agent_broker_fd = fd;
+            green_agent_broker_fd = dupfd;
             pthread_mutex_unlock(&green_agent_broker_lock);
             snprintf(response->message, sizeof(response->message),
                      "broker attached pid=%d", (int)getpid());
@@ -378,21 +383,7 @@ static void *green_agent_handle_client(void *arg)
                      "agent command failed: %d", status);
         if (green_agent_write_full(client, &response, sizeof(response)) != 0)
             break;
-        if (request.tool == GREEN_AGENT_TOOL_CORE &&
-            request.command == GREEN_AGENT_CMD_BROKER_ATTACH) {
-            is_broker = 1;
-            /* Serve as the broker channel: block until root disconnects. */
-            {
-                char drop;
-                while (read(client, &drop, 1) > 0)
-                    ;
-            }
-            pthread_mutex_lock(&green_agent_broker_lock);
-            if (green_agent_broker_fd == client)
-                green_agent_broker_fd = -1;
-            pthread_mutex_unlock(&green_agent_broker_lock);
-            break;
-        }
+        (void)is_broker;
     }
     close(client);
     return NULL;
