@@ -15,12 +15,11 @@
 #include <signal.h>
 #include <stddef.h>
 #include <string.h>
-#include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <linux/un.h>
 #include <unistd.h>
 
-#include <green/abi.h>
 #include <gum/arch-arm64/gumarm64writer.h>
 #include <gum/gummemory.h>
 
@@ -95,53 +94,133 @@ int green_agent_register_tool(const struct green_agent_tool *tool)
     return 0;
 }
 
-static void green_agent_redirect_apply(gpointer memory, gpointer user_data)
+static int green_agent_broker_request(uint32_t command, uint64_t addr,
+                                      const void *payload, uint32_t len,
+                                      int64_t *value)
 {
-    GumArm64Writer writer;
-    guint64 replacement = (guint64)(uintptr_t)user_data;
+    struct sockaddr_un address;
+    struct green_broker_request request;
+    struct green_broker_response response;
+    char name[sizeof(address.sun_path) - 1];
+    int fd;
+    int name_len;
 
-    gum_arm64_writer_init(&writer, memory);
-    writer.pc = (GumAddress)(uintptr_t)memory;
-    gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16, replacement);
-    gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
-    gum_arm64_writer_flush(&writer);
-    gum_arm64_writer_clear(&writer);
+    name_len = green_agent_broker_name(getpid(), name, sizeof(name));
+    if (name_len < 0)
+        return -EINVAL;
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -errno;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    address.sun_path[0] = '\0';
+    memcpy(address.sun_path + 1, name, (size_t)name_len);
+    if (connect(fd, (struct sockaddr *)&address,
+                (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len)) != 0) {
+        close(fd);
+        return -ENOENT;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request.magic = GREEN_AGENT_MAGIC;
+    request.command = command;
+    request.addr = addr;
+    request.len = len;
+    if (write(fd, &request, sizeof(request)) != (ssize_t)sizeof(request) ||
+        (len != 0 && write(fd, payload, len) != (ssize_t)len) ||
+        read(fd, &response, sizeof(response)) != (ssize_t)sizeof(response)) {
+        close(fd);
+        return -EIO;
+    }
+    close(fd);
+    if (value)
+        *value = response.value;
+    return response.status;
 }
 
 static int green_agent_hook_self_test(struct green_agent_response *response);
+
+/* Prepare the patched page image locally: snapshot this process's original
+ * page through process_vm_readv, then let the real GumArm64Writer emit the
+ * redirect into the snapshot.  The privileged commit itself is forwarded to
+ * the root-side broker. */
+static int green_agent_hook_redirect(uint64_t target, uint64_t replacement,
+                                     struct green_agent_response *response)
+{
+    uint64_t page = target & ~4095ULL;
+    size_t offset = (size_t)(target - page);
+    guint8 *snapshot;
+    GumArm64Writer writer;
+    guint64 replacement_addr = (guint64)replacement;
+    int status;
+
+    if ((target & 3) != 0 || (replacement & 3) != 0 || offset > 4096 - 16)
+        return -EINVAL;
+
+    snapshot = malloc(4096);
+    if (!snapshot)
+        return -ENOMEM;
+    {
+        struct iovec local = { .iov_base = snapshot, .iov_len = 4096 };
+        struct iovec remote = { .iov_base = (void *)(uintptr_t)page,
+                                .iov_len = 4096 };
+        ssize_t n;
+
+        do {
+            n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        } while (n < 0 && errno == EINTR);
+        if (n != 4096) {
+            free(snapshot);
+            return -EIO;
+        }
+    }
+
+    gum_arm64_writer_init(&writer, snapshot + offset);
+    writer.pc = (GumAddress)target;
+    gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16,
+                                         replacement_addr);
+    gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
+    gum_arm64_writer_flush(&writer);
+    gum_arm64_writer_clear(&writer);
+
+    status = green_agent_broker_request(GREEN_BROKER_PATCH, page, snapshot,
+                                        4096, &response->value);
+    free(snapshot);
+    if (status != 0)
+        return status ? status : -EIO;
+    response->value = target;
+    return 0;
+}
 
 static int green_agent_hook_handler(const struct green_agent_request *request,
                                     struct green_agent_response *response,
                                     void *userdata)
 {
-    gboolean ok;
+    int64_t value = 0;
+    int status;
 
     (void)userdata;
-    if (request->command == GREEN_AGENT_HOOK_REDIRECT) {
-        if ((request->arg0 & 3) != 0 || (request->arg1 & 3) != 0 ||
-            request->arg2 < 16 || request->arg2 > 4096)
-            return -EINVAL;
-        ok = gum_memory_patch_code((gpointer)(uintptr_t)request->arg0,
-                                    (gsize)request->arg2,
-                                    green_agent_redirect_apply,
-                                    (gpointer)(uintptr_t)request->arg1);
-        if (!ok)
-            return -EIO;
-        response->value = request->arg0;
-        return 0;
-    }
+    switch (request->command) {
+    case GREEN_AGENT_HOOK_REDIRECT:
+        status = green_agent_hook_redirect(request->arg0, request->arg1,
+                                           response);
+        return status;
 
-    if (request->command == GREEN_AGENT_HOOK_RELEASE) {
-        if (!green_gum_release_page((gconstpointer)(uintptr_t)request->arg0))
-            return -EIO;
+    case GREEN_AGENT_HOOK_RELEASE:
+        status = green_agent_broker_request(GREEN_BROKER_RELEASE,
+                                            request->arg0 & ~4095ULL, NULL,
+                                            0, &value);
+        if (status != 0)
+            return status;
         response->value = request->arg0 & ~4095ULL;
         return 0;
-    }
 
-    if (request->command == GREEN_AGENT_HOOK_SELF_TEST)
+    case GREEN_AGENT_HOOK_SELF_TEST:
         return green_agent_hook_self_test(response);
 
-    return -EOPNOTSUPP;
+    default:
+        return -EOPNOTSUPP;
+    }
 }
 
 __attribute__((noinline)) static int green_agent_test_target(int value)
@@ -158,23 +237,38 @@ __attribute__((noinline)) static int green_agent_test_replacement(int value)
 
 static int green_agent_hook_self_test(struct green_agent_response *response)
 {
+    struct green_agent_response unused;
     int before;
     int during;
+    int status;
 
+    memset(&unused, 0, sizeof(unused));
     before = green_agent_test_target(1);
     if (before != 2)
         return -EFAULT;
-    if (!gum_memory_patch_code((gpointer)(uintptr_t)green_agent_test_target,
-                               16, green_agent_redirect_apply,
-                               (gpointer)(uintptr_t)green_agent_test_replacement))
-        return -EIO;
+
+    status = green_agent_hook_redirect(
+        (uint64_t)(uintptr_t)green_agent_test_target,
+        (uint64_t)(uintptr_t)green_agent_test_replacement, &unused);
+    if (status != 0)
+        return status;
+
     during = green_agent_test_target(1);
     if (during != 101) {
-        green_gum_release_page((gconstpointer)green_agent_test_target);
+        green_agent_broker_request(GREEN_BROKER_RELEASE,
+                                   (uint64_t)(uintptr_t)green_agent_test_target &
+                                       ~4095ULL,
+                                   NULL, 0, NULL);
         return -EFAULT;
     }
-    if (!green_gum_release_page((gconstpointer)green_agent_test_target))
-        return -EIO;
+
+    status = green_agent_broker_request(
+        GREEN_BROKER_RELEASE,
+        (uint64_t)(uintptr_t)green_agent_test_target & ~4095ULL, NULL, 0,
+        NULL);
+    if (status != 0)
+        return status;
+
     response->value = (uint64_t)((before << 16) | during);
     snprintf(response->message, sizeof(response->message),
              "green_hook self-test before=%d during=%d after=%d", before,
@@ -199,20 +293,11 @@ static void green_agent_response_init(struct green_agent_response *response)
 static int green_agent_core_dispatch(const struct green_agent_request *request,
                                      struct green_agent_response *response)
 {
-    long count;
-
     if (request->command == GREEN_AGENT_CMD_PING) {
         response->value = (uint64_t)getpid();
         snprintf(response->message, sizeof(response->message),
                  "green-agent ready pid=%d", (int)getpid());
         return 0;
-    }
-    if (request->command == GREEN_AGENT_CMD_STATUS) {
-        count = prctl((int)PR_GREEN_SHADOW_COUNT, 0, 0, 0, 0);
-        response->value = count >= 0 ? (uint64_t)count : 0;
-        snprintf(response->message, sizeof(response->message),
-                 "green-agent pid=%d shadow_count=%ld", (int)getpid(), count);
-        return count < 0 ? -errno : 0;
     }
     return -EOPNOTSUPP;
 }

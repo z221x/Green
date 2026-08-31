@@ -18,15 +18,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <linux/un.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#include <green/abi.h>
 
 struct map_entry {
     uintptr_t start;
@@ -264,16 +261,11 @@ restore:
     return result;
 }
 
-static int inject_payload(pid_t pid, const char *payload, int enable_mm)
+static int inject_payload(pid_t pid, const char *payload)
 {
     int attached = 0;
     int result = -1;
 
-    if (enable_mm && prctl((int)PR_GREEN_SHADOW_AGENT_ENABLE,
-                           (unsigned long)pid, 0, 0, 0) != 0) {
-        perror("PR_GREEN_SHADOW_AGENT_ENABLE");
-        return -1;
-    }
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) != 0) {
         perror("PTRACE_ATTACH");
         goto disable;
@@ -293,9 +285,6 @@ detach:
     return 0;
 
 disable:
-    if (enable_mm)
-        prctl((int)PR_GREEN_SHADOW_AGENT_DISABLE, (unsigned long)pid,
-              0, 0, 0);
     return -1;
 }
 
@@ -350,9 +339,8 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "usage:\n"
-            "  %s inject --pid PID --so /path/in/target/libgreen_agent.so [--no-enable]\n"
+            "  %s inject --pid PID --so /path/in/target/libgreen_agent.so\n"
             "  %s ping --pid PID\n"
-            "  %s status --pid PID\n"
             "  %s self-test --pid PID\n"
             "  %s hook --pid PID --target ADDR --replacement ADDR [--len N]\n"
             "  %s release --pid PID --target ADDR\n", program, program,
@@ -380,7 +368,6 @@ int main(int argc, char **argv)
     uintptr_t target = 0;
     uintptr_t replacement = 0;
     uintptr_t length = 16;
-    int enable_mm = 1;
     int i;
 
     if (argc < 2) {
@@ -399,8 +386,6 @@ int main(int argc, char **argv)
             parse_ulong(argv[++i], &replacement);
         else if (!strcmp(argv[i], "--len") && i + 1 < argc)
             parse_ulong(argv[++i], &length);
-        else if (!strcmp(argv[i], "--no-enable"))
-            enable_mm = 0;
         else {
             usage(argv[0]);
             return 2;
@@ -414,7 +399,7 @@ int main(int argc, char **argv)
     if (!strcmp(command, "inject")) {
         char socket_name[64];
 
-        if (!so || inject_payload((pid_t)pid_value, so, enable_mm) != 0)
+        if (!so || inject_payload((pid_t)pid_value, so) != 0)
             return 1;
         if (green_agent_socket_name((pid_t)pid_value, socket_name,
                                     sizeof(socket_name)) < 0)
@@ -425,9 +410,6 @@ int main(int argc, char **argv)
     if (!strcmp(command, "ping"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_CORE,
                              GREEN_AGENT_CMD_PING, 0, 0, 0);
-    if (!strcmp(command, "status"))
-        return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_CORE,
-                             GREEN_AGENT_CMD_STATUS, 0, 0, 0);
     if (!strcmp(command, "self-test"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
                              GREEN_AGENT_HOOK_SELF_TEST, 0, 0, 0);

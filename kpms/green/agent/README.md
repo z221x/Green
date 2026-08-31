@@ -6,12 +6,29 @@
   Unix socket and dispatches registered tools. The first registered tool is
   `green_hook`, which uses the real GumArm64Writer and the Green shadow
   backend.
-- `green_agent_ctl`: root-side controller. It enables the target mm in the
-  Green KPM, injects the payload with an AArch64 `ptrace` remote `dlopen`, and
-  sends protocol requests to the payload.
+- `green_agent_ctl`: root-side controller. It injects the payload with an
+  AArch64 `ptrace` remote `dlopen` and sends protocol requests to the payload.
 
-The socket name is `@green.agent.<pid>`. Mutating tool requests require a root
-peer (`SO_PEERCRED`); `PING` is available for liveness checks.
+## Privilege model
+
+The agent has **no kernel privileges and never calls the Green prctl ABI**.
+Privileged page-table operations are performed by a root-side broker:
+
+```text
+agent (target process, unprivileged)
+   |  1. socket request (patch image / release / count)
+   v
+green cli  `shadow broker`  (root)
+   |  2. prctl(PR_GREEN_SHADOW_*)
+   v
+KPM (page-table operations)
+```
+
+- `green shadow broker -p <pid>` listens on `@green.broker.<pid>` and serves
+  only peers whose uid equals the target process's uid, so one broker instance
+  is bound to exactly one target.
+- The agent's own socket is `@green.agent.<pid>`; `PING` works without a
+  broker.
 
 ## Build
 
@@ -26,34 +43,28 @@ kpms/green/build/libgreen_agent.so
 kpms/green/build/green_agent_ctl
 ```
 
-## Inject
+## Inject and use
 
-The payload must be accessible by the target app. For an Android app, copy it
-into the app's own data directory with the app UID and executable/readable
-permissions. Then:
+The payload must be readable/executable by the target app; copy it into the
+app's own data directory with the app uid. Then, as root:
 
 ```sh
+# 1. inject
 green_agent_ctl inject --pid PID \
   --so /data/user/0/<package>/cache/libgreen_agent.so
+
+# 2. start the root broker for this target
+green shadow broker -p PID
+
+# 3. liveness + green_hook self-test (real GumArm64Writer + shadow backend)
 green_agent_ctl ping --pid PID
-green_agent_ctl status --pid PID
 green_agent_ctl self-test --pid PID
-```
 
-`inject` first calls `PR_GREEN_SHADOW_AGENT_ENABLE` from the root controller.
-The injected app process can then call the normal Green shadow ABI with `pid=0`;
-the KPM authorizes only that previously enabled mm. This avoids making the
-shadow ABI globally available to unprivileged apps.
-
-## Green hook request
-
-```sh
+# 4. explicit hook by absolute in-process addresses
 green_agent_ctl hook --pid PID --target 0xTARGET \
   --replacement 0xREPLACEMENT --len 16
 green_agent_ctl release --pid PID --target 0xTARGET
 ```
 
-`self-test` exercises the real GumArm64Writer and Green shadow backend inside
-the injected target. The explicit `hook` command accepts absolute in-process
-addresses for a target function and replacement function. A future tool can
-register a new tool id and handler without changing the transport or injector.
+The tool registry (`green_agent_register_tool`) lets future Green tools add
+new tool ids and handlers without changing the transport or the injector.

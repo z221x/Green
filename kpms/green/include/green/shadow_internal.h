@@ -31,11 +31,6 @@
 #define GREEN_SHADOW_STATE_EXEC 1
 #define GREEN_SHADOW_STATE_READ 2
 
-struct green_shadow_agent_mm {
-    struct list_head node;
-    void *mm;
-};
-
 struct green_shadow_page {
     struct list_head node;
     void *mm;
@@ -51,7 +46,6 @@ struct green_shadow_page {
 };
 
 extern struct list_head green_shadow_pages;
-extern struct list_head green_shadow_agent_mms;
 extern atomic_t green_shadow_pages_busy;
 extern atomic_t green_shadow_hooks_busy;
 extern int green_shadow_online;
@@ -61,15 +55,27 @@ extern int green_shadow_root_shift;
 extern s64 green_shadow_linear_offset;
 extern int16_t green_shadow_vma_mm_offset;
 
+/* All in-kernel spinlocks are bounded: on timeout the caller fails the
+ * operation gracefully instead of wedging an EL1 thread (which cannot be
+ * killed or attached).  A leaked page or an unhandled fault is always
+ * preferable to a permanently spinning CPU. */
+#define GREEN_LOCK_MAX_ITER 100000000u
+
 static inline void green_cpu_relax(void)
 {
     asm volatile("yield" ::: "memory");
 }
 
-static inline void green_lock(atomic_t *lock)
+static inline bool green_lock(atomic_t *lock)
 {
-    while (atomic_cmpxchg(lock, 0, 1) != 0)
+    unsigned int iter = GREEN_LOCK_MAX_ITER;
+
+    while (atomic_cmpxchg(lock, 0, 1) != 0) {
+        if (--iter == 0)
+            return false;
         green_cpu_relax();
+    }
+    return true;
 }
 
 static inline void green_unlock(atomic_t *lock)
@@ -78,9 +84,9 @@ static inline void green_unlock(atomic_t *lock)
     atomic_set(lock, 0);
 }
 
-static inline void green_shadow_page_lock(struct green_shadow_page *page)
+static inline bool green_shadow_page_lock(struct green_shadow_page *page)
 {
-    green_lock(&page->pte_busy);
+    return green_lock(&page->pte_busy);
 }
 
 static inline void green_shadow_page_unlock(struct green_shadow_page *page)
@@ -167,11 +173,6 @@ int green_shadow_release_mm(void *mm, bool restore);
 int green_shadow_release_all(bool restore);
 int green_shadow_count_mm(void *mm);
 void *green_shadow_mm_from_pid(pid_t pid);
-int green_shadow_agent_enable(pid_t pid);
-int green_shadow_agent_disable(pid_t pid);
-int green_shadow_agent_allowed_current(void);
-void green_shadow_agent_release_all(void);
-void green_shadow_agent_drop_mm(void *mm);
 int green_shadow_copy_from_user(void *dst, const void __user *src, unsigned long len);
 long green_shadow_patch_mm(void *mm, unsigned long addr, const void *buf,
                            unsigned long len, bool from_user);

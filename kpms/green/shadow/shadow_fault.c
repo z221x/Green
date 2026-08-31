@@ -158,8 +158,12 @@ static int green_shadow_emulate_same_page(struct green_shadow_page *page,
         return GREEN_EMU_UNSUPPORTED;
 
     /* Serialize against patching and PTE/lifecycle changes. */
-    green_shadow_page_lock(page);
-    green_lock(&green_shadow_pages_busy);
+    if (!green_shadow_page_lock(page))
+        return GREEN_EMU_UNSUPPORTED;
+    if (!green_lock(&green_shadow_pages_busy)) {
+        green_shadow_page_unlock(page);
+        return GREEN_EMU_UNSUPPORTED;
+    }
     if (page->dead || page->state != GREEN_SHADOW_STATE_EXEC ||
         !page->shadow_kva || !page->original_pfn) {
         green_unlock(&green_shadow_pages_busy);
@@ -345,7 +349,13 @@ void green_shadow_gup_before(hook_fargs5_t *args, void *udata)
         goto out;
     }
 
-    green_shadow_page_lock(page);
+    /* Hold the page lock only for the PTE swap, never across the original
+     * follow_page_pte: a frozen or wedged holder would leave any faulting
+     * thread spinning in the kernel forever. */
+    if (!green_shadow_page_lock(page)) {
+        green_shadow_put_page(page);
+        goto out;
+    }
     ptep = green_shadow_get_pte(mm, page->va);
     if (!ptep) {
         green_shadow_page_unlock(page);
@@ -360,6 +370,7 @@ void green_shadow_gup_before(hook_fargs5_t *args, void *udata)
         goto out;
     }
     green_shadow_write_pte(ptep, green_shadow_read_pte_for_gup(page));
+    green_shadow_page_unlock(page);
 
     args->arg5 = (unsigned long)page;
     args->arg6 = saved;
@@ -380,9 +391,17 @@ void green_shadow_gup_after(hook_fargs5_t *args, void *udata)
     if (!page)
         return;
 
-    if (ptep)
-        green_shadow_write_pte(ptep, saved);
-    green_shadow_page_unlock(page);
+    if (ptep) {
+        if (green_shadow_page_lock(page)) {
+            green_shadow_write_pte(ptep, saved);
+            green_shadow_page_unlock(page);
+        } else {
+            /* Degraded: restore without the lock rather than spinning. */
+            pr_err("green_shadow: gup restore lock timeout va=%lx\n",
+                   page->va);
+            green_shadow_write_pte(ptep, saved);
+        }
+    }
     green_shadow_put_page(page);
     atomic_dec(&green_shadow_hooks_busy);
 }
@@ -399,6 +418,5 @@ void green_shadow_exit_mmap_before(hook_fargs1_t *args, void *udata)
     /* Restore before exit_mmap drops the PTE; do not leave a freed shadow
      * page for the normal unmap path to inspect. */
     green_shadow_release_mm(mm, true);
-    green_shadow_agent_drop_mm(mm);
     atomic_dec(&green_shadow_hooks_busy);
 }

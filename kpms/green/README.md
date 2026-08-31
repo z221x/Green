@@ -56,7 +56,7 @@ Green 的 shadow 工具重新实现了一个 patch-oriented 的 R^X / W^X shadow
 - 代码和数据位于同一页时，使用 `emu/` 中的单指令 ARM64 模拟器从 original page 读取数据并推进 `pt_regs->pc`，避免整页切换造成 fault 循环。
 - hook `follow_page_pte` 时临时暴露 original PTE，覆盖 `/proc/pid/mem`、`process_vm_readv`、`ptrace` 等 GUP 读取路径。
 - hook `exit_mmap` 自动释放进程退出时遗留的 shadow 页。
-- 控制入口是 `prctl`；普通 root 客户端可直接控制，注入 agent 的目标 mm 需先由 root 侧显式启用 agent 权限。
+- 控制入口是 `prctl`，只允许 root 调用。注入到目标进程的 agent 没有内核特权：它把补丁请求转发给 root 侧 `green shadow broker`，由 CLI 执行页表操作（详见 `agent/README.md`）。
 
 内核符号统一由 `common/symbol.c` 提取和解析，地址变量及公共声明集中在 `include/green/symbol.h`；其他 KPM 工具只通过该头文件使用已解析地址。
 

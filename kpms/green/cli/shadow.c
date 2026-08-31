@@ -2,10 +2,14 @@
 
 #include <green/cli.h>
 #include <green/shadow.h>
+#include <green_agent.h>
 #include <green/abi.h>
 
 #include <errno.h>
 #include <getopt.h>
+#include <sys/socket.h>
+#include <linux/un.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,11 +98,12 @@ static void shadow_usage(const char *prog)
             "  %s shadow patch   -p <pid> (-a <addr>|-b <lib> -o <off>) -x <hex>\n"
             "  %s shadow nop     -p <pid> (-a <addr>|-b <lib> -o <off>) [-n insns]\n"
             "  %s shadow branch  -p <pid> (-a <addr>|-b <lib> -o <off>) -t <target>\n"
-            "  %s shadow release -p <pid> [-a <addr>]\n\n"
+            "  %s shadow release -p <pid> [-a <addr>]\n"
+            "  %s shadow broker -p <pid>        root-side agent broker\n\n"
             "Notes:\n"
             "  patch/nop/branch write only to the shadow physical page. Reads see original bytes.\n"
             "  release without -a releases all shadow pages in the target mm.\n",
-            prog, prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog);
 }
 
 struct shadow_opts {
@@ -327,6 +332,138 @@ static int cmd_release(int argc, char **argv)
     return green_shadow_request_release(opts.pid, opts.have_addr ? opts.addr : 0);
 }
 
+/*
+ * Root-side broker for the injected agent: listens on @green.broker.<pid>
+ * and performs the privileged prctl page-table operations on behalf of the
+ * target's own agent.  Only peers with the target's uid are served, so a
+ * broker instance is bound to exactly one target process.
+ */
+static int cmd_broker(int argc, char **argv)
+{
+    struct shadow_opts opts;
+    struct sockaddr_un address;
+    char name[sizeof(address.sun_path) - 1];
+    char status_path[64];
+    char line[256];
+    unsigned int target_uid = 0;
+    int name_len;
+    int server;
+    FILE *status;
+    int ret = parse_opts(argc, argv, "p:h", &opts);
+
+    if (ret != 0) {
+        if (ret > 0)
+            shadow_usage("green");
+        return ret > 0 ? 0 : 1;
+    }
+    if (opts.pid <= 0) {
+        fprintf(stderr, "broker requires --pid <target>\n");
+        return 2;
+    }
+
+    snprintf(status_path, sizeof(status_path), "/proc/%d/status",
+             (int)green_cli_effective_pid(opts.pid));
+    status = fopen(status_path, "re");
+    if (!status) {
+        fprintf(stderr, "cannot open %s\n", status_path);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), status)) {
+        if (!strncmp(line, "Uid:", 4)) {
+            target_uid = (unsigned int)strtoul(line + 4, NULL, 10);
+            break;
+        }
+    }
+    fclose(status);
+
+    name_len = green_agent_broker_name(green_cli_effective_pid(opts.pid), name,
+                                       sizeof(name));
+    if (name_len < 0)
+        return 1;
+    server = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server < 0) {
+        perror("socket");
+        return 1;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    address.sun_path[0] = '\0';
+    memcpy(address.sun_path + 1, name, (size_t)name_len);
+    if (bind(server, (struct sockaddr *)&address,
+             (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len)) != 0 ||
+        listen(server, 4) != 0) {
+        perror("bind broker");
+        close(server);
+        return 1;
+    }
+    printf("broker ready uid=%u socket=@%s\n", target_uid, name);
+    fflush(stdout);
+
+    for (;;) {
+        int client = accept(server, NULL, NULL);
+        struct ucred cred;
+        socklen_t cred_len = sizeof(cred);
+
+        if (client < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0 ||
+            cred.uid != (uid_t)target_uid) {
+            fprintf(stderr, "broker rejected peer uid=%d\n", (int)cred.uid);
+            close(client);
+            continue;
+        }
+        for (;;) {
+            struct green_broker_request request;
+            struct green_broker_response response;
+            unsigned char payload[GREEN_SHADOW_MAX_PATCH_LEN];
+            long pr;
+
+            if (read(client, &request, sizeof(request)) != (ssize_t)sizeof(request))
+                break;
+            memset(&response, 0, sizeof(response));
+            if (request.magic != GREEN_AGENT_MAGIC ||
+                request.len > GREEN_SHADOW_MAX_PATCH_LEN) {
+                response.status = -EBADMSG;
+            } else if (request.command == GREEN_BROKER_PATCH &&
+                       (request.addr & 4095UL) + request.len <= GREEN_SHADOW_MAX_PATCH_LEN &&
+                       request.len > 0) {
+                if (read(client, payload, request.len) != (ssize_t)request.len) {
+                    response.status = -EBADMSG;
+                } else {
+                    pr = green_cli_prctl(PR_GREEN_SHADOW_PATCH,
+                                         green_cli_effective_pid(opts.pid),
+                                         request.addr, (unsigned long)payload,
+                                         request.len);
+                    response.status = pr < 0 ? (int32_t)pr : 0;
+                    response.value = pr;
+                }
+            } else if (request.command == GREEN_BROKER_RELEASE) {
+                pr = green_cli_prctl(PR_GREEN_SHADOW_RELEASE,
+                                     green_cli_effective_pid(opts.pid),
+                                     request.addr, 0, 0);
+                response.status = pr < 0 ? (int32_t)pr : 0;
+                response.value = pr;
+            } else if (request.command == GREEN_BROKER_COUNT) {
+                pr = green_cli_prctl(PR_GREEN_SHADOW_COUNT,
+                                     green_cli_effective_pid(opts.pid), 0, 0, 0);
+                response.status = pr < 0 ? (int32_t)pr : 0;
+                response.value = pr;
+            } else {
+                response.status = -EOPNOTSUPP;
+            }
+            if (write(client, &response, sizeof(response)) != (ssize_t)sizeof(response))
+                break;
+        }
+        close(client);
+        break;
+    }
+    close(server);
+    return 0;
+}
+
 static int shadow_main(int argc, char **argv)
 {
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
@@ -346,6 +483,8 @@ static int shadow_main(int argc, char **argv)
         return cmd_branch(argc, argv);
     if (!strcmp(argv[1], "release"))
         return cmd_release(argc, argv);
+    if (!strcmp(argv[1], "broker"))
+        return cmd_broker(argc, argv);
 
     fprintf(stderr, "unknown shadow command: %s\n", argv[1]);
     shadow_usage("green");

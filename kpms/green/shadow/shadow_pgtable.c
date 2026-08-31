@@ -173,8 +173,12 @@ int green_shadow_map_exec(struct green_shadow_page *page)
     u64 pte;
 
     green_shadow_sync_code(page->shadow_kva, GREEN_PAGE_SIZE);
-    green_shadow_page_lock(page);
-    green_lock(&green_shadow_pages_busy);
+    if (!green_shadow_page_lock(page))
+        return -EBUSY;
+    if (!green_lock(&green_shadow_pages_busy)) {
+        green_shadow_page_unlock(page);
+        return -EBUSY;
+    }
     if (page->dead) {
         green_unlock(&green_shadow_pages_busy);
         green_shadow_page_unlock(page);
@@ -204,8 +208,12 @@ int green_shadow_map_read(struct green_shadow_page *page)
     u64 *ptep;
     u64 pte;
 
-    green_shadow_page_lock(page);
-    green_lock(&green_shadow_pages_busy);
+    if (!green_shadow_page_lock(page))
+        return -EBUSY;
+    if (!green_lock(&green_shadow_pages_busy)) {
+        green_shadow_page_unlock(page);
+        return -EBUSY;
+    }
     if (page->dead) {
         green_unlock(&green_shadow_pages_busy);
         green_shadow_page_unlock(page);
@@ -233,7 +241,8 @@ int green_shadow_restore_original(struct green_shadow_page *page)
 {
     u64 *ptep;
 
-    green_shadow_page_lock(page);
+    if (!green_shadow_page_lock(page))
+        return -EBUSY;
     ptep = green_shadow_get_pte(page->mm, page->va);
     if (ptep) {
         unsigned long cur_pfn = green_pte_pfn(*ptep);

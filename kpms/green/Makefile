@@ -65,7 +65,7 @@ CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
 $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
-	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -Iinclude -o $@ $(CLI_SRCS)
+	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -Iinclude -Iagent -o $@ $(CLI_SRCS)
 
 .PHONY: testhook
 TESTHOOK := $(BUILD_DIR)/test_hook
