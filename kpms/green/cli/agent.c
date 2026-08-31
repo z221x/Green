@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <sys/stat.h>
 #include <linux/ptrace.h>
 #include <signal.h>
 #include <stdio.h>
@@ -468,6 +469,14 @@ static int broker_patch(pid_t target, unsigned long target_addr,
     gum_arm64_writer_flush(&writer);
     gum_arm64_writer_clear(&writer);
 
+    fprintf(stderr, "broker: image head at target: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            snapshot[offset], snapshot[offset+1], snapshot[offset+2],
+            snapshot[offset+3], snapshot[offset+4], snapshot[offset+5],
+            snapshot[offset+6], snapshot[offset+7]);
+    fprintf(stderr, "broker: image head: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            snapshot[offset], snapshot[offset+1], snapshot[offset+2],
+            snapshot[offset+3], snapshot[offset+4], snapshot[offset+5],
+            snapshot[offset+6], snapshot[offset+7]);
     pr = green_cli_prctl(PR_GREEN_SHADOW_PATCH, target, page,
                          (unsigned long)snapshot, sizeof(snapshot));
     *out_value = pr;
@@ -478,6 +487,124 @@ static int broker_patch(pid_t target, unsigned long target_addr,
  *   conn A: the command request and its final agent response;
  *   conn B: attached as the broker; the agent forwards its privileged
  *           page-table requests here while the command runs. */
+static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
+                         uint64_t arg0, uint64_t arg1, uint64_t arg2);
+
+/* Deploy the user script into the app's cache and run it through the JS
+ * tool, then call the probe so a registered Interceptor hook fires. */
+static int agent_js_load(pid_t pid, const char *script_path)
+{
+    char cmdline[128] = {0};
+    char dest[300];
+    char pkg[128] = {0};
+    const char *slash;
+    char status_path[64];
+    char line[256];
+    unsigned int uid = 0;
+    FILE *status;
+    int src, dst;
+    char buf[8192];
+    ssize_t n;
+    int r;
+    struct green_agent_request request;
+    struct green_agent_response response;
+    int cmd_fd;
+    int broker_fd;
+
+    /* target package name */
+    snprintf(status_path, sizeof(status_path), "/proc/%d/cmdline", (int)pid);
+    src = open(status_path, O_RDONLY);
+    if (src >= 0) {
+        n = read(src, pkg, sizeof(pkg) - 1);
+        close(src);
+        if (n > 0) pkg[n] = '\0';
+    }
+    slash = strrchr(pkg, '/');
+    if (slash) {
+        /* binary path (non-app target): deploy next to it */
+        size_t dir_len = (size_t)(slash - pkg) + 1;
+        snprintf(dest, sizeof(dest), "%.*sgreen_hook.js", (int)dir_len, pkg);
+    } else {
+        snprintf(pkg, sizeof(pkg), "%s", pkg);
+        snprintf(dest, sizeof(dest), "/data/user/0/%s/cache/green_hook.js", pkg);
+    }
+
+    /* copy script into place as the target uid */
+    fprintf(stderr, "js: copying %s -> %s\n", script_path, dest);
+    if (strcmp(script_path, dest) == 0) {
+        /* already deployed at the destination */
+        return agent_request(pid, GREEN_AGENT_TOOL_JS,
+                             GREEN_AGENT_CMD_JS_LOAD, 0, 0, 0);
+    }
+    src = open(script_path, O_RDONLY);
+    if (src < 0) { perror("open script"); return 1; }
+    dst = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (dst < 0) { perror("open dest"); close(src); return 1; }
+    while ((n = read(src, buf, sizeof(buf))) > 0) {
+        if (write(dst, buf, n) != n) { perror("write"); close(src); close(dst); return 1; }
+    }
+    close(src);
+    fchown(dst, uid, uid);
+    close(dst);
+    fchown(dst, uid, uid);
+
+    {
+        struct stat st;
+        if (stat(dest, &st) == 0)
+            fchown(dst, st.st_uid, st.st_gid); /* keep owner: app uid */
+    }
+
+    /* LOAD + CALL over the SAME connection pair: the JS hook registers on
+     * the broker channel and the probe call exercises it in-process. */
+    /* JS_LOAD then JS_CALL over the same connection pair; the broker
+     * channel (conn B) stays attached for the whole sequence. */
+    memset(&request, 0, sizeof(request));
+    request.magic = GREEN_AGENT_MAGIC;
+    request.version = GREEN_AGENT_VERSION;
+    request.tool = GREEN_AGENT_TOOL_JS;
+    request.command = GREEN_AGENT_CMD_JS_LOAD;
+    request.size = sizeof(request);
+    if (write(cmd_fd, &request, sizeof(request)) !=
+        (ssize_t)sizeof(request)) {
+        close(cmd_fd);
+        close(broker_fd);
+        return 1;
+    }
+    if (read_full(cmd_fd, &response, sizeof(response)) != 0) {
+        close(cmd_fd);
+        close(broker_fd);
+        return 1;
+    }
+    printf("status=%d value=0x%" PRIx64 " %s\n", response.status,
+           response.value, response.message);
+
+    memset(&request, 0, sizeof(request));
+    request.magic = GREEN_AGENT_MAGIC;
+    request.version = GREEN_AGENT_VERSION;
+    request.tool = GREEN_AGENT_TOOL_JS;
+    request.command = GREEN_AGENT_CMD_JS_CALL;
+    request.size = sizeof(request);
+    if (write(cmd_fd, &request, sizeof(request)) !=
+        (ssize_t)sizeof(request)) {
+        close(cmd_fd);
+        close(broker_fd);
+        return 1;
+    }
+    if (read_full(cmd_fd, &response, sizeof(response)) != 0) {
+        close(cmd_fd);
+        close(broker_fd);
+        return 1;
+    }
+    printf("status=%d value=0x%" PRIx64 " %s\n", response.status,
+           response.value, response.message);
+    {
+        int rc = response.status == 0 ? 0 : 1;
+        close(cmd_fd);
+        close(broker_fd);
+        return rc;
+    }
+}
+
 static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
                          uint64_t arg0, uint64_t arg1, uint64_t arg2)
 {
@@ -659,6 +786,7 @@ int green_agent_main(int argc, char **argv)
 {
     const char *command;
     const char *so = NULL;
+    const char *script_file = NULL;
     unsigned long pid_value = 0;
     uintptr_t target = 0;
     uintptr_t replacement = 0;
@@ -678,6 +806,8 @@ int green_agent_main(int argc, char **argv)
             parse_ulong(argv[++i], &target);
         else if (!strcmp(argv[i], "--replacement") && i + 1 < argc)
             parse_ulong(argv[++i], &replacement);
+        else if (!strcmp(argv[i], "--file") && i + 1 < argc)
+            script_file = argv[++i];
         else {
             agent_usage("green");
             return 2;
@@ -702,6 +832,10 @@ int green_agent_main(int argc, char **argv)
     if (!strcmp(command, "ping"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_CORE,
                              GREEN_AGENT_CMD_PING, 0, 0, 0);
+    if (!strcmp(command, "js")) {
+        if (!script_file) { fprintf(stderr, "js: --file required (device path of the script)\n"); return 2; }
+        return agent_js_load((pid_t)pid_value, script_file);
+    }
     if (!strcmp(command, "self-test"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
                              GREEN_AGENT_HOOK_SELF_TEST, 0, 0, 0);

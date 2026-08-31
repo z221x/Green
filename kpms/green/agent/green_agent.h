@@ -20,6 +20,12 @@
 enum green_agent_tool_id {
     GREEN_AGENT_TOOL_CORE = 0,
     GREEN_AGENT_TOOL_GREEN_HOOK = 1,
+    GREEN_AGENT_TOOL_JS = 2,
+};
+
+enum green_agent_js_command {
+    GREEN_AGENT_CMD_JS_LOAD = 1, /* eval the script at the well-known path */
+    GREEN_AGENT_CMD_JS_CALL = 2, /* call the probe; returns the hooked value */
 };
 
 enum green_agent_core_command {

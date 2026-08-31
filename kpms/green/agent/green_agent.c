@@ -21,6 +21,8 @@
 #include <linux/un.h>
 #include <unistd.h>
 
+#include <quickjs.h>
+
 #define AGLOG(...) __android_log_print(ANDROID_LOG_INFO, "green-agent", __VA_ARGS__)
 
 
@@ -28,6 +30,261 @@ struct green_agent_registry {
     pthread_mutex_t lock;
     struct green_agent_tool tools[GREEN_AGENT_MAX_TOOLS];
     size_t count;
+};
+
+/* ---- JS runtime bridge (QuickJS) ------------------------------------
+ * Scripts live at <app cache>/green_hook.js and are pushed by the root
+ * controller.  A script calls the native global `hook(target, fn)` which
+ * registers `fn` and asks the root broker to redirect `target` to
+ * green_agent_js_trampoline; every call of the hooked function then runs
+ * the JS callback with the live register arguments and uses its return
+ * value as the function result. ------------------------------------------------------------------ */
+
+static JSRuntime *g_js_rt;
+static JSContext *g_js_ctx;
+static pthread_mutex_t g_js_lock = PTHREAD_MUTEX_INITIALIZER;
+static JSValue g_js_fn;
+static uint64_t g_js_hook_target;
+static int g_js_ready;
+static int green_agent_test_target(int value);
+static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
+                                           uint64_t arg, const void *payload,
+                                           uint32_t len, int64_t *value);
+
+/* The shadow redirect lands here.  Runs the registered JS callback with the
+ * live register arguments (x0-x7) and returns its result to the caller. */
+__attribute__((noinline)) int64_t green_agent_js_trampoline(
+    int64_t a0, int64_t a1, int64_t a2, int64_t a3,
+    int64_t a4, int64_t a5, int64_t a6, int64_t a7)
+{
+    int64_t out = 0;
+    int64_t vals[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
+    JSValue args[8];
+    JSValue rv;
+
+    pthread_mutex_lock(&g_js_lock);
+    if (!g_js_ready) {
+        pthread_mutex_unlock(&g_js_lock);
+        return 0;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "green-agent",
+                        "js_trampoline fired a0=%llx", (unsigned long long)a0);
+    for (int i = 0; i < 8; i++)
+        args[i] = JS_NewInt64(g_js_ctx, vals[i]);
+    rv = JS_Call(g_js_ctx, g_js_fn, JS_UNDEFINED, 8, args);
+    if (JS_IsException(rv)) {
+        JSValue exc = JS_GetException(g_js_ctx);
+        const char *msg = JS_ToCString(g_js_ctx, exc);
+        __android_log_print(ANDROID_LOG_ERROR, "green-agent",
+                            "js hook error: %s", msg ? msg : "?");
+        if (msg)
+            JS_FreeCString(g_js_ctx, msg);
+        JS_FreeValue(g_js_ctx, exc);
+    } else {
+        int64_t v = 0;
+        JS_ToInt64(g_js_ctx, &v, rv);
+        out = v;
+    }
+    JS_FreeValue(g_js_ctx, rv);
+    for (int i = 0; i < 8; i++)
+        JS_FreeValue(g_js_ctx, args[i]);
+    pthread_mutex_unlock(&g_js_lock);
+    return out;
+}
+
+static JSValue js_native_log(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    for (int i = 0; i < argc; i++) {
+        const char *s = JS_ToCString(ctx, argv[i]);
+        if (s) {
+            __android_log_print(ANDROID_LOG_INFO, "green-js", "%s", s);
+            JS_FreeCString(ctx, s);
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_native_selftest_target(JSContext *ctx,
+                                         JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
+{
+    return JS_NewInt64(ctx, (int64_t)(uintptr_t)green_agent_test_target);
+}
+
+static JSValue js_native_hook(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    uint64_t target = 0;
+    int64_t status;
+
+    if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&target, argv[0]) != 0 ||
+        (target & 3) != 0 || !JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowInternalError(ctx, "hook(target, fn) expects an aligned address and a function");
+
+    status = green_agent_broker_request_full(GREEN_BROKER_PATCH, target,
+        (uint64_t)(uintptr_t)green_agent_js_trampoline, NULL, 0, NULL);
+    if (status != 0)
+        return JS_ThrowInternalError(ctx, "broker patch failed: %d", (int)status);
+
+    JS_FreeValue(ctx, g_js_fn);
+    g_js_fn = JS_DupValue(ctx, argv[1]);
+    g_js_hook_target = target;
+    g_js_ready = 1;
+    return JS_NewInt32(ctx, 0);
+}
+
+static int js_ensure_runtime(char *err, size_t errlen)
+{
+    pthread_mutex_lock(&g_js_lock);
+    if (!g_js_rt) {
+        g_js_rt = JS_NewRuntime();
+        if (!g_js_rt) {
+            pthread_mutex_unlock(&g_js_lock);
+            snprintf(err, errlen, "JS_NewRuntime failed");
+            return -1;
+        }
+        g_js_ctx = JS_NewContext(g_js_rt);
+        if (!g_js_ctx) {
+            pthread_mutex_unlock(&g_js_lock);
+            snprintf(err, errlen, "JS_NewContext failed");
+            return -1;
+        }
+        {
+            JSValue global = JS_GetGlobalObject(g_js_ctx);
+            JS_SetPropertyStr(g_js_ctx, global, "hook",
+                JS_NewCFunction(g_js_ctx, js_native_hook, "hook", 2));
+            JS_SetPropertyStr(g_js_ctx, global, "log",
+                JS_NewCFunction(g_js_ctx, js_native_log, "log", 1));
+            JS_SetPropertyStr(g_js_ctx, global, "selfTestTarget",
+                JS_NewCFunction(g_js_ctx, js_native_selftest_target,
+                                "selfTestTarget", 0));
+            JS_FreeValue(g_js_ctx, global);
+        }
+        g_js_fn = JS_UNDEFINED;
+        g_js_ready = 0;
+    }
+    pthread_mutex_unlock(&g_js_lock);
+    return 0;
+}
+
+static void green_agent_js_script_path(char *out, size_t out_size)
+{
+    char cmdline[128] = {0};
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    const char *slash;
+
+    if (fd >= 0) {
+        ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
+        if (n > 0)
+            cmdline[n] = '\0';
+    }
+    if (cmdline[0] == '\0')
+        snprintf(cmdline, sizeof(cmdline), "unknown");
+
+    slash = strrchr(cmdline, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - cmdline) + 1;
+        snprintf(out, out_size, "%.*sgreen_hook.js", (int)dir_len, cmdline);
+    } else {
+        /* Android app process: cmdline is the package name. */
+        snprintf(out, out_size,
+                 "/data/user/0/%s/cache/green_hook.js", cmdline);
+    }
+}
+
+static int green_agent_js_tool_handler(const struct green_agent_request *request,
+                                       struct green_agent_response *response,
+                                       void *userdata)
+{
+    char path[256];
+    char err[192] = {0};
+    char pkg[128] = {0};
+    int fd;
+    ssize_t n;
+    char *source;
+    size_t source_len;
+    JSValue rv;
+
+    (void)userdata;
+    green_agent_js_script_path(path, sizeof(path));
+
+    if (request->command == GREEN_AGENT_CMD_JS_LOAD) {
+        if (js_ensure_runtime(err, sizeof(err)) != 0) {
+            snprintf(response->message, sizeof(response->message), "%s", err);
+            return -EIO;
+        }
+
+        fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            snprintf(response->message, sizeof(response->message),
+                     "script not found: %s", path);
+            return -ENOENT;
+        }
+        source_len = (size_t)lseek(fd, 0, SEEK_END);
+        lseek(fd, 0, SEEK_SET);
+        source = malloc(source_len + 1);
+        n = read(fd, source, source_len);
+        close(fd);
+        if (n != (ssize_t)source_len) {
+            free(source);
+            snprintf(response->message, sizeof(response->message),
+                     "script read failed");
+            return -EIO;
+        }
+        source[source_len] = '\0';
+
+        /* Wrap in an IIFE: repeated loads get a fresh variable scope. */
+        char * wrapped = malloc(source_len + 32);
+        if (!wrapped) {
+            free(source);
+            return -ENOMEM;
+        }
+        snprintf(wrapped, source_len + 32, "(function(){\n%.*s\n})()",
+                 (int)source_len, source);
+
+        rv = JS_Eval(g_js_ctx, wrapped, strlen(wrapped), "green_hook.js",
+                     JS_EVAL_TYPE_GLOBAL);
+        free(wrapped);
+        free(source);
+        if (JS_IsException(rv)) {
+            JSValue exc = JS_GetException(g_js_ctx);
+            const char *msg = JS_ToCString(g_js_ctx, exc);
+            snprintf(response->message, sizeof(response->message),
+                     "script error: %s", msg ? msg : "?");
+            if (msg)
+                JS_FreeCString(g_js_ctx, msg);
+            JS_FreeValue(g_js_ctx, exc);
+            return -EIO;
+        }
+        JS_FreeValue(g_js_ctx, rv);
+
+        snprintf(response->message, sizeof(response->message),
+                 "script loaded from %s", path);
+        return 0;
+    }
+
+    if (request->command == GREEN_AGENT_CMD_JS_CALL) {
+        /* Indirect call through a volatile function pointer: the compiler
+         * must not inline the target, so the call goes through the patched
+         * entry and the shadow redirect actually fires. */
+        static int (*volatile js_probe)(int) = green_agent_test_target;
+        int during = js_probe(1);
+
+        response->value = (uint64_t)during;
+        snprintf(response->message, sizeof(response->message),
+                 "probe during=%d", during);
+        return 0;
+    }
+
+    return -EOPNOTSUPP;
+}
+
+static const struct green_agent_tool green_agent_js_tool = {
+    .id = GREEN_AGENT_TOOL_JS,
+    .name = "js",
+    .handler = green_agent_js_tool_handler,
 };
 
 static struct green_agent_registry green_agent_registry = {
@@ -428,6 +685,7 @@ static void green_agent_start_once(void)
     struct sigaction ignored;
 
     green_agent_register_tool(&green_agent_hook_tool);
+    green_agent_register_tool(&green_agent_js_tool);
     memset(&ignored, 0, sizeof(ignored));
     ignored.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &ignored, NULL);

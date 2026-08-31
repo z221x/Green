@@ -99,13 +99,15 @@ $(TESTHOOK): tests/test_hook.c green_hook/green_gum.h $(GUM_SRCS) include/green/
 AGENT_PAYLOAD := $(BUILD_DIR)/libgreen_agent.so
 # Payload: pure transport (no gum).  Privileged page-table operations are
 # performed by the root-side broker inside the green CLI.
+GUM_PREFIX := vendor/prefix
 agent: $(AGENT_PAYLOAD)
 
 $(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
-		-Iagent -o $@ agent/green_agent.c -pthread -llog
+		-Iagent -I$(CURDIR)/$(GUM_PREFIX)/include/quickjs \
+		-o $@ agent/green_agent.c $(GUM_PREFIX)/lib/libquickjs.a -lm -llog -pthread
 
 .PHONY: clean
 clean:
