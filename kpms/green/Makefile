@@ -37,9 +37,9 @@ CFLAGS += -Os -fno-stack-protector -fno-builtin -nostdinc -fno-PIC \
 KPM_SRCS := green.c \
             common/symbol.c \
             emu/emu.c \
-            hook/shadow_hook.c \
-            hook/shadow_hook_pgtable.c \
-            hook/shadow_hook_fault.c
+            shadow/shadow.c \
+            shadow/shadow_pgtable.c \
+            shadow/shadow_fault.c
 KPM_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(KPM_SRCS))
 KPM_HEADERS := $(wildcard include/*.h include/green/*.h)
 
@@ -66,6 +66,18 @@ $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -Iinclude -o $@ $(CLI_SRCS)
+
+.PHONY: testhook
+TESTHOOK := $(BUILD_DIR)/test_hook
+
+# green_hook 用例：验证 patch 执行 / 读原始 / 恢复 三条 gum 语义。
+testhook: $(TESTHOOK)
+
+$(TESTHOOK): tests/test_hook.c hook/gum_io_shadow.c include/green/gum_io.h include/green/abi.h
+	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
+	mkdir -p $(dir $@)
+	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -mbranch-protection=none \
+		-Iinclude -o $@ tests/test_hook.c hook/gum_io_shadow.c
 
 .PHONY: clean
 clean:

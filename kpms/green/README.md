@@ -19,13 +19,18 @@ kpms/green/
 │   ├── green/emu.h          # 单指令模拟器公共接口
 │   ├── green/symbol.h       # 内核符号地址与解析接口
 │   └── green/hook.h         # shadow 工具对外 API
-├── hook/
-│   ├── shadow_hook.c        # shadow 工具生命周期、prctl ABI、页对象管理
-│   ├── shadow_hook_pgtable.c# 页表切换、TLB/cache 维护
-│   └── shadow_hook_fault.c  # page fault / GUP / exit_mmap hooks
+├── shadow/
+│   ├── shadow.c             # shadow 工具生命周期、prctl ABI、页对象管理
+│   ├── shadow_pgtable.c     # 页表切换、TLB/cache 维护
+│   └── shadow_fault.c       # page fault / GUP / exit_mmap 处理与同页模拟
+├── hook/                    # green_hook：gum 内存 I/O 的 shadow 替换层
+│   ├── IO_MAP.md            # gum 底层内存 I/O 函数与调用点梳理
+│   └── gum_io_shadow.c      # gummemory API 的 shadow 实现 + 重定向写入器
 ├── common/
 │   ├── common.c             # CLI 公共解析、solist、prctl、process_vm helpers
 │   └── symbol.c             # KPM 内核符号提取与地址解析
+├── tests/
+│   └── test_hook.c          # green_hook 端到端用例（patch/读原始/恢复）
 └── cli/
     ├── main.c               # CLI 工具分发入口
     ├── README.md             # CLI 扩展说明
@@ -59,6 +64,7 @@ Green 的 shadow 工具重新实现了一个 patch-oriented 的 R^X / W^X shadow
 cd kpms/green
 make TARGET_COMPILE=aarch64-elf-
 make client
+make testhook
 ```
 
 所有构建产物统一输出到 `build/`：
@@ -67,6 +73,7 @@ make client
 build/
 ├── green.kpm              # KPM
 ├── green                  # Android ARM64 CLI
+├── test_hook              # green_hook 端到端用例（需 root + 已加载 KPM）
 └── *.o                    # KPM 中间目标文件
 ```
 
@@ -75,6 +82,30 @@ build/
 ```sh
 make TARGET_COMPILE=aarch64-elf- KP_DIR=/path/to/KernelPatch-0.13.3
 ```
+
+## green_hook（gum 兼容层）
+
+`hook/` 组件把 frida-gum 的底层内存 I/O 全部替换为 shadow 操作（详见 `hook/IO_MAP.md`）：
+
+- `green_gum_memory_patch_code()` ↔ gum `gum_memory_patch_code()`：apply 回调写入本地缓冲，提交到 shadow 页；执行看到补丁，读取看到原始字节。
+- `green_gum_memory_read()` ↔ gum `gum_memory_read()`：仍走 `process_vm_readv`，GUP hook 返回原始页。
+- `green_gum_release_page()` ↔ gum `deactivate_trampoline` 的回填：恢复原始 PTE。
+- 重定向写入器按 `gumarm64writer` 编码移植（B imm26 / LDR+BR+literal / ADRP / NOP）。
+
+用例（设备上以 root 运行，需先加载 KPM）：
+
+```sh
+make testhook
+adb push build/test_hook /data/local/tmp/
+adb shell su -c /data/local/tmp/test_hook
+```
+
+验证点：
+
+1. `target_fn()` 被重定向到 `replacement_fn()`（执行看到 shadow 补丁）；
+2. GUP 读与直接读均返回原始字节（读取看到 original page）；
+3. `ldr x16,#8` 从 shadow 页自身的 literal pool 取地址（同页自读模拟）；
+4. release 后 `target_fn()` 恢复原行为。
 
 ## CLI 用法
 

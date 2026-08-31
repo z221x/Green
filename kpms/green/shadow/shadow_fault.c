@@ -38,7 +38,12 @@ static int green_shadow_emu_read(void *ctx, u64 addr, void *buf,
     if (offset > GREEN_PAGE_SIZE || size > GREEN_PAGE_SIZE - offset)
         return GREEN_EMU_BAD_MEMORY;
 
-    kva = green_phys_to_kva(page->original_pfn << GREEN_PAGE_SHIFT);
+    /* Same-page reads execute ON the shadow page (patched code reading its
+     * own literal pool, e.g. an LDR/BR redirect).  Those reads must observe
+     * the patched bytes, so resolve data from the shadow copy, not from the
+     * original page.  Integrity checks from other code take the PTE-switch
+     * or GUP paths instead and never reach this callback. */
+    kva = (unsigned long)page->shadow_kva;
     if (!green_is_kva(kva))
         return GREEN_EMU_BAD_MEMORY;
     memcpy(buf, (void *)(kva + offset), size);
