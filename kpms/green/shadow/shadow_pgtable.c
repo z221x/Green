@@ -79,17 +79,23 @@ int green_shadow_detect_paging(void)
 int green_shadow_check_epan(void)
 {
     u64 mmfr1;
+    u64 pan;
 
     asm volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
 
-    /* ID_AA64MMFR1_EL1.EPAN, bits [63:60]: 0 = not implemented. */
-    if ((mmfr1 >> 60) == 0) {
-        pr_err("green_shadow: FEAT_EPAN is a hard requirement and this CPU does not implement it (ID_AA64MMFR1_EL1.EPAN=0)\n");
+    /* FEAT_EPAN is FEAT_PAN3: the ID_AA64MMFR1_EL1.PAN field (bits
+     * [23:20]) must read 3.  This mirrors the kernel's ARM64_HAS_EPAN
+     * matcher exactly (field_pos = ID_AA64MMFR1_PAN_SHIFT == 20,
+     * min_field_value = 3).  PAN=1 is FEAT_PAN, PAN=2 is FEAT_PAN2. */
+    pan = (mmfr1 >> 20) & 0xf;
+    if (pan < 3) {
+        pr_err("green_shadow: FEAT_EPAN is a hard requirement and this CPU does not implement it (ID_AA64MMFR1_EL1.PAN=%llu)\n",
+               pan);
         return -EOPNOTSUPP;
     }
 
-    pr_info("green_shadow: FEAT_EPAN detected (ID_AA64MMFR1_EL1.EPAN=%llu)\n",
-            (unsigned long long)(mmfr1 >> 60));
+    pr_info("green_shadow: FEAT_EPAN detected (ID_AA64MMFR1_EL1.PAN=%llu)\n",
+            pan);
     return 0;
 }
 
