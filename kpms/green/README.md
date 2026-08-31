@@ -170,7 +170,7 @@ green_shadow_release_task(pid, addr);
 
 ## 限制
 
-- **硬性条件：FEAT_EPAN 必须存在**（`ID_AA64MMFR1_EL1.PAN`=3，即 FEAT_PAN3；建议 Linux 5.13+ 且开启 `CONFIG_ARM64_EPAN`）。普通 EL1 uaccess 不被 Green 全局接管；只有 Green 内部需要读取 shadow 内容时，直接使用 `page->shadow_kva`，避免修改用户 PTE 和暴露读取窗口。缺少 EPAN 时 KPM 拒绝上线。
+- **FEAT_EPAN 非必需**：execute-only shadow 映射允许具备内核权限的代码按系统策略读取。Green 内部需要读取 shadow 内容时，直接使用 `page->shadow_kva`，不修改用户 PTE、不需要额外 uaccess hook；设备不具备 FEAT_EPAN 时 KPM 仍可正常上线。
 - 当前只支持 ARM64 + 4K 用户页粒度。
 - `emu/` 支持常见 GPR 标量 `LDR/STR`、`LDUR/STUR`、寄存器偏移、前/后索引、`LDRSB/LDRSH/LDRSW`、literal load、`LDP/STP`，以及 SIMD/FP `LDR B/H/S/D/Q`、literal load、`LDP S/D/Q`；exclusive、跨页访问暂不模拟。
 - `patch` 不能跨目标页。

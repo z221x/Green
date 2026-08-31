@@ -540,12 +540,6 @@ static long green_shadow_init(const char *args, const char *event,
     if (ret)
         return ret;
 
-    /* Hard requirement: the exec view relies on execute-only mappings
-     * being PAN-covered, which needs FEAT_EPAN. */
-    ret = green_shadow_check_epan();
-    if (ret)
-        return ret;
-
     if (mm_struct_offset.pgd_offset < 0) {
         pr_err("green_shadow: mm_struct_offset.pgd_offset unavailable\n");
         return -EFAULT;

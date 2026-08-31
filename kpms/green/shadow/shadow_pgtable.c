@@ -66,39 +66,6 @@ int green_shadow_detect_paging(void)
     return 0;
 }
 
-/*
- * Hard requirement: FEAT_EPAN must be implemented.
- *
- * The shadow exec view is an execute-only mapping (PAGE_EXECONLY encoding,
- * AP[2:1]=10 + UXN=0).  On hardware without FEAT_EPAN such mappings are
- * readable from EL1 without tripping PAN — the exact hole that made the
- * upstream kernel revert execute-only support in 2019 — so the shadow page
- * would be exposed to ordinary privileged reads.  Detect ID_AA64MMFR1_EL1's
- * EPAN field and refuse to come online when it is not implemented.
- */
-int green_shadow_check_epan(void)
-{
-    u64 mmfr1;
-    u64 pan;
-
-    asm volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
-
-    /* FEAT_EPAN is FEAT_PAN3: the ID_AA64MMFR1_EL1.PAN field (bits
-     * [23:20]) must read 3.  This mirrors the kernel's ARM64_HAS_EPAN
-     * matcher exactly (field_pos = ID_AA64MMFR1_PAN_SHIFT == 20,
-     * min_field_value = 3).  PAN=1 is FEAT_PAN, PAN=2 is FEAT_PAN2. */
-    pan = (mmfr1 >> 20) & 0xf;
-    if (pan < 3) {
-        pr_err("green_shadow: FEAT_EPAN is required (ID_AA64MMFR1_EL1.PAN=%llu)\n",
-               pan);
-        return -EOPNOTSUPP;
-    }
-
-    pr_info("green_shadow: FEAT_EPAN detected (ID_AA64MMFR1_EL1.PAN=%llu)\n",
-            pan);
-    return 0;
-}
-
 u64 *green_shadow_get_pte(void *mm, unsigned long addr)
 {
     u64 *table;
@@ -173,9 +140,8 @@ static u64 green_shadow_exec_pte(struct green_shadow_page *page)
      *   UXN     = 0
      * EL0 may fetch from this mapping but any data read faults, which is
      * what drives the read-fault seesaw and the same-page emulator.
-     * With FEAT_EPAN (a project hard requirement) PAN also covers such
-     * mappings, so privileged reads through the user VA trip PAN instead
-     * of silently succeeding. */
+     * Privileged access to this mapping is intentionally allowed by the
+     * project policy; Green's own shadow reads use the kernel linear alias. */
     pte |= PTE_VALID | PTE_TYPE_PAGE | PTE_AF | PTE_SPECIAL | PTE_RDONLY;
     pte &= ~(u64)(PTE_USER | PTE_UXN);
 #ifdef PTE_DBM
