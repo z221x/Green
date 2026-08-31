@@ -128,13 +128,13 @@ static int green_agent_broker_request(uint32_t command, uint64_t addr,
     return status;
 }
 
-__attribute__((noinline)) static int green_agent_test_target(int value)
+__attribute__((noinline, aligned(4096))) static int green_agent_test_target(int value)
 {
     asm volatile("" ::: "memory");
     return value + 1;
 }
 
-__attribute__((noinline)) static int green_agent_test_replacement(int value)
+__attribute__((noinline, aligned(4096))) static int green_agent_test_replacement(int value)
 {
     asm volatile("" ::: "memory");
     return value + 100;
