@@ -98,9 +98,10 @@ enum green_broker_command {
 struct green_broker_request {
     uint32_t magic;
     uint32_t command;
-    uint64_t addr; /* PATCH: target address; RELEASE: page address */
-    uint64_t arg;  /* PATCH: replacement address */
-    uint32_t len;  /* always 0; the CLI snapshots the page itself */
+    uint64_t addr; /* PATCH: target/page address; RELEASE: page address */
+    uint64_t arg;  /* PATCH, len==0: replacement address */
+    uint32_t len;  /* PATCH image bytes following this header (0..4096);
+                    * len==0 means the broker snapshots the page itself */
     uint32_t reserved;
 };
 
@@ -109,6 +110,11 @@ struct green_broker_response {
     uint32_t reserved;
     int64_t value;
 };
+
+/* Called by the vendored gum memory backend to commit a page image to the
+ * shadow copy through the root-side broker.  Implemented by the transport. */
+int green_agent_broker_page_commit(uint64_t page_address,
+                                   const void *image, size_t len);
 
 static inline int green_agent_broker_name(pid_t pid, char *out, size_t out_size)
 {

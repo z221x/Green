@@ -16,9 +16,12 @@
 #include <signal.h>
 #include <stddef.h>
 #include <string.h>
+#include <android/log.h>
 #include <sys/socket.h>
 #include <linux/un.h>
 #include <unistd.h>
+
+#define AGLOG(...) __android_log_print(ANDROID_LOG_INFO, "green-agent", __VA_ARGS__)
 
 
 struct green_agent_registry {
@@ -95,8 +98,9 @@ int green_agent_register_tool(const struct green_agent_tool *tool)
 /* Forward a privileged operation to the root-side broker over the
  * connection the broker established.  Returns -ENOENT while no broker is
  * attached. */
-static int green_agent_broker_request(uint32_t command, uint64_t addr,
-                                      uint64_t arg, int64_t *value)
+static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
+                                           uint64_t arg, const void *payload,
+                                           uint32_t len, int64_t *value)
 {
     struct green_broker_request request;
     struct green_broker_response response;
@@ -112,10 +116,14 @@ static int green_agent_broker_request(uint32_t command, uint64_t addr,
     request.command = command;
     request.addr = addr;
     request.arg = arg;
-    if (write(green_agent_broker_fd, &request, sizeof(request)) !=
-            (ssize_t)sizeof(request) ||
-        read(green_agent_broker_fd, &response, sizeof(response)) !=
-            (ssize_t)sizeof(response)) {
+    request.len = len;
+    if (green_agent_write_full(green_agent_broker_fd, &request,
+                               sizeof(request)) != 0 ||
+        (len != 0 &&
+            green_agent_write_full(green_agent_broker_fd, payload, len) !=
+                0) ||
+        green_agent_read_full(green_agent_broker_fd, &response,
+                              sizeof(response)) != 0) {
         close(green_agent_broker_fd);
         green_agent_broker_fd = -1;
         pthread_mutex_unlock(&green_agent_broker_lock);
@@ -126,6 +134,19 @@ static int green_agent_broker_request(uint32_t command, uint64_t addr,
     if (value)
         *value = response.value;
     return status;
+}
+
+static int green_agent_broker_request(uint32_t command, uint64_t addr,
+                                      uint64_t arg, int64_t *value)
+{
+    return green_agent_broker_request_full(command, addr, arg, NULL, 0, value);
+}
+
+int green_agent_broker_page_commit(uint64_t page_address, const void *image,
+                                   size_t len)
+{
+    return green_agent_broker_request_full(GREEN_BROKER_PATCH, page_address,
+                                           0, image, (uint32_t)len, NULL);
 }
 
 __attribute__((noinline, aligned(4096))) static int green_agent_test_target(int value)
@@ -151,6 +172,8 @@ static int green_agent_hook_self_test(struct green_agent_response *response)
     if (before != 2)
         return -EFAULT;
 
+    /* The root-side broker snapshots this page (process_vm_readv), emits the
+     * GumArm64Writer redirect and commits it through the shadow ABI. */
     status = green_agent_broker_request(
         GREEN_BROKER_PATCH, (uint64_t)(uintptr_t)green_agent_test_target,
         (uint64_t)(uintptr_t)green_agent_test_replacement, &value);
@@ -260,6 +283,9 @@ static int green_agent_dispatch(int fd, const struct green_agent_request *reques
     uid_t uid;
     int status;
 
+    AGLOG("dispatch fd=%d tool=%u cmd=%u", fd, request->tool,
+          request->command);
+
     if (request->tool == GREEN_AGENT_TOOL_CORE) {
         if (request->command == GREEN_AGENT_CMD_BROKER_ATTACH) {
             /* Only root may become the broker.  dup() the connection so it
@@ -271,11 +297,13 @@ static int green_agent_dispatch(int fd, const struct green_agent_request *reques
             int dupfd = dup(fd);
             if (dupfd < 0)
                 return -EIO;
+            AGLOG("attach: peer fd=%d dupfd=%d uid=%d", fd, dupfd, (int)uid);
             pthread_mutex_lock(&green_agent_broker_lock);
             if (green_agent_broker_fd >= 0)
                 close(green_agent_broker_fd);
             green_agent_broker_fd = dupfd;
             pthread_mutex_unlock(&green_agent_broker_lock);
+            AGLOG("attach: peer fd=%d dupfd=%d uid=%d", fd, dupfd, (int)uid);
             snprintf(response->message, sizeof(response->message),
                      "broker attached pid=%d", (int)getpid());
             return 0;

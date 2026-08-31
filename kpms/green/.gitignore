@@ -7,3 +7,9 @@ build/
 *.kpm
 
 compile_commands.json
+# Vendored open-source sources and cross-build outputs are fetched/built
+# locally (see vendor/README.md); only our own scripts and configs are committed.
+vendor/frida-gum/
+vendor/prefix/
+vendor/meson14/
+vendor/scratch/
