@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
@@ -31,6 +32,8 @@ static struct green_agent_registry green_agent_registry = {
 };
 static pthread_once_t green_agent_once = PTHREAD_ONCE_INIT;
 static int green_agent_server_fd = -1;
+static int green_agent_broker_fd = -1;
+static pthread_mutex_t green_agent_broker_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int green_agent_read_full(int fd, void *buf, size_t size)
 {
@@ -89,46 +92,40 @@ int green_agent_register_tool(const struct green_agent_tool *tool)
     return 0;
 }
 
+/* Forward a privileged operation to the root-side broker over the
+ * connection the broker established.  Returns -ENOENT while no broker is
+ * attached. */
 static int green_agent_broker_request(uint32_t command, uint64_t addr,
                                       uint64_t arg, int64_t *value)
 {
-    struct sockaddr_un address;
     struct green_broker_request request;
     struct green_broker_response response;
-    char name[sizeof(address.sun_path) - 1];
-    int fd;
-    int name_len;
+    int status;
 
-    name_len = green_agent_broker_name(getpid(), name, sizeof(name));
-    if (name_len < 0)
-        return -EINVAL;
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0)
-        return -errno;
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    address.sun_path[0] = '\0';
-    memcpy(address.sun_path + 1, name, (size_t)name_len);
-    if (connect(fd, (struct sockaddr *)&address,
-                (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len)) != 0) {
-        close(fd);
+    pthread_mutex_lock(&green_agent_broker_lock);
+    if (green_agent_broker_fd < 0) {
+        pthread_mutex_unlock(&green_agent_broker_lock);
         return -ENOENT;
     }
-
     memset(&request, 0, sizeof(request));
     request.magic = GREEN_AGENT_MAGIC;
     request.command = command;
     request.addr = addr;
     request.arg = arg;
-    if (write(fd, &request, sizeof(request)) != (ssize_t)sizeof(request) ||
-        read(fd, &response, sizeof(response)) != (ssize_t)sizeof(response)) {
-        close(fd);
+    if (write(green_agent_broker_fd, &request, sizeof(request)) !=
+            (ssize_t)sizeof(request) ||
+        read(green_agent_broker_fd, &response, sizeof(response)) !=
+            (ssize_t)sizeof(response)) {
+        close(green_agent_broker_fd);
+        green_agent_broker_fd = -1;
+        pthread_mutex_unlock(&green_agent_broker_lock);
         return -EIO;
     }
-    close(fd);
+    pthread_mutex_unlock(&green_agent_broker_lock);
+    status = response.status;
     if (value)
         *value = response.value;
-    return response.status;
+    return status;
 }
 
 __attribute__((noinline)) static int green_agent_test_target(int value)
@@ -263,8 +260,23 @@ static int green_agent_dispatch(int fd, const struct green_agent_request *reques
     uid_t uid;
     int status;
 
-    if (request->tool == GREEN_AGENT_TOOL_CORE)
+    if (request->tool == GREEN_AGENT_TOOL_CORE) {
+        if (request->command == GREEN_AGENT_CMD_BROKER_ATTACH) {
+            /* Only root may become the broker.  The caller keeps this
+             * connection open and serves forwarded requests on it. */
+            if (green_agent_peer_uid(fd, &uid) != 0 || uid != 0)
+                return -EPERM;
+            pthread_mutex_lock(&green_agent_broker_lock);
+            if (green_agent_broker_fd >= 0)
+                close(green_agent_broker_fd);
+            green_agent_broker_fd = fd;
+            pthread_mutex_unlock(&green_agent_broker_lock);
+            snprintf(response->message, sizeof(response->message),
+                     "broker attached pid=%d", (int)getpid());
+            return 0;
+        }
         return green_agent_core_dispatch(request, response);
+    }
 
     /* Mutating target memory is a root-controller operation.  The injected
      * process itself is normally an unprivileged Android app. */
@@ -284,6 +296,8 @@ static int green_agent_dispatch(int fd, const struct green_agent_request *reques
     pthread_mutex_unlock(&green_agent_registry.lock);
     return -ENOENT;
 }
+
+static void *green_agent_handle_client(void *arg);
 
 static void *green_agent_server_main(void *unused)
 {
@@ -313,35 +327,74 @@ static void *green_agent_server_main(void *unused)
 
     for (;;) {
         int client = accept(green_agent_server_fd, NULL, NULL);
+        pthread_t thread;
+        int *fdp;
+
         if (client < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
-        for (;;) {
-            struct green_agent_request request;
-            struct green_agent_response response;
-            int status;
-
-            if (green_agent_read_full(client, &request, sizeof(request)) != 0)
-                break;
-            green_agent_response_init(&response);
-            if (request.magic != GREEN_AGENT_MAGIC ||
-                request.version != GREEN_AGENT_VERSION ||
-                request.size != sizeof(request)) {
-                status = -EPROTO;
-            } else {
-                status = green_agent_dispatch(client, &request, &response);
-            }
-            response.status = status;
-            if (status != 0 && response.message[0] == '\0')
-                snprintf(response.message, sizeof(response.message),
-                         "agent command failed: %d", status);
-            if (green_agent_write_full(client, &response, sizeof(response)) != 0)
-                break;
+        fdp = malloc(sizeof(*fdp));
+        if (!fdp) {
+            close(client);
+            continue;
         }
-        close(client);
+        *fdp = client;
+        if (pthread_create(&thread, NULL, green_agent_handle_client, fdp) == 0)
+            pthread_detach(thread);
+        else
+            close(client);
     }
+    return NULL;
+}
+
+/* One thread per connection.  A BROKER_ATTACH connection is kept open: the
+ * thread blocks until the root side disconnects (broker channel closed). */
+static void *green_agent_handle_client(void *arg)
+{
+    int client = *(int *)arg;
+    free(arg);
+    int is_broker = 0;
+
+    for (;;) {
+        struct green_agent_request request;
+        struct green_agent_response response;
+        int status;
+
+        if (green_agent_read_full(client, &request, sizeof(request)) != 0)
+            break;
+        green_agent_response_init(&response);
+        if (request.magic != GREEN_AGENT_MAGIC ||
+            request.version != GREEN_AGENT_VERSION ||
+            request.size != sizeof(request)) {
+            status = -EPROTO;
+        } else {
+            status = green_agent_dispatch(client, &request, &response);
+        }
+        response.status = status;
+        if (status != 0 && response.message[0] == '\0')
+            snprintf(response.message, sizeof(response.message),
+                     "agent command failed: %d", status);
+        if (green_agent_write_full(client, &response, sizeof(response)) != 0)
+            break;
+        if (request.tool == GREEN_AGENT_TOOL_CORE &&
+            request.command == GREEN_AGENT_CMD_BROKER_ATTACH) {
+            is_broker = 1;
+            /* Serve as the broker channel: block until root disconnects. */
+            {
+                char drop;
+                while (read(client, &drop, 1) > 0)
+                    ;
+            }
+            pthread_mutex_lock(&green_agent_broker_lock);
+            if (green_agent_broker_fd == client)
+                green_agent_broker_fd = -1;
+            pthread_mutex_unlock(&green_agent_broker_lock);
+            break;
+        }
+    }
+    close(client);
     return NULL;
 }
 

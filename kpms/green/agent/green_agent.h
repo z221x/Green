@@ -24,7 +24,11 @@ enum green_agent_tool_id {
 
 enum green_agent_core_command {
     GREEN_AGENT_CMD_PING = 1,
-    GREEN_AGENT_CMD_STATUS = 2,
+    /* Root connects to the agent socket and attaches as the broker; the
+     * agent then forwards privileged page-table requests over that
+     * connection.  (SELinux forbids untrusted_app -> root connectto, so the
+     * connection must be established by root.) */
+    GREEN_AGENT_CMD_BROKER_ATTACH = 3,
 };
 
 enum green_agent_hook_command {

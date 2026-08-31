@@ -59,21 +59,13 @@ $(BUILD_DIR)/%.o: %.c $(KPM_HEADERS)
 .PHONY: client
 client: $(CLIENT)
 
-CLI_GUM_VENDOR_DIR := green_hook/vendor/gum
-CLI_GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
-CLI_GUM_SRCS := green_hook/gummemory-green.c \
-                $(CLI_GUM_VENDOR_DIR)/gumlibc.c \
-                $(CLI_GUM_VENDOR_DIR)/gummetalarray.c \
-                $(CLI_GUM_VENDOR_DIR)/gummetalhash.c \
-                $(CLI_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
-CLI_SRCS := cli/main.c common/common.c cli/shadow.c $(CLI_GUM_SRCS)
+CLI_SRCS := cli/main.c common/common.c cli/shadow.c
 CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
 
 $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
-	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -Iinclude -Iagent \
-		$(CLI_GUM_SHIM_FLAGS) -o $@ $(CLI_SRCS)
+	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -Iinclude -Iagent -o $@ $(CLI_SRCS)
 
 .PHONY: testhook
 TESTHOOK := $(BUILD_DIR)/test_hook
@@ -108,11 +100,20 @@ $(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h
 	$(ANDROID_CC) -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
 		-Iagent -o $@ agent/green_agent.c -pthread
 
-$(AGENT_CTL): agent/green_agent_ctl.c agent/green_agent.h include/green/abi.h
+CTL_GUM_VENDOR_DIR := green_hook/vendor/gum
+CTL_GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
+CTL_GUM_SRCS := green_hook/gummemory-green.c \
+                $(CTL_GUM_VENDOR_DIR)/gumlibc.c \
+                $(CTL_GUM_VENDOR_DIR)/gummetalarray.c \
+                $(CTL_GUM_VENDOR_DIR)/gummetalhash.c \
+                $(CTL_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
+
+$(AGENT_CTL): agent/green_agent_ctl.c agent/green_agent.h include/green/abi.h \
+                 $(CTL_GUM_SRCS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
-	$(ANDROID_CC) -D_GNU_SOURCE -O2 -Wall -Wextra \
-		-Iagent -Iinclude -o $@ agent/green_agent_ctl.c -ldl
+	$(ANDROID_CC) -D_GNU_SOURCE -O2 -Wall -Wextra -Iagent -Iinclude \
+		$(CTL_GUM_SHIM_FLAGS) -o $@ agent/green_agent_ctl.c $(CTL_GUM_SRCS) -ldl
 
 .PHONY: clean
 clean:

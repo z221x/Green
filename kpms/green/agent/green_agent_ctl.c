@@ -13,6 +13,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+
+#include <green/abi.h>
+#include <sys/prctl.h>
 #include <linux/ptrace.h>
 #include <signal.h>
 #include <stdio.h>
@@ -22,6 +25,8 @@
 #include <sys/socket.h>
 #include <linux/un.h>
 #include <sys/uio.h>
+
+#include <gum/arch-arm64/gumarm64writer.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -288,6 +293,116 @@ disable:
     return -1;
 }
 
+/* Broker mode: attach to the agent as root, then serve the agent's
+ * privileged page-table requests (snapshot + writer + prctl). */
+static int broker_serve(pid_t pid)
+{
+    struct sockaddr_un address;
+    struct green_agent_request request;
+    struct green_agent_response response;
+    char name[sizeof(address.sun_path) - 1];
+    int fd;
+    int name_len;
+
+    name_len = green_agent_socket_name(pid, name, sizeof(name));
+    if (name_len < 0)
+        return -1;
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    address.sun_path[0] = '\0';
+    memcpy(address.sun_path + 1, name, (size_t)name_len);
+    if (connect(fd, (struct sockaddr *)&address,
+                (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len)) != 0) {
+        perror("connect agent");
+        close(fd);
+        return -1;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request.magic = GREEN_AGENT_MAGIC;
+    request.version = GREEN_AGENT_VERSION;
+    request.tool = GREEN_AGENT_TOOL_CORE;
+    request.command = GREEN_AGENT_CMD_BROKER_ATTACH;
+    request.size = sizeof(request);
+    if (write(fd, &request, sizeof(request)) != (ssize_t)sizeof(request) ||
+        read(fd, &response, sizeof(response)) != (ssize_t)sizeof(response) ||
+        response.status != 0) {
+        fprintf(stderr, "broker attach failed\n");
+        close(fd);
+        return -1;
+    }
+    printf("broker attached to pid %d\n", (int)pid);
+    fflush(stdout);
+
+    for (;;) {
+        struct green_broker_request request;
+        struct green_broker_response response;
+        static guint8 snapshot[4096];
+        long pr = 0;
+
+        if (read(fd, &request, sizeof(request)) != (ssize_t)sizeof(request))
+            break;
+        memset(&response, 0, sizeof(response));
+        if (request.magic != GREEN_AGENT_MAGIC) {
+            response.status = -EBADMSG;
+        } else if (request.command == GREEN_BROKER_PATCH) {
+            unsigned long page = request.addr & ~4095UL;
+            size_t offset = (size_t)(request.addr - page);
+            struct iovec local = { .iov_base = snapshot,
+                                   .iov_len = sizeof(snapshot) };
+            struct iovec remote = { .iov_base = (void *)page,
+                                    .iov_len = sizeof(snapshot) };
+            GumArm64Writer writer;
+            ssize_t n;
+
+            if ((request.addr & 3) || (request.arg & 3) || offset > 4096 - 16) {
+                response.status = -EINVAL;
+            } else {
+                do {
+                    n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
+                } while (n < 0 && errno == EINTR);
+                if (n != (ssize_t)sizeof(snapshot)) {
+                    response.status = -EIO;
+                } else {
+                    gum_arm64_writer_init(&writer, snapshot + offset);
+                    writer.pc = (GumAddress)request.addr;
+                    gum_arm64_writer_put_ldr_reg_address(
+                        &writer, ARM64_REG_X16, (guint64)request.arg);
+                    gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
+                    gum_arm64_writer_flush(&writer);
+                    gum_arm64_writer_clear(&writer);
+                    pr = prctl((int)PR_GREEN_SHADOW_PATCH, (unsigned long)pid,
+                               page, (unsigned long)snapshot,
+                               sizeof(snapshot));
+                    response.status = pr < 0 ? -(int)errno : 0;
+                    response.value = pr;
+                }
+            }
+        } else if (request.command == GREEN_BROKER_RELEASE) {
+            pr = prctl((int)PR_GREEN_SHADOW_RELEASE, (unsigned long)pid,
+                       request.addr, 0, 0);
+            response.status = pr < 0 ? -(int)errno : 0;
+            response.value = pr;
+        } else if (request.command == GREEN_BROKER_COUNT) {
+            pr = prctl((int)PR_GREEN_SHADOW_COUNT, (unsigned long)pid, 0, 0, 0);
+            response.status = pr < 0 ? -(int)errno : 0;
+            response.value = pr;
+        } else {
+            response.status = -EOPNOTSUPP;
+        }
+        if (write(fd, &response, sizeof(response)) != (ssize_t)sizeof(response))
+            break;
+    }
+    close(fd);
+    printf("broker channel closed\n");
+    return 0;
+}
+
 static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
                          uint64_t arg0, uint64_t arg1, uint64_t arg2)
 {
@@ -342,6 +457,7 @@ static void usage(const char *program)
             "  %s inject --pid PID --so /path/in/target/libgreen_agent.so\n"
             "  %s ping --pid PID\n"
             "  %s self-test --pid PID\n"
+            "  %s broker --pid PID\n"
             "  %s hook --pid PID --target ADDR --replacement ADDR [--len N]\n"
             "  %s release --pid PID --target ADDR\n", program, program,
             program, program, program, program);
@@ -410,6 +526,8 @@ int main(int argc, char **argv)
     if (!strcmp(command, "ping"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_CORE,
                              GREEN_AGENT_CMD_PING, 0, 0, 0);
+    if (!strcmp(command, "broker"))
+        return broker_serve((pid_t)pid_value);
     if (!strcmp(command, "self-test"))
         return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
                              GREEN_AGENT_HOOK_SELF_TEST, 0, 0, 0);
