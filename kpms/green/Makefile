@@ -59,13 +59,21 @@ $(BUILD_DIR)/%.o: %.c $(KPM_HEADERS)
 .PHONY: client
 client: $(CLIENT)
 
-CLI_SRCS := cli/main.c common/common.c cli/shadow.c
+CLI_GUM_VENDOR_DIR := green_hook/vendor/gum
+CLI_GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
+CLI_GUM_SRCS := green_hook/gummemory-green.c \
+                $(CLI_GUM_VENDOR_DIR)/gumlibc.c \
+                $(CLI_GUM_VENDOR_DIR)/gummetalarray.c \
+                $(CLI_GUM_VENDOR_DIR)/gummetalhash.c \
+                $(CLI_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
+CLI_SRCS := cli/main.c common/common.c cli/shadow.c $(CLI_GUM_SRCS)
 CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
 
 $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
-	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -Iinclude -Iagent -o $@ $(CLI_SRCS)
+	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -Iinclude -Iagent \
+		$(CLI_GUM_SHIM_FLAGS) -o $@ $(CLI_SRCS)
 
 .PHONY: testhook
 TESTHOOK := $(BUILD_DIR)/test_hook
@@ -90,23 +98,15 @@ $(TESTHOOK): tests/test_hook.c green_hook/green_gum.h $(GUM_SRCS) include/green/
 .PHONY: agent
 AGENT_PAYLOAD := $(BUILD_DIR)/libgreen_agent.so
 AGENT_CTL := $(BUILD_DIR)/green_agent_ctl
-AGENT_GUM_VENDOR_DIR := green_hook/vendor/gum
-AGENT_GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
-AGENT_GUM_SRCS := green_hook/gummemory-green.c \
-                 $(AGENT_GUM_VENDOR_DIR)/gumlibc.c \
-                 $(AGENT_GUM_VENDOR_DIR)/gummetalarray.c \
-                 $(AGENT_GUM_VENDOR_DIR)/gummetalhash.c \
-                 $(AGENT_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
-
+# The payload is a pure transport: it forwards addresses to the root-side
+# broker and links none of the gum sources.
 agent: $(AGENT_PAYLOAD) $(AGENT_CTL)
 
-$(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h green_hook/green_gum.h \
-                 $(AGENT_GUM_SRCS) include/green/abi.h
+$(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
-		-Iagent -Iinclude $(AGENT_GUM_SHIM_FLAGS) -Igreen_hook \
-		-o $@ agent/green_agent.c $(AGENT_GUM_SRCS) -pthread
+		-Iagent -o $@ agent/green_agent.c -pthread
 
 $(AGENT_CTL): agent/green_agent_ctl.c agent/green_agent.h include/green/abi.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)

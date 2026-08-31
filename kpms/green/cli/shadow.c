@@ -8,8 +8,11 @@
 #include <errno.h>
 #include <getopt.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <linux/un.h>
 #include <unistd.h>
+
+#include <gum/arch-arm64/gumarm64writer.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -338,6 +341,46 @@ static int cmd_release(int argc, char **argv)
  * target's own agent.  Only peers with the target's uid are served, so a
  * broker instance is bound to exactly one target process.
  */
+/* Snapshot the target page cross-process, emit the redirect with the real
+ * GumArm64Writer, and commit it through the shadow ABI. */
+static int broker_patch(pid_t target, unsigned long target_addr,
+                        unsigned long replacement, long *out_value)
+{
+    unsigned long page = target_addr & ~4095UL;
+    size_t offset = (size_t)(target_addr - page);
+    static guint8 snapshot[4096];
+    struct iovec local = { .iov_base = snapshot, .iov_len = sizeof(snapshot) };
+    struct iovec remote = { .iov_base = (void *)page,
+                            .iov_len = sizeof(snapshot) };
+    GumArm64Writer writer;
+    ssize_t n;
+    long pr;
+
+    if ((target_addr & 3) || (replacement & 3) || offset > 4096 - 16)
+        return -EINVAL;
+
+    do {
+        n = process_vm_readv((pid_t)target, &local, 1, &remote, 1, 0);
+    } while (n < 0 && errno == EINTR);
+    if (n != (ssize_t)sizeof(snapshot)) {
+        fprintf(stderr, "broker: process_vm_readv failed: %s\n", strerror(errno));
+        return -EIO;
+    }
+
+    gum_arm64_writer_init(&writer, snapshot + offset);
+    writer.pc = (GumAddress)target_addr;
+    gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16,
+                                         (guint64)replacement);
+    gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
+    gum_arm64_writer_flush(&writer);
+    gum_arm64_writer_clear(&writer);
+
+    pr = green_cli_prctl(PR_GREEN_SHADOW_PATCH, target, page,
+                         (unsigned long)snapshot, sizeof(snapshot));
+    *out_value = pr;
+    return pr < 0 ? (int)pr : 0;
+}
+
 static int cmd_broker(int argc, char **argv)
 {
     struct shadow_opts opts;
@@ -427,19 +470,10 @@ static int cmd_broker(int argc, char **argv)
             if (request.magic != GREEN_AGENT_MAGIC ||
                 request.len > GREEN_SHADOW_MAX_PATCH_LEN) {
                 response.status = -EBADMSG;
-            } else if (request.command == GREEN_BROKER_PATCH &&
-                       (request.addr & 4095UL) + request.len <= GREEN_SHADOW_MAX_PATCH_LEN &&
-                       request.len > 0) {
-                if (read(client, payload, request.len) != (ssize_t)request.len) {
-                    response.status = -EBADMSG;
-                } else {
-                    pr = green_cli_prctl(PR_GREEN_SHADOW_PATCH,
-                                         green_cli_effective_pid(opts.pid),
-                                         request.addr, (unsigned long)payload,
-                                         request.len);
-                    response.status = pr < 0 ? (int32_t)pr : 0;
-                    response.value = pr;
-                }
+            } else if (request.command == GREEN_BROKER_PATCH) {
+                response.status = (int32_t)broker_patch(
+                    green_cli_effective_pid(opts.pid), request.addr,
+                    request.arg, &response.value);
             } else if (request.command == GREEN_BROKER_RELEASE) {
                 pr = green_cli_prctl(PR_GREEN_SHADOW_RELEASE,
                                      green_cli_effective_pid(opts.pid),

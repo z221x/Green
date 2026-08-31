@@ -11,22 +11,26 @@
 
 ## Privilege model
 
-The agent has **no kernel privileges and never calls the Green prctl ABI**.
-Privileged page-table operations are performed by a root-side broker:
+The agent has **no kernel privileges, never calls the Green prctl ABI, and
+links none of the gum sources**.  A hook request carries only the target and
+replacement addresses; the privileged work happens in a root-side broker:
 
 ```text
-agent (target process, unprivileged)
-   |  1. socket request (patch image / release / count)
+agent (target process, unprivileged, pure transport)
+   |  1. socket request: {target addr, replacement addr}
    v
 green cli  `shadow broker`  (root)
-   |  2. prctl(PR_GREEN_SHADOW_*)
+   |  2. process_vm_readv(target): snapshot the original page
+   |  3. GumArm64Writer emits the redirect into the snapshot
+   |  4. prctl(PR_GREEN_SHADOW_PATCH/RELEASE/COUNT)
    v
 KPM (page-table operations)
 ```
 
-- `green shadow broker -p <pid>` listens on `@green.broker.<pid>` and serves
-  only peers whose uid equals the target process's uid, so one broker instance
-  is bound to exactly one target.
+- `green shadow broker -p <pid>` listens on `@green.broker.<pid>`, serves only
+  peers whose uid equals the target process's uid, snapshots pages
+  cross-process with `process_vm_readv`, and commits through the shadow ABI,
+  so one broker instance is bound to exactly one target.
 - The agent's own socket is `@green.agent.<pid>`; `PING` works without a
   broker.
 

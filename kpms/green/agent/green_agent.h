@@ -94,8 +94,9 @@ enum green_broker_command {
 struct green_broker_request {
     uint32_t magic;
     uint32_t command;
-    uint64_t addr;
-    uint32_t len; /* payload bytes after this header (PATCH only) */
+    uint64_t addr; /* PATCH: target address; RELEASE: page address */
+    uint64_t arg;  /* PATCH: replacement address */
+    uint32_t len;  /* always 0; the CLI snapshots the page itself */
     uint32_t reserved;
 };
 
