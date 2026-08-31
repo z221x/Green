@@ -71,13 +71,21 @@ $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)
 TESTHOOK := $(BUILD_DIR)/test_hook
 
 # green_hook 用例：验证 patch 执行 / 读原始 / 恢复 三条 gum 语义。
+GUM_VENDOR_DIR := hook/vendor/gum
+GUM_SHIM_FLAGS := -Ihook/vendor -Ihook/vendor/gum -Ihook/shim
+GUM_SRCS := hook/gummemory-green.c \
+            $(GUM_VENDOR_DIR)/gumlibc.c \
+            $(GUM_VENDOR_DIR)/gummetalarray.c \
+            $(GUM_VENDOR_DIR)/gummetalhash.c \
+            $(GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
+
 testhook: $(TESTHOOK)
 
-$(TESTHOOK): tests/test_hook.c hook/gum_io_shadow.c include/green/gum_io.h include/green/abi.h
+$(TESTHOOK): tests/test_hook.c hook/green_gum.h $(GUM_SRCS) include/green/abi.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -mbranch-protection=none \
-		-Iinclude -o $@ tests/test_hook.c hook/gum_io_shadow.c
+		-Iinclude $(GUM_SHIM_FLAGS) -Ihook -o $@ tests/test_hook.c $(GUM_SRCS)
 
 .PHONY: clean
 clean:

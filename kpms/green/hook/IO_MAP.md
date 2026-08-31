@@ -1,96 +1,83 @@
-# green_hook — gum 内存 I/O 与 shadow 替换映射
+# green_hook — gum 源码级接入与 shadow 内存 I/O 替换
 
-`green_hook` 以 `kpms/green/tmp/frida-gum/gum` 源码为参考实现，把 gum 在
-Linux/Android ARM64 上的底层内存 I/O 全部替换为 green shadow 页操作：
+`green_hook` 直接编译 frida-gum 的源码（`hook/vendor/gum/`，逐字未改），
+把 gum 在 hook 时的内存读写替换为 green shadow 页操作。替换发生在
+**源码层面**：gum 的平台后端接缝（`gummemory-linux.c` 在上游扮演的角色）
+由 `hook/gummemory-green.c` 承担；指令编码完全来自 gum 自己的
+`GumArm64Writer`，没有任何手写二进制 hook。
 
-- **写代码页（hook 安装）**：gum 用 `mprotect(RW) → memcpy → mprotect(RX)`,
-  green_hook 用 `prctl(PR_GREEN_SHADOW_PATCH)` 写 shadow 页；执行看到补丁、
-  读取看到原始字节。
-- **读代码页（完整性校验）**：gum 用 `process_vm_readv`/`memcpy`, green_hook
-  原样保留 —— shadow 的 GUP hook 与 read-fault 切换天然让读取看到原始页。
-- **恢复（hook 卸载）**：gum 回填 `overwritten_prologue`, green_hook 用
-  `prctl(PR_GREEN_SHADOW_RELEASE)` 一步恢复原始 PTE。
+## 一、编译的 gum 源码（vendor，未修改）
 
-## 一、gum 底层内存 I/O 函数清单
+| 文件 | 作用 |
+|---|---|
+| `arch-arm64/gumarm64writer.c` | ARM64 指令发射器（hook 重定向的编码来源） |
+| `gummetalarray.c` / `gummetalhash.c` | writer 的 literal pool 容器 |
+| `gumlibc.c` | gum_memcpy/memset/memmove |
+| `gumdefs.h` / `gummemory.h` / `gummemory-priv.h` | gum 类型与内存 API |
 
-来源：`gum/gummemory.c`、`gum/backend-linux/gummemory-linux.c`。
+`arch-arm64/gumarm64reader.c` 已 vendor 但暂不编译（需要真实 capstone
+反汇编器 `cs_disasm_iter`）。
 
-| gum 函数 | 位置 | Linux 实现 | 用途 | green_hook 替换 |
-|---|---|---|---|---|
-| `gum_memory_patch_code` | gummemory.c:368 | 收集页 → `patch_code_pages` | 在目标代码页写入补丁 | `green_gum_memory_patch_code` → `PR_GREEN_SHADOW_PATCH` |
-| `gum_memory_patch_code_pages` | gummemory.c:434 | Linux 走 `via_mprotect` | 事务批量落盘 | 同上（逐页提交） |
-| `gum_memory_patch_code_pages_via_mprotect` | gummemory.c:616 | `mprotect RW → apply → mprotect RX` | 真正写入 | shadow 写（内核侧 `green_shadow_sync_code` 已含 I-cache/TLB 维护） |
-| `gum_memory_read` | gummemory-linux.c:307 | `process_vm_readv` → 直接 `memcpy` 兜底 | 读取目标代码 | `green_gum_memory_read`（保留 `process_vm_readv`; GUP hook 返回原始 PFN） |
-| `gum_memory_write` | gummemory-linux.c:367 | `process_vm_writev` → `memcpy` 兜底 | 极少用于代码页 | `green_gum_memory_write` → `PR_GREEN_SHADOW_PATCH` |
-| `gum_mprotect` / `gum_try_mprotect` | gummemory-linux.c:415 | `mprotect(2)` | 权限切换 | `green_gum_mprotect`（保留原生；仅用于 gum 自建 code allocator 页，与 shadow 无关） |
-| `gum_clear_cache` | gummemory-linux.c:454 | `__builtin___clear_cache` | I-cache 同步 | `green_gum_clear_cache`（no-op；shadow patch 时内核已同步） |
-| `gum_memory_can_remap_writable` | gummemory-linux.c | 恒 `FALSE` | 路径选择 | shadow 版恒 `FALSE`（不需要 remap 路径） |
-| `gum_memory_mark_code` | gummemory.c:964 | QNX 专用 | — | 不需要 |
-| `gum_ensure_code_readable` | gummemory.c:1857 | Android 上 no-op | — | 不需要 |
+## 二、shim（仅外部依赖，不含任何指令编码）
 
-## 二、调用点（hook 写入链路）
+| 文件 | 内容 |
+|---|---|
+| `shim/glib.h` | writer/容器用到的 glib 原语：类型、`g_slice_*`→malloc、原子、断言、字节序宏 |
+| `shim/capstone.h` | `arm64_reg` / `arm64_cc` 枚举（writer 只用枚举值，不反汇编） |
+| `shim/gumprocess.h` | `GumOS`（枚举在 gumdefs.h）+ `gum_process_get_native_os` 声明 |
+| `shim/gum/gumenumtypes.h` | 空占位 |
 
-gum interceptor 在 ARM64 上安装一个 hook 的完整链路：
+## 三、hook 时的读写替换（`gummemory-green.c`）
+
+沿用 gum 前端 `gum_memory_patch_code_pages_via_remap()` 的算法骨架，
+remap 对（`try_remap_writable_pages` / `dispose_writable_pages`）实现为
+**快照 / 提交**：
 
 ```text
-gum_interceptor_attach                        guminterceptor.c
-  └─ gum_interceptor_transaction_commit       guminterceptor.c:1560
-       └─ gum_memory_patch_code_pages         guminterceptor.c:1638   ★写入口
-            └─ gum_apply_updates              guminterceptor.c:1671
-                 └─ _gum_interceptor_backend_activate_trampoline
-                                              guminterceptor-arm64.c:1072
-                      写入 B imm / ADRP+BR / LDR+BR 重定向
-  └─ gum_arm64_relocator                      arch-arm64/gumarm64relocator.c
-       被覆盖指令重定位进 trampoline（写入自有内存, 不落目标页）
-  └─ thunks 页: gum_memory_patch_code         guminterceptor-arm64.c:1277
-卸载:
-gum_interceptor_deactivate → gum_memcpy(prologue, overwritten_prologue)
-                                              guminterceptor-arm64.c:1157  ★恢复入口
+gum_memory_patch_code(target, size, apply, data)   ← gum 前端逻辑
+  ├─ gum_memory_try_remap_writable_pages(page, n)
+  │     快照 original 页（process_vm_readv，GUP 对 shadow 页返回原始 PFN）
+  ├─ apply(snapshot + page_offset, data)
+  │     回调内由 GumArm64Writer 发射重定向（真实 gum 源码）
+  └─ gum_memory_dispose_writable_pages(snapshot, n)
+        每页 prctl(PR_GREEN_SHADOW_PATCH, 0, page, snapshot, 4096)
+        内核在 shadow 副本上叠加快照 → 执行看到补丁、读取看到原始
 ```
 
-green_hook 对应替换：
-
-| gum 调用点 | green_hook |
-|---|---|
-| `gum_memory_patch_code_pages`（安装重定向） | `green_gum_memory_patch_code(addr, size, apply, data)` |
-| `gum_memcpy(prologue, overwritten…)`（恢复） | `green_gum_release_page(addr)` → `PR_GREEN_SHADOW_RELEASE` |
-| `gum_memory_read`（快照/校验） | `green_gum_memory_read`（无需改动，天然读到原始页） |
-| `gum_clear_cache` | no-op（内核 patch 路径已做 `green_shadow_sync_code`） |
-
-非代码页的内存操作（`gum_code_allocator` 自建 trampoline 页的
-`gum_mprotect`、`gum_memory_allocate` 的 `mmap`）不涉及目标进程代码，
-全部保留原生实现。
-
-## 三、重定向指令（取自 gumarm64writer 编码）
-
-green_hook 的 `arm64_writer` 按 gum `gumarm64writer.c` 的指令编码移植：
-
-| gum API | 编码 | 用途 |
-|---|---|---|
-| `put_b_imm` | `0x14000000 \| ((d/4) & 0x3ffffff)` | ±128MB 近跳 |
-| `put_ldr_reg_u64` + literal | `0x58000000 \| (imm19<<5) \| rt` | LDR Xt, literal |
-| `put_br_reg` | `0xd61f0000 \| (rt<<5)` | BR Xt（无 PAC extra=0） |
-| `put_adrp_reg_address` | `0x90000000 \| (lo<<29) \| (hi<<5) \| rt` | ±4GB 近跳 |
-| `put_nop` | `0xd503201f` | 填充 |
-
-安装 hook 时 green_hook 默认写 gum 的 full redirect：
+写入器输出（host 实测，vendor 源码直接产出）：
 
 ```asm
-ldr x16, #8        ; 从 shadow 页自身的 literal pool 取地址
-br  x16
-.quad replacement  ; 同页数据 → 由同页自读模拟器从 shadow 页取回
+58000050  ldr x16, #8      ; GumArm64Writer put_ldr_reg_address(X16, repl)
+d61f0200  br  x16          ; GumArm64Writer put_br_reg(X16)
+.quad replacement          ; writer 自动追加的 literal pool
 ```
 
-注意：`ldr x16, #8` 的 literal 落在 shadow 页内，同页自读 fault 由
-`emu/` 模拟器处理，且模拟器对同页数据读 **shadow** 字节（已在
-`shadow/shadow_fault.c` 中修正），重定向地址因此能被正确读出。
+`ldr x16,#8` 执行在 shadow 页上读同页 literal —— 由 `emu/` 同页自读
+模拟器从 **shadow** 字节取回（`shadow/shadow_fault.c`），重定向地址因此可用。
 
-## 四、shadow 侧已具备的支撑
+## 四、gum 内存 I/O → green 后端映射
 
-| 能力 | 位置 | 对 gum 语义的意义 |
-|---|---|---|
-| patch 写入 + 执行 | `PR_GREEN_SHADOW_PATCH` | `patch_code` 的隐身版 |
-| 读取见原始页（跨进程） | GUP hook（`follow_page_pte`） | `gum_memory_read` 语义不变 |
-| 读取见原始页（本进程） | read fault → PTE 切换 | 同上 |
-| 同页执行+读 | `emu/emu.c` 单指令模拟 | literal pool / 自读代码不死循环 |
-| 恢复 | `PR_GREEN_SHADOW_RELEASE` | `deactivate_trampoline` 的等价物 |
+| gum 函数（上游 Linux 后端） | green 后端实现 |
+|---|---|
+| `gum_memory_patch_code[_pages]` | via_remap 骨架 + 快照/提交（见上） |
+| `gum_memory_write` | `PR_GREEN_SHADOW_PATCH`（绝不对 RX 页 memcpy） |
+| `gum_memory_read` | `process_vm_readv`（GUP hook 已返回原始 PFN） |
+| `gum_try_mprotect` / `gum_mprotect` | 原生 mprotect（仅 gum 自建 code allocator 页会走到） |
+| `gum_clear_cache` | no-op（内核 patch 时已做 I-cache/TLB 维护） |
+| `gum_memory_can_remap_writable` | `TRUE`（把前端路由进 remap 路径） |
+| deactivate_trampoline（卸载） | `green_gum_release_page()` → `PR_GREEN_SHADOW_RELEASE` |
+
+## 五、gum 调用点链路（上游 → green_hook）
+
+```text
+gum_interceptor_transaction_commit        guminterceptor.c:1638
+  └─ gum_memory_patch_code_pages          ★ green: 快照/提交
+       └─ gum_apply_updates
+            └─ _gum_interceptor_backend_activate_trampoline
+                 写 B / ADRP+BR / LDR+BR   ★ green: GumArm64Writer (vendor)
+卸载:
+gum_interceptor_deactivate → memcpy 回填   ★ green: green_gum_release_page
+```
+
+gum 自建内存（code allocator 的 mmap/mprotect、trampoline 页）与目标
+进程代码页无关，保留原生路径。

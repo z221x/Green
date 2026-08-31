@@ -23,9 +23,12 @@ kpms/green/
 │   ├── shadow.c             # shadow 工具生命周期、prctl ABI、页对象管理
 │   ├── shadow_pgtable.c     # 页表切换、TLB/cache 维护
 │   └── shadow_fault.c       # page fault / GUP / exit_mmap 处理与同页模拟
-├── hook/                    # green_hook：gum 内存 I/O 的 shadow 替换层
-│   ├── IO_MAP.md            # gum 底层内存 I/O 函数与调用点梳理
-│   └── gum_io_shadow.c      # gummemory API 的 shadow 实现 + 重定向写入器
+├── hook/                    # green_hook：gum 源码级接入
+│   ├── IO_MAP.md            # gum 内存 I/O 与调用点梳理、替换映射
+│   ├── gummemory-green.c    # gum 内存后端：hook 读写走 shadow
+│   ├── green_gum.h          # green 扩展（release）声明
+│   ├── vendor/gum/          # frida-gum 源码（逐字未改）：GumArm64Writer 等
+│   └── shim/                # glib/capstone 最小垫片（仅外部依赖）
 ├── common/
 │   ├── common.c             # CLI 公共解析、solist、prctl、process_vm helpers
 │   └── symbol.c             # KPM 内核符号提取与地址解析
@@ -83,14 +86,14 @@ build/
 make TARGET_COMPILE=aarch64-elf- KP_DIR=/path/to/KernelPatch-0.13.3
 ```
 
-## green_hook（gum 兼容层）
+## green_hook（gum 源码级接入）
 
-`hook/` 组件把 frida-gum 的底层内存 I/O 全部替换为 shadow 操作（详见 `hook/IO_MAP.md`）：
+`hook/` 直接编译 frida-gum 源码（`hook/vendor/gum/`，未修改），hook 时的内存读写全部替换为 shadow 操作（详见 `hook/IO_MAP.md`）：
 
-- `green_gum_memory_patch_code()` ↔ gum `gum_memory_patch_code()`：apply 回调写入本地缓冲，提交到 shadow 页；执行看到补丁，读取看到原始字节。
-- `green_gum_memory_read()` ↔ gum `gum_memory_read()`：仍走 `process_vm_readv`，GUP hook 返回原始页。
-- `green_gum_release_page()` ↔ gum `deactivate_trampoline` 的回填：恢复原始 PTE。
-- 重定向写入器按 `gumarm64writer` 编码移植（B imm26 / LDR+BR+literal / ADRP / NOP）。
+- `gum_memory_patch_code()`：gum via_remap 骨架，remap 对实现为快照/提交 —— apply 回调由真实 `GumArm64Writer` 发射重定向，提交时逐页 `prctl(PR_GREEN_SHADOW_PATCH)`；执行看到补丁，读取看到原始字节。
+- `gum_memory_read()`：仍走 `process_vm_readv`，GUP hook 返回原始页。
+- `green_gum_release_page()` ↔ gum `deactivate_trampoline`：恢复原始 PTE。
+- 指令编码全部来自 gum 源码（实测输出 `58000050 d61f0200 .quad`），无任何手写二进制 hook；shim 仅覆盖 glib/capstone 枚举等外部依赖。
 
 用例（设备上以 root 运行，需先加载 KPM）：
 

@@ -1,19 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * green_hook end-to-end test (runs as root on the device with the green KPM
- * loaded).
+ * green_hook end-to-end test (root, on device, with the green KPM loaded).
  *
- * Verifies the three core gum-semantics guarantees on a live RX page:
+ * The hook redirect is emitted by the VENDORED frida-gum GumArm64Writer
+ * (vendor/gum/arch-arm64/gumarm64writer.c) and committed through
+ * gum_memory_patch_code() whose backend (hook/gummemory-green.c) writes via
+ * the green shadow pager — no mprotect, no hand-encoded instructions.
  *
- *   1. patch  — execution of target_fn() observes the redirect written via
- *               green_gum_memory_patch_code();
- *   2. read   — both direct (same-process, cross-page) reads and GUP
- *               (process_vm_readv) reads still observe the ORIGINAL bytes
- *               while the hook is active;
- *   3. restore— green_gum_release_page() brings target_fn() back.
+ * Verifies gum hook-time semantics on a live RX page:
+ *   1. patch: execution of target_fn() takes the writer-emitted redirect;
+ *   2. read:  GUP (process_vm_readv) and direct reads still observe the
+ *             ORIGINAL bytes while the hook is active;
+ *   3. restore: green_gum_release_page() brings target_fn() back.
  */
 
-#include <green/gum_io.h>
+#include <gum/arch-arm64/gumarm64writer.h>
+#include <gum/gummemory.h>
+
+#include "green_gum.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -27,10 +31,6 @@
 
 #define PATCH_LEN 16U
 
-/*
- * Keep these out of the compiler's reach for inlining and make sure both sit
- * on pages distinct from the test code (separate function, aligned).
- */
 __attribute__((noinline, aligned(4096))) static int target_fn(int x)
 {
     asm volatile("" ::: "memory");
@@ -43,23 +43,28 @@ __attribute__((noinline, aligned(4096))) static int replacement_fn(int x)
     return x + 100;
 }
 
-/* padding so target_fn is at least PATCH_LEN bytes before the next symbol */
 __attribute__((noinline, aligned(4096))) static void target_pad(void)
 {
     asm volatile(".space 64" ::: "memory");
 }
 
-struct patch_ctx {
-    uint64_t pc;
-    uint64_t replacement;
-};
-
+/*
+ * gum: apply callback used with gum_memory_patch_code(), mirroring
+ * _gum_interceptor_backend_activate_trampoline() — the real GumArm64Writer
+ * emits LDR x16, <literal>; BR x16 and appends the literal pool itself.
+ */
 static void apply_redirect(void *mem, void *user_data)
 {
-    struct patch_ctx *ctx = user_data;
+    GumArm64Writer writer;
+    guint64 replacement = (guint64)(uintptr_t)user_data;
 
-    /* gum: _gum_interceptor_backend_activate_trampoline() equivalent. */
-    green_hook_write_branch_ldr((uint32_t *)mem, ctx->replacement);
+    gum_arm64_writer_init(&writer, mem);
+    writer.pc = (GumAddress)(uintptr_t)mem;
+
+    gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16, replacement);
+    gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
+    gum_arm64_writer_flush(&writer);
+    gum_arm64_writer_clear(&writer);
 }
 
 static ssize_t gup_read_self(void *dst, const void *remote, size_t len)
@@ -74,12 +79,7 @@ static ssize_t gup_read_self(void *dst, const void *remote, size_t len)
     return n;
 }
 
-static long prctl_green_count(void)
-{
-    return prctl((int)PR_GREEN_SHADOW_COUNT, 0, 0, 0, 0);
-}
-
-/* byte-wise volatile read: ldrb, always supported by the same-page emu */
+/* byte-wise volatile read (ldrb): always supported by the same-page emu */
 static void direct_read(uint8_t *dst, const volatile uint8_t *src, size_t len)
 {
     size_t i;
@@ -90,29 +90,28 @@ static void direct_read(uint8_t *dst, const volatile uint8_t *src, size_t len)
 
 static int failures;
 
-#define CHECK(cond, msg)                                          \
-    do {                                                          \
-        if (cond) {                                               \
-            printf("  ok   %s\n", msg);                           \
-        } else {                                                  \
-            printf("  FAIL %s\n", msg);                           \
-            failures++;                                           \
-        }                                                         \
+#define CHECK(cond, msg)                     \
+    do {                                     \
+        if (cond) {                          \
+            printf("  ok   %s\n", msg);      \
+        } else {                             \
+            printf("  FAIL %s\n", msg);      \
+            failures++;                      \
+        }                                    \
     } while (0)
 
 int main(void)
 {
     uint8_t before[PATCH_LEN];
-    uint8_t during_gup[PATCH_LEN];
-    uint8_t during_direct[PATCH_LEN];
-    struct patch_ctx ctx;
+    uint8_t during[PATCH_LEN];
     long shadow_pages;
     int value;
 
     (void)target_pad;
 
-    printf("green_hook test: target=%p replacement=%p\n", (void *)target_fn,
-           (void *)replacement_fn);
+    printf("green_hook test (gum sources + shadow backend)\n");
+    printf("  target=%p replacement=%p writer=%s\n", (void *)target_fn,
+           (void *)replacement_fn, "GumArm64Writer");
 
     /* --- baseline ------------------------------------------------------ */
 
@@ -120,56 +119,57 @@ int main(void)
     CHECK(value == 2, "target_fn(1) == 2 before patch");
 
     direct_read(before, (const volatile uint8_t *)target_fn, PATCH_LEN);
-    CHECK(gup_read_self(during_gup, target_fn, PATCH_LEN) == (ssize_t)PATCH_LEN,
+    CHECK(gup_read_self(during, target_fn, PATCH_LEN) == (ssize_t)PATCH_LEN,
           "baseline GUP read");
 
-    /* --- install hook via the gum-compatible patch API ------------------ */
+    /* --- install hook: gum writer + gum patch API + shadow backend ------ */
 
-    ctx.pc = (uint64_t)(uintptr_t)target_fn;
-    ctx.replacement = (uint64_t)(uintptr_t)replacement_fn;
+    CHECK(gum_memory_patch_code((void *)target_fn, PATCH_LEN, apply_redirect,
+                                (void *)(uintptr_t)replacement_fn),
+          "gum_memory_patch_code() installs writer-emitted redirect");
 
-    CHECK(green_gum_memory_patch_code((void *)target_fn, PATCH_LEN,
-                                      apply_redirect, &ctx) == 0,
-          "green_gum_memory_patch_code() installs redirect");
-
-    shadow_pages = prctl_green_count();
+    shadow_pages = prctl((int)PR_GREEN_SHADOW_COUNT, 0, 0, 0, 0);
     CHECK(shadow_pages >= 1, "shadow page is live");
 
     /* --- execution sees the patch --------------------------------------- */
 
     value = target_fn(1);
-    CHECK(value == 101, "target_fn(1) == 101 while hooked (redirect taken)");
+    CHECK(value == 101, "target_fn(1) == 101 while hooked");
 
     value = target_fn(41);
     CHECK(value == 141, "target_fn(41) == 141 while hooked");
 
     /* --- reads still see the original bytes ------------------------------ */
 
-    CHECK(gup_read_self(during_gup, target_fn, PATCH_LEN) ==
-              (ssize_t)PATCH_LEN,
+    CHECK(gup_read_self(during, target_fn, PATCH_LEN) == (ssize_t)PATCH_LEN,
           "GUP read succeeds while hooked");
-    CHECK(memcmp(before, during_gup, PATCH_LEN) == 0,
+    CHECK(memcmp(before, during, PATCH_LEN) == 0,
           "GUP read sees ORIGINAL bytes while hooked");
 
-    /*
-     * The literal load inside the redirect (ldr x16,#8) executes on the
-     * shadow page and reads the shadow literal — proven by the redirect
-     * working above.  A direct read from THIS page (test code lives on a
-     * different page) must fault-switch to the original mapping instead.
-     */
-    direct_read(during_direct, (const volatile uint8_t *)target_fn, PATCH_LEN);
-    CHECK(memcmp(before, during_direct, PATCH_LEN) == 0,
+    direct_read(during, (const volatile uint8_t *)target_fn, PATCH_LEN);
+    CHECK(memcmp(before, during, PATCH_LEN) == 0,
           "direct read sees ORIGINAL bytes while hooked");
+
+    /* also via the gum API itself */
+    {
+        gsize n = 0;
+        guint8 *bytes = gum_memory_read(target_fn, PATCH_LEN, &n);
+
+        CHECK(bytes != NULL && n == PATCH_LEN, "gum_memory_read() works");
+        CHECK(bytes != NULL && memcmp(before, bytes, PATCH_LEN) == 0,
+              "gum_memory_read() sees ORIGINAL bytes");
+        g_free(bytes);
+    }
 
     /* --- restore --------------------------------------------------------- */
 
-    CHECK(green_gum_release_page(target_fn) == 0, "release shadow page");
+    CHECK(green_gum_release_page(target_fn), "green_gum_release_page()");
 
     value = target_fn(1);
     CHECK(value == 2, "target_fn(1) == 2 after release");
 
-    direct_read(during_direct, (const volatile uint8_t *)target_fn, PATCH_LEN);
-    CHECK(memcmp(before, during_direct, PATCH_LEN) == 0,
+    direct_read(during, (const volatile uint8_t *)target_fn, PATCH_LEN);
+    CHECK(memcmp(before, during, PATCH_LEN) == 0,
           "direct read unchanged after release");
 
     printf(failures == 0 ? "green_hook test: ALL PASS\n"
