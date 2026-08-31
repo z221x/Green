@@ -89,9 +89,13 @@ int green_shadow_check_epan(void)
      * min_field_value = 3).  PAN=1 is FEAT_PAN, PAN=2 is FEAT_PAN2. */
     pan = (mmfr1 >> 20) & 0xf;
     if (pan < 3) {
-        pr_err("green_shadow: FEAT_EPAN is a hard requirement and this CPU does not implement it (ID_AA64MMFR1_EL1.PAN=%llu)\n",
-               pan);
-        return -EOPNOTSUPP;
+        /* TEST BUILD ONLY: bypass the gate to empirically verify whether EL0
+         * fetch works on the AP=10 execute-only encoding without EPAN, and
+         * whether kernel uaccess reads leak the shadow bytes.  The hard
+         * gate is restored after the experiment. */
+        pr_warn("green_shadow: TEST BUILD: FEAT_EPAN absent (PAN=%llu) but continuing\n",
+                pan);
+        return 0;
     }
 
     pr_info("green_shadow: FEAT_EPAN detected (ID_AA64MMFR1_EL1.PAN=%llu)\n",

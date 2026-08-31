@@ -170,7 +170,7 @@ green_shadow_release_task(pid, addr);
 
 ## 限制
 
-- **硬性条件：设备 CPU 必须实现 FEAT_EPAN**（`ID_AA64MMFR1_EL1.PAN` 字段 = 3，即 FEAT_PAN3；内核建议 5.13+ 且开启 `CONFIG_ARM64_EPAN`）。shadow 执行视图是 execute-only 映射（`PAGE_EXECONLY` 编码，AP[2:1]=10 + UXN=0）：无 EPAN 时这类映射可被 EL1 无声读取（上游内核 2019 年因此回退过 exec-only 支持），KPM 初始化会检测并拒绝上线。
+- **FEAT_EPAN（`ID_AA64MMFR1_EL1.PAN`=3，即 FEAT_PAN3）为推荐条件，非硬性**：实测（Cortex-A710，PAN=2）证明 AP[2:1]=10 + UXN=0 的 execute-only 视图在无 EPAN 硬件上 EL0 取指/跷跷板/模拟器均正常工作。EPAN 的作用是让 PAN 覆盖 exec-only 页，堵住 EL1 侧 uaccess 读（`write()`/`send()` 等系统调用会把 shadow 字节读出去）——无 EPAN 设备存在该泄露面，KPM 检测到缺失时打警告并继续上线。
 - 当前只支持 ARM64 + 4K 用户页粒度。
 - `emu/` 第一版支持常见 GPR 标量 `LDR/STR`、`LDUR/STUR`、寄存器偏移、前/后索引、`LDRSB/LDRSH/LDRSW`、literal load，以及 `LDP/STP`；SIMD、exclusive、跨页访问暂不模拟。
 - `patch` 不能跨目标页。

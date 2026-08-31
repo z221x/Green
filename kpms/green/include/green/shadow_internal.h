@@ -43,6 +43,11 @@ struct green_shadow_page {
     int refs;
     bool dead;
     atomic_t pte_busy;
+
+    /* No-progress fault-loop guard (same pc+far repeating). */
+    unsigned long repeat_pc;
+    unsigned long repeat_far;
+    u32 repeat_count;
 };
 
 extern struct list_head green_shadow_pages;

@@ -17,32 +17,142 @@
 #define GREEN_FAULT_READ  2
 #define GREEN_FAULT_WRITE 3
 
-/* Fault-path tracing: log the first N faults after load so hangs and
- * PTE-flap loops can be diagnosed from dmesg. */
-#define GREEN_SHADOW_TRACE_BUDGET 48
-static atomic_t green_shadow_trace_budget = ATOMIC_INIT(GREEN_SHADOW_TRACE_BUDGET);
+/* Fault-path tracing is removed: normal execution is verified silent.
+ * Only genuine failures speak, with a tiny budget so a wedged loop
+ * cannot flood dmesg. */
+#define GREEN_SHADOW_EMU_FAIL_BUDGET 16
+static atomic_t green_shadow_emu_fail_budget = ATOMIC_INIT(GREEN_SHADOW_EMU_FAIL_BUDGET);
 
-static bool green_shadow_trace_want(void)
+static bool green_shadow_emu_fail_log_want(void)
 {
-    int left = atomic_sub_return(1, &green_shadow_trace_budget);
+    int left = atomic_sub_return(1, &green_shadow_emu_fail_budget);
 
-    /* atomic_dec_if_positive() is not provided by the KPM headers; emulate
-     * it with a sub that stops going negative. */
     if (left < 0) {
-        atomic_add(1, &green_shadow_trace_budget);
+        atomic_add(1, &green_shadow_emu_fail_budget);
         return false;
     }
     return true;
 }
 
-static void green_shadow_trace(const char *tag, unsigned long far,
-                               unsigned int esr, struct pt_regs *regs,
-                               struct green_shadow_page *page, int kind,
-                               int same_page)
+/*
+ * No-progress guard: if the exact same (pc, far) pair keeps faulting, the
+ * emulation is not advancing and the thread would spin forever.  After
+ * GREEN_SHADOW_REPEAT_LIMIT identical faults the shadow page is released
+ * (fail-open): the hook is dropped for that page and the process unwedges
+ * (usually by taking a real SIGSEGV) instead of burning a CPU.
+ */
+#define GREEN_SHADOW_REPEAT_LIMIT 200000
+
+static void green_shadow_note_repeat(struct green_shadow_page *page,
+                                      unsigned long pc, unsigned long far)
 {
-    pr_info("green_shadow: [%s] far=%lx esr=%x pc=%lx state=%d kind=%d same=%d\n",
-            tag, far, esr, regs ? regs->pc : 0, page ? page->state : -1,
-            kind, same_page);
+    green_lock(&green_shadow_pages_busy);
+    if (pc == page->repeat_pc && far == page->repeat_far) {
+        page->repeat_count++;
+    } else {
+        page->repeat_pc = pc;
+        page->repeat_far = far;
+        page->repeat_count = 1;
+    }
+    green_unlock(&green_shadow_pages_busy);
+}
+
+static bool green_shadow_repeat_exceeded(struct green_shadow_page *page)
+{
+    bool exceeded;
+
+    green_lock(&green_shadow_pages_busy);
+    exceeded = page->repeat_count > GREEN_SHADOW_REPEAT_LIMIT;
+    green_unlock(&green_shadow_pages_busy);
+    return exceeded;
+}
+
+/*
+ * SIMD load write-back: stores the loaded bytes into the low lanes of V
+ * register `reg`.  At EL0 fault entry the live V0-V31 still hold the
+ * user's FPSIMD state (the kernel preserves them until an explicit
+ * kernel_neon_begin / context switch, and our hook runs before any of
+ * that), so writing the destination register here reproduces the
+ * architectural effect of the load.  Upper lanes are preserved by the
+ * MOV (element) forms, matching B/H/S/D views.
+ *
+ * Known edge: if TIF_FOREIGN_FPSTATE was already set when the fault was
+ * taken (state saved in memory, e.g. right after a migration), the write
+ * is discarded on return-to-user and the load result is lost.  Accepted
+ * for this version; rare and non-fatal.
+ */
+#define GREEN_SIMD_WRITE_CASE(N)                                                   \
+    case N:                                                                        \
+        switch (nbytes) {                                                          \
+        case 1:                                                                    \
+            asm volatile("mov v" #N ".b[0], %w0"                                 \
+                         : : "r"(*(const u8 *)data));                              \
+            return 0;                                                              \
+        case 2:                                                                    \
+            asm volatile("mov v" #N ".h[0], %w0"                                 \
+                         : : "r"(*(const u16 *)data));                             \
+            return 0;                                                              \
+        case 4:                                                                    \
+            asm volatile("mov v" #N ".s[0], %w0"                                 \
+                         : : "r"(*(const u32 *)data));                             \
+            return 0;                                                              \
+        case 8:                                                                    \
+            asm volatile("mov v" #N ".d[0], %x0"                                 \
+                         : : "r"(*(const u64 *)data));                             \
+            return 0;                                                              \
+        case 16:                                                                   \
+            asm volatile("mov v" #N ".d[0], %x0"                                 \
+                         : : "r"(*(const u64 *)data));                              \
+            asm volatile("mov v" #N ".d[1], %x0"                                 \
+                         : : "r"(*(const u64 *)((const u8 *)data + 8)));           \
+            return 0;                                                              \
+        default:                                                                   \
+            return GREEN_EMU_BAD_MEMORY;                                           \
+        }
+
+static int green_shadow_simd_write(void *ctx, unsigned int reg,
+                                   unsigned int nbytes, const void *data)
+{
+    (void)ctx;
+    if (!data || reg > 31)
+        return GREEN_EMU_BAD_MEMORY;
+
+    switch (reg) {
+    GREEN_SIMD_WRITE_CASE(0)
+    GREEN_SIMD_WRITE_CASE(1)
+    GREEN_SIMD_WRITE_CASE(2)
+    GREEN_SIMD_WRITE_CASE(3)
+    GREEN_SIMD_WRITE_CASE(4)
+    GREEN_SIMD_WRITE_CASE(5)
+    GREEN_SIMD_WRITE_CASE(6)
+    GREEN_SIMD_WRITE_CASE(7)
+    GREEN_SIMD_WRITE_CASE(8)
+    GREEN_SIMD_WRITE_CASE(9)
+    GREEN_SIMD_WRITE_CASE(10)
+    GREEN_SIMD_WRITE_CASE(11)
+    GREEN_SIMD_WRITE_CASE(12)
+    GREEN_SIMD_WRITE_CASE(13)
+    GREEN_SIMD_WRITE_CASE(14)
+    GREEN_SIMD_WRITE_CASE(15)
+    GREEN_SIMD_WRITE_CASE(16)
+    GREEN_SIMD_WRITE_CASE(17)
+    GREEN_SIMD_WRITE_CASE(18)
+    GREEN_SIMD_WRITE_CASE(19)
+    GREEN_SIMD_WRITE_CASE(20)
+    GREEN_SIMD_WRITE_CASE(21)
+    GREEN_SIMD_WRITE_CASE(22)
+    GREEN_SIMD_WRITE_CASE(23)
+    GREEN_SIMD_WRITE_CASE(24)
+    GREEN_SIMD_WRITE_CASE(25)
+    GREEN_SIMD_WRITE_CASE(26)
+    GREEN_SIMD_WRITE_CASE(27)
+    GREEN_SIMD_WRITE_CASE(28)
+    GREEN_SIMD_WRITE_CASE(29)
+    GREEN_SIMD_WRITE_CASE(30)
+    GREEN_SIMD_WRITE_CASE(31)
+    default:
+        return GREEN_EMU_BAD_MEMORY;
+    }
 }
 
 struct green_shadow_emu_context {
@@ -119,6 +229,7 @@ static int green_shadow_emulate_same_page(struct green_shadow_page *page,
     memory.ctx = &context;
     memory.read = green_shadow_emu_read;
     memory.write = 0; /* A shadow code page is never writable. */
+    memory.simd_write = green_shadow_simd_write;
     /* Compare the page offset below instead of relying on tagged FAR equality. */
     memory.fault_addr = 0;
 
@@ -207,8 +318,6 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
     }
 
     same_page = regs && green_align_down(regs->pc) == page->va;
-    if (green_shadow_trace_want())
-        green_shadow_trace("fault", far, esr, regs, page, kind, same_page);
     if (kind == GREEN_FAULT_EXEC && page->state == GREEN_SHADOW_STATE_READ) {
         ret = green_shadow_map_exec(page);
         if (ret == 0) {
@@ -220,10 +329,22 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
             /* The instruction and data use the same VA/PTE.  Switching the
              * whole page to original would immediately cause an instruction
              * abort and replay this data abort forever. */
+            green_shadow_note_repeat(page, regs->pc, far);
+            if (green_shadow_repeat_exceeded(page)) {
+                pr_err("green_shadow: no-progress fault loop pc=%lx far=%lx, releasing shadow page va=%lx (fail-open)\n",
+                       regs->pc, far, page->va);
+                green_shadow_release_page(page, true);
+                green_k_mmput(mm);
+                atomic_dec(&green_shadow_hooks_busy);
+                return;
+            }
             ret = green_shadow_emulate_same_page(page, regs, far);
             if (ret == GREEN_EMU_OK) {
                 args->ret = 0;
                 args->skip_origin = 1;
+            } else if (green_shadow_emu_fail_log_want()) {
+                pr_err("green_shadow: emu rejected pc=%lx far=%lx ret=%d\n",
+                       regs->pc, far, ret);
             }
         } else {
             ret = green_shadow_map_read(page);

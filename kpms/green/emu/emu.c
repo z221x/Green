@@ -21,6 +21,7 @@
 #define GREEN_EMU_KIND_PAIR   2
 #define GREEN_EMU_KIND_LITERAL 3
 
+
 struct green_emu_decoded {
     unsigned int kind;
     unsigned int load;
@@ -36,6 +37,7 @@ struct green_emu_decoded {
     unsigned int mode;
     unsigned int writeback;
     unsigned int reg_offset;
+    unsigned int simd;
     s64 offset;
 };
 
@@ -232,10 +234,181 @@ static int green_emu_decode_pair(u32 insn, struct green_emu_decoded *d)
     d->rt = insn & 31;
     d->rt2 = (insn >> 10) & 31;
     d->rn = (insn >> 5) & 31;
-    d->mode = mode;
-    d->writeback = mode != 2;
+    /* raw encoding: 2=offset, 1=post, 3=pre; normalize 2 -> OFFSET so the
+     * shared address/writeback logic applies the displacement. */
+    d->mode = (mode == 2) ? GREEN_EMU_MODE_OFFSET : mode;
+    d->writeback = d->mode != GREEN_EMU_MODE_OFFSET;
     d->reg_offset = 0;
     d->offset = green_emu_sext((insn >> 15) & 0x7f, 7) * (s64)size;
+    return GREEN_EMU_OK;
+}
+
+/*
+ * SIMD/FP loads (B/H/S/D/Q views of V0-V31).  Encodings verified against
+ * clang+llvm-objdump: unsigned-immediate, unscaled, pre/post-index,
+ * register-offset, literal, and LDP pairs.  Stores are rejected (the shadow
+ * exec view is never writable anyway).
+ */
+static unsigned int green_emu_simd_load_bytes(unsigned int opc,
+                                              unsigned int size_code)
+{
+    /* opc=01: B/H/S/D by size; opc=11: Q (size 0) or D (size 2). */
+    if (opc == 1)
+        return 1U << size_code;
+    if (opc == 3 && size_code == 0)
+        return 16;
+    if (opc == 3 && size_code == 2)
+        return 8;
+    return 0;
+}
+
+static unsigned int green_emu_simd_scale(unsigned int bytes)
+{
+    switch (bytes) {
+    case 1: return 0;
+    case 2: return 1;
+    case 4: return 2;
+    case 8: return 3;
+    default: return 4;
+    }
+}
+
+static int green_emu_decode_simd_scalar(u32 insn,
+                                        struct green_emu_decoded *d)
+{
+    unsigned int opc;
+    unsigned int size_code;
+    unsigned int bytes;
+    unsigned int mode;
+    unsigned int option;
+    unsigned int imm_form;
+
+    if (!(insn & GREEN_EMU_BIT(26)))
+        return GREEN_EMU_UNSUPPORTED;
+
+    /* unsigned-immediate form: bits 29:27=111, V=1, 25:24=01, 21=0 */
+    imm_form = (insn & 0x3f200000U) == 0x3d000000U;
+
+    opc = (insn >> 22) & 3;
+    size_code = (insn >> 30) & 3;
+    bytes = green_emu_simd_load_bytes(opc, size_code);
+    if (bytes == 0)
+        return GREEN_EMU_UNSUPPORTED; /* store or reserved */
+
+    d->kind = GREEN_EMU_KIND_SCALAR;
+    d->simd = 1;
+    d->load = 1;
+    d->sign = 0;
+    d->size = bytes;
+    d->dst_bits = 0;
+    d->rt = insn & 31;
+    d->rn = (insn >> 5) & 31;
+
+    if (imm_form) {
+        d->mode = GREEN_EMU_MODE_OFFSET;
+        d->writeback = 0;
+        d->reg_offset = 0;
+        d->offset = (s64)((u64)((insn >> 10) & 0xfff)
+                          << green_emu_simd_scale(bytes));
+        return GREEN_EMU_OK;
+    }
+
+    /* base form: bits 29:27=111, V=1, 25:24=00; bit21 selects the
+     * register-offset variant, bits 11:10 select offset/post/pre. */
+    if ((insn & 0x3f000000U) != 0x3c000000U)
+        return GREEN_EMU_UNSUPPORTED;
+
+    if (insn & GREEN_EMU_BIT(21)) {
+        option = (insn >> 13) & 7;
+        if (option != 2 && option != 3 && option != 6 && option != 7)
+            return GREEN_EMU_UNSUPPORTED;
+        d->reg_offset = 1;
+        d->rm = (insn >> 16) & 31;
+        d->option = option;
+        d->shift = (insn >> 12) & 1;
+        d->mode = GREEN_EMU_MODE_OFFSET;
+        d->writeback = 0;
+    } else {
+        mode = (insn >> 10) & 3;
+        if (mode == 2)
+            return GREEN_EMU_UNSUPPORTED; /* LDTR */
+        d->mode = mode;
+        d->reg_offset = 0;
+        d->writeback = mode != GREEN_EMU_MODE_OFFSET;
+        d->offset = green_emu_sext((insn >> 12) & 0x1ff, 9);
+    }
+
+    return GREEN_EMU_OK;
+}
+
+static int green_emu_decode_simd_literal(u32 insn,
+                                         struct green_emu_decoded *d)
+{
+    unsigned int opc;
+
+    if (!(insn & GREEN_EMU_BIT(26)))
+        return GREEN_EMU_UNSUPPORTED;
+    if ((insn & GREEN_EMU_LS_CLASS_MASK) != GREEN_EMU_LITERAL_CLASS)
+        return GREEN_EMU_UNSUPPORTED;
+
+    opc = (insn >> 30) & 3;
+    if (opc == 3)
+        return GREEN_EMU_UNSUPPORTED; /* PRFM (literal) */
+
+    d->kind = GREEN_EMU_KIND_LITERAL;
+    d->simd = 1;
+    d->load = 1;
+    d->sign = 0;
+    d->size = 4U << opc;
+    d->dst_bits = 0;
+    d->rt = insn & 31;
+    d->rn = 0;
+    d->mode = GREEN_EMU_MODE_OFFSET;
+    d->writeback = 0;
+    d->reg_offset = 0;
+    d->offset = green_emu_sext((insn >> 5) & 0x7ffff, 19) * (s64)4;
+    return GREEN_EMU_OK;
+}
+
+static int green_emu_decode_simd_pair(u32 insn,
+                                      struct green_emu_decoded *d)
+{
+    unsigned int opc;
+    unsigned int mode;
+    unsigned int bytes;
+
+    if (!(insn & GREEN_EMU_BIT(26)))
+        return GREEN_EMU_UNSUPPORTED;
+    /* opc(31:30) 101 V 01x L ... : opc selects S/D/Q = 0/1/2 */
+    opc = (insn >> 30) & 3;
+    if (opc == 3)
+        return GREEN_EMU_UNSUPPORTED;
+    /* opc 101 V 01x ... : bits 29,27,26 set, 28,25 clear (b24 varies with
+     * the addressing mode: 1 for offset/pre, 0 for post). */
+    if ((insn & 0x3e000000U) != 0x2c000000U)
+        return GREEN_EMU_UNSUPPORTED;
+    /* L bit 22 must be set for LDP. */
+    if (!((insn >> 22) & 1))
+        return GREEN_EMU_UNSUPPORTED;
+
+    bytes = 4U << opc;
+    mode = (insn >> 23) & 3;
+    if (mode == 0)
+        return GREEN_EMU_UNSUPPORTED; /* LDNP */
+
+    d->kind = GREEN_EMU_KIND_PAIR;
+    d->simd = 1;
+    d->load = 1;
+    d->sign = 0;
+    d->size = bytes;
+    d->dst_bits = 0;
+    d->rt = insn & 31;
+    d->rt2 = (insn >> 10) & 31;
+    d->rn = (insn >> 5) & 31;
+    d->mode = (mode == 2) ? GREEN_EMU_MODE_OFFSET : mode;
+    d->writeback = d->mode != GREEN_EMU_MODE_OFFSET;
+    d->reg_offset = 0;
+    d->offset = green_emu_sext((insn >> 15) & 0x7f, 7) * (s64)bytes;
     return GREEN_EMU_OK;
 }
 
@@ -278,6 +451,15 @@ static int green_emu_decode(u32 insn, struct green_emu_decoded *d)
     ret = green_emu_decode_literal(insn, d);
     if (ret == GREEN_EMU_OK)
         return ret;
+    ret = green_emu_decode_simd_scalar(insn, d);
+    if (ret == GREEN_EMU_OK)
+        return ret;
+    ret = green_emu_decode_simd_literal(insn, d);
+    if (ret == GREEN_EMU_OK)
+        return ret;
+    ret = green_emu_decode_simd_pair(insn, d);
+    if (ret == GREEN_EMU_OK)
+        return ret;
     return GREEN_EMU_UNSUPPORTED;
 }
 
@@ -286,7 +468,8 @@ static u64 green_emu_index(const struct green_emu_cpu *cpu,
 {
     u64 value = green_emu_read_reg(cpu, d->rm);
     s64 signed_value;
-    unsigned int amount = d->shift ? (d->size == 8 ? 3 :
+    unsigned int amount = d->shift ? (d->size == 16 ? 4 :
+                                      d->size == 8 ? 3 :
                                       d->size == 4 ? 2 :
                                       d->size == 2 ? 1 : 0) : 0;
 
@@ -319,7 +502,9 @@ static u64 green_emu_address(const struct green_emu_cpu *cpu,
     base = green_emu_read_base(cpu, d->rn);
     if (d->reg_offset)
         return base + green_emu_index(cpu, d);
-    if (d->mode == GREEN_EMU_MODE_PRE)
+    /* Both offset-mode and pre-index access at base+offset; post-index
+     * accesses at the unmodified base and writes back base+offset. */
+    if (d->mode == GREEN_EMU_MODE_OFFSET || d->mode == GREEN_EMU_MODE_PRE)
         return base + (u64)d->offset;
     return base;
 }
@@ -347,7 +532,7 @@ int green_emu_step(struct green_emu_cpu *cpu, u32 insn,
     struct green_emu_cpu next;
     struct green_emu_decoded d;
     struct green_emu_result out;
-    u8 data[16];
+    u8 data[32];
     u64 address;
     u64 value;
     u64 value2;
@@ -359,8 +544,14 @@ int green_emu_step(struct green_emu_cpu *cpu, u32 insn,
     ret = green_emu_decode(insn, &d);
     if (ret)
         return ret;
-    if (d.size == 0 || d.size > 8)
+    if (d.simd) {
+        if (!mem->simd_write)
+            return GREEN_EMU_UNSUPPORTED;
+        if (d.size == 0 || d.size > 16)
+            return GREEN_EMU_UNSUPPORTED;
+    } else if (d.size == 0 || d.size > 8) {
         return GREEN_EMU_UNSUPPORTED;
+    }
     if (d.kind == GREEN_EMU_KIND_PAIR && d.size * 2 > sizeof(data))
         return GREEN_EMU_UNSUPPORTED;
     if (!d.load && !mem->write)
@@ -369,7 +560,7 @@ int green_emu_step(struct green_emu_cpu *cpu, u32 insn,
         return GREEN_EMU_BAD_MEMORY;
 
     /* Writeback overlap has architecturally constrained/unpredictable cases. */
-    if (d.writeback && d.load && d.rn < 31 &&
+    if (d.writeback && d.load && !d.simd && d.rn < 31 &&
         (d.rn == d.rt || (d.kind == GREEN_EMU_KIND_PAIR && d.rn == d.rt2)))
         return GREEN_EMU_UNSUPPORTED;
     if (d.kind == GREEN_EMU_KIND_PAIR && d.load && d.rt == d.rt2)
@@ -401,7 +592,18 @@ int green_emu_step(struct green_emu_cpu *cpu, u32 insn,
     /* Struct assignments would be lowered to a plain memcpy() call, which
      * the KPM loader cannot resolve; route through the kf_memcpy inline. */
     memcpy (&next, cpu, sizeof (next));
-    if (d.load) {
+    if (d.simd && d.load) {
+        /* SIMD/FP loads: bytes go to the V register file via the callback;
+         * upper lanes are preserved by the writer. */
+        ret = mem->simd_write(mem->ctx, d.rt, d.size, data);
+        if (ret)
+            return ret;
+        if (d.kind == GREEN_EMU_KIND_PAIR && d.rt2 != d.rt) {
+            ret = mem->simd_write(mem->ctx, d.rt2, d.size, data + d.size);
+            if (ret)
+                return ret;
+        }
+    } else if (d.load) {
         value = green_emu_load_le(data, d.size);
         if (d.sign)
             value = (u64)green_emu_sext(value, d.size * 8);

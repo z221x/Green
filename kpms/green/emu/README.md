@@ -12,6 +12,7 @@ The first version supports scalar GPR memory instructions:
 - `LDRSB`, `LDRSH`, `LDRSW`;
 - `LDR` literal;
 - `LDP`/`STP` for W/X registers.
+- SIMD/FP loads: `LDR Bt/Ht/St/Dt/Qt` (immediate/unscaled/pre/post-index/register-offset), `LDR St/Dt/Qt, literal`, `LDP St/Dt/Qt` pairs; destinations written back through a `simd_write` callback (the shadow fault path writes the live V registers).
 
 SIMD/FP, exclusive/atomic instructions, unprivileged accesses and accesses
 crossing a page boundary are intentionally rejected. The shadow fault hook

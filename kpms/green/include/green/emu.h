@@ -24,10 +24,21 @@ typedef int (*green_emu_mem_read_t)(void *ctx, u64 addr, void *buf,
 typedef int (*green_emu_mem_write_t)(void *ctx, u64 addr, const void *buf,
                                      unsigned int size);
 
+/*
+ * SIMD/FP load destination write-back: stores the loaded bytes into the low
+ * lanes of V register `reg` (0-31), preserving the upper lanes like the
+ * architecture does for B/H/S/D/Q views.  nbytes ∈ {1,2,4,8,16}.
+ */
+typedef int (*green_emu_simd_write_t)(void *ctx, unsigned int reg,
+                                      unsigned int nbytes, const void *data);
+
 struct green_emu_mem {
     void *ctx;
     green_emu_mem_read_t read;
     green_emu_mem_write_t write;
+
+    /* Optional: without it SIMD/FP loads are rejected as unsupported. */
+    green_emu_simd_write_t simd_write;
 
     /* If non-zero, the first memory address must match this fault address. */
     u64 fault_addr;
