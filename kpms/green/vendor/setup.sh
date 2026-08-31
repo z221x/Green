@@ -60,3 +60,23 @@ echo "== gum =="
         subprojects/libunwind/src/libunwind.a >/dev/null)
 
 echo "vendor build complete: $GUM/build-android-arm64/gum/libfrida-gum-1.0.a"
+
+echo "== quickjs (native, for quickcompile) =="
+(cd $GUM/subprojects/quickjs 2>/dev/null || { git clone -q --depth=1 https://github.com/frida/quickjs.git $GUM/subprojects/quickjs; cd $GUM/subprojects/quickjs; } && \
+    $MESON setup build-native -Ddefault_library=static >/dev/null && \
+    ninja -C build-native >/dev/null)
+
+echo "== gumjs (arm64 payload library) =="
+(cd $GUM && \
+    PKG_CONFIG_PATH=$VENDOR/native-pc:/opt/homebrew/lib/pkgconfig \
+    $MESON setup build-gumjs --cross-file cross/android-arm64.ini \
+        --native-file $VENDOR/cross/native-file.ini \
+        -Dfrida_version=17.7.0 -Dgumjs=enabled -Dquickjs=enabled \
+        -Dtests=disabled -Dgumpp=disabled -Dinspector=disabled \
+        -Dgraft_tool=disabled >/dev/null && \
+    ninja -C build-gumjs gum/libfrida-gum-1.0.a \
+        bindings/gumjs/libfrida-gumjs-1.0.a \
+        subprojects/libdwarf/src/lib/libdwarf/libdwarf.a \
+        subprojects/libunwind/src/libunwind.a >/dev/null)
+
+echo "vendor build complete (incl. gumjs)"

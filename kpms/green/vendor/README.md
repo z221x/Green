@@ -1,32 +1,32 @@
 # Vendored dependencies (not committed)
 
-The directories below are fetched/built locally and are **git-ignored**:
+git-ignored directories (fetched/built locally):
 
-| Path | Source | Purpose |
-|---|---|---|
-| `frida-gum/` | frida-gum + subprojects (glib, capstone, libffi, libdwarf, libunwind) | the real GumInterceptor stack |
-| `prefix/` | cross-built arm64 static libs (glib/capstone/libffi + headers + .pc) | link inputs for the payload |
-| `meson14/` | local Python venv with meson 1.4.2 (frida-era) + ninja + setuptools | build tool |
-| `scratch/` | throwaway test sources/binaries | — |
+- `frida-gum/` — frida-gum source + subprojects (glib, capstone, libffi,
+  libdwarf, libunwind, quickjs)
+- `prefix/` — cross-built arm64 static libs + headers + .pc files
+- `meson14/` — Python venv with meson 1.4.2 (frida-era), ninja, setuptools
+- `scratch/` — throwaway test sources
 
-Only `cross/`, `setup.sh` and this README are committed.
+Committed: `cross/` (meson machine files + arm64 pkg-config wrapper),
+`native-pkg-config`, `setup.sh`, this README.
 
-## Rebuild from scratch
+## What the build produces
+
+- `prefix/` — arm64 static: glib/gobject/gio, capstone 5, libffi, lzma, zstd,
+  quickjs (frida fork)
+- `frida-gum/build-gumjs/gum/libfrida-gum-1.0.a` — gum core incl.
+  GumInterceptor (trampoline + relocation) and the memory backend we route
+  through the broker
+- `frida-gum/build-gumjs/bindings/gumjs/libfrida-gumjs-1.0.a` — QuickJS
+  script backend + the frida JS API runtime (Interceptor, Memory, Module...)
+
+## Rebuild
 
 ```sh
-# 1. sources: copy the reference checkout into vendor/
-rsync -a --exclude='.git' --exclude='build-android-arm64' \
-    ../tmp/frida-gum/ frida-gum/
-
-# 2. tool venv
-python3 -m venv meson14
-meson14/bin/pip install meson==1.4.2 ninja setuptools
-
-# 3. libffi / glib / capstone -> prefix  (see log excerpts in setup.sh)
 ./setup.sh
 ```
 
-`setup.sh` performs the full flow: standalone cross builds of libffi, glib
-(force-fallback pcre2) and capstone into `prefix/`, then the gum build
-against `prefix` via `PKG_CONFIG_PATH`, producing
-`frida-gum/build-android-arm64/gum/libfrida-gum-1.0.a`.
+Requires: Android NDK (ANDROID_NDK env or default location), meson 1.4.2
+venv at `meson14/` (recreate with `python3 -m venv` + pip install),
+network for the first clone.

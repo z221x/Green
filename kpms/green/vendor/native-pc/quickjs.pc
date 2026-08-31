@@ -1,0 +1,9 @@
+prefix=/Users/work/Desktop/work/work/KernelPatch/kpms/green/vendor/quickjs
+libdir=/Users/work/Desktop/work/work/KernelPatch/kpms/green/vendor/quickjs/build-native
+includedir=/Users/work/Desktop/work/work/KernelPatch/kpms/green/vendor/quickjs
+
+Name: quickjs
+Description: QuickJS native (build machine)
+Version: 2024-01-13
+Libs: /Users/work/Desktop/work/work/KernelPatch/kpms/green/vendor/quickjs/build-native/libquickjs.a -lm
+Cflags: -I/Users/work/Desktop/work/work/KernelPatch/kpms/green/vendor/quickjs -I/Users/work/Desktop/work/work/KernelPatch/kpms/green/vendor/quickjs/build-native

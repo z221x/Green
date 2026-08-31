@@ -1,0 +1,3 @@
+#!/bin/sh
+export PKG_CONFIG_PATH="/Users/work/Desktop/work/work/KernelPatch/kpms/green/vendor/prefix/lib/pkgconfig"
+exec /opt/homebrew/bin/pkg-config "$@"
