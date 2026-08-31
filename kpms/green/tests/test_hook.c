@@ -139,16 +139,21 @@ int main(void)
     value = target_fn(41);
     CHECK(value == 141, "target_fn(41) == 141 while hooked");
 
-    /* --- reads still see the original bytes ------------------------------ */
+    /* --- reads while hooked ---------------------------------------------- */
 
+    /* GUP readers (process_vm_readv, ptrace, /proc/pid/mem) get the original
+     * page through the follow_page_pte hook. */
     CHECK(gup_read_self(during, target_fn, PATCH_LEN) == (ssize_t)PATCH_LEN,
           "GUP read succeeds while hooked");
     CHECK(memcmp(before, during, PATCH_LEN) == 0,
           "GUP read sees ORIGINAL bytes while hooked");
 
+    /* Execute-only exec view (AP=10 + UXN=0): a direct load from test code
+     * (different page) takes a read fault, the seesaw switches the page to
+     * the r-- original view, and the load observes the ORIGINAL bytes. */
     direct_read(during, (const volatile uint8_t *)target_fn, PATCH_LEN);
     CHECK(memcmp(before, during, PATCH_LEN) == 0,
-          "direct read sees ORIGINAL bytes while hooked");
+          "direct read sees ORIGINAL bytes while hooked (read-fault seesaw)");
 
     /* also via the gum API itself */
     {
@@ -157,7 +162,7 @@ int main(void)
 
         CHECK(bytes != NULL && n == PATCH_LEN, "gum_memory_read() works");
         CHECK(bytes != NULL && memcmp(before, bytes, PATCH_LEN) == 0,
-              "gum_memory_read() sees ORIGINAL bytes");
+              "gum_memory_read() sees ORIGINAL bytes (GUP path)");
         g_free(bytes);
     }
 

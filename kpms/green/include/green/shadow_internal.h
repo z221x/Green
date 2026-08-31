@@ -144,6 +144,7 @@ static inline void *green_mm_pgd(void *mm)
 }
 
 int green_shadow_detect_paging(void);
+int green_shadow_check_epan(void);
 int green_shadow_detect_vma_mm(void *mm, void *vma);
 
 u64 *green_shadow_get_pte(void *mm, unsigned long addr);

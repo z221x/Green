@@ -17,6 +17,34 @@
 #define GREEN_FAULT_READ  2
 #define GREEN_FAULT_WRITE 3
 
+/* Fault-path tracing: log the first N faults after load so hangs and
+ * PTE-flap loops can be diagnosed from dmesg. */
+#define GREEN_SHADOW_TRACE_BUDGET 48
+static atomic_t green_shadow_trace_budget = ATOMIC_INIT(GREEN_SHADOW_TRACE_BUDGET);
+
+static bool green_shadow_trace_want(void)
+{
+    int left = atomic_sub_return(1, &green_shadow_trace_budget);
+
+    /* atomic_dec_if_positive() is not provided by the KPM headers; emulate
+     * it with a sub that stops going negative. */
+    if (left < 0) {
+        atomic_add(1, &green_shadow_trace_budget);
+        return false;
+    }
+    return true;
+}
+
+static void green_shadow_trace(const char *tag, unsigned long far,
+                               unsigned int esr, struct pt_regs *regs,
+                               struct green_shadow_page *page, int kind,
+                               int same_page)
+{
+    pr_info("green_shadow: [%s] far=%lx esr=%x pc=%lx state=%d kind=%d same=%d\n",
+            tag, far, esr, regs ? regs->pc : 0, page ? page->state : -1,
+            kind, same_page);
+}
+
 struct green_shadow_emu_context {
     struct green_shadow_page *page;
 };
@@ -179,6 +207,8 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
     }
 
     same_page = regs && green_align_down(regs->pc) == page->va;
+    if (green_shadow_trace_want())
+        green_shadow_trace("fault", far, esr, regs, page, kind, same_page);
     if (kind == GREEN_FAULT_EXEC && page->state == GREEN_SHADOW_STATE_READ) {
         ret = green_shadow_map_exec(page);
         if (ret == 0) {

@@ -66,6 +66,33 @@ int green_shadow_detect_paging(void)
     return 0;
 }
 
+/*
+ * Hard requirement: FEAT_EPAN must be implemented.
+ *
+ * The shadow exec view is an execute-only mapping (PAGE_EXECONLY encoding,
+ * AP[2:1]=10 + UXN=0).  On hardware without FEAT_EPAN such mappings are
+ * readable from EL1 without tripping PAN — the exact hole that made the
+ * upstream kernel revert execute-only support in 2019 — so the shadow page
+ * would be exposed to ordinary privileged reads.  Detect ID_AA64MMFR1_EL1's
+ * EPAN field and refuse to come online when it is not implemented.
+ */
+int green_shadow_check_epan(void)
+{
+    u64 mmfr1;
+
+    asm volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
+
+    /* ID_AA64MMFR1_EL1.EPAN, bits [63:60]: 0 = not implemented. */
+    if ((mmfr1 >> 60) == 0) {
+        pr_err("green_shadow: FEAT_EPAN is a hard requirement and this CPU does not implement it (ID_AA64MMFR1_EL1.EPAN=0)\n");
+        return -EOPNOTSUPP;
+    }
+
+    pr_info("green_shadow: FEAT_EPAN detected (ID_AA64MMFR1_EL1.EPAN=%llu)\n",
+            (unsigned long long)(mmfr1 >> 60));
+    return 0;
+}
+
 u64 *green_shadow_get_pte(void *mm, unsigned long addr)
 {
     u64 *table;
@@ -135,8 +162,16 @@ static u64 green_shadow_exec_pte(struct green_shadow_page *page)
 {
     u64 pte = green_pte_replace_pfn(page->original_pte, page->shadow_pfn);
 
-    pte |= PTE_VALID | PTE_TYPE_PAGE | PTE_AF | PTE_SPECIAL;
-    pte &= ~(u64)(PTE_USER | PTE_RDONLY | PTE_UXN);
+    /* Execute-only, matching the kernel's PAGE_EXECONLY encoding:
+     *   AP[2:1] = 0b10  (PTE_RDONLY set, PTE_USER clear)
+     *   UXN     = 0
+     * EL0 may fetch from this mapping but any data read faults, which is
+     * what drives the read-fault seesaw and the same-page emulator.
+     * With FEAT_EPAN (a project hard requirement) PAN also covers such
+     * mappings, so privileged reads through the user VA trip PAN instead
+     * of silently succeeding. */
+    pte |= PTE_VALID | PTE_TYPE_PAGE | PTE_AF | PTE_SPECIAL | PTE_RDONLY;
+    pte &= ~(u64)(PTE_USER | PTE_UXN);
 #ifdef PTE_DBM
     pte &= ~(u64)PTE_DBM;
 #endif
