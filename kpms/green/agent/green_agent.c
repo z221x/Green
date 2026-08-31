@@ -360,7 +360,6 @@ static void *green_agent_handle_client(void *arg)
 {
     int client = *(int *)arg;
     free(arg);
-    int is_broker = 0;
 
     for (;;) {
         struct green_agent_request request;
@@ -383,7 +382,13 @@ static void *green_agent_handle_client(void *arg)
                      "agent command failed: %d", status);
         if (green_agent_write_full(client, &response, sizeof(response)) != 0)
             break;
-        (void)is_broker;
+        if (request.tool == GREEN_AGENT_TOOL_CORE &&
+            request.command == GREEN_AGENT_CMD_BROKER_ATTACH) {
+            /* The dup'd broker_fd now owns this channel exclusively; any
+             * further read here would steal broker responses. */
+            close(client);
+            return NULL;
+        }
     }
     close(client);
     return NULL;
