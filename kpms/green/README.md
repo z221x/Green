@@ -41,12 +41,13 @@ kpms/green/
 │   └── symbol.c             # KPM 内核符号提取与地址解析
 ├── tests/
 │   └── test_hook.c          # green_hook 端到端用例（patch/读原始/恢复）
-└── cli/
-    ├── main.c               # CLI 工具分发入口
-    ├── README.md            # CLI 扩展说明
-    ├── shadow.c             # shadow 子命令
-    ├── hook.c               # hook 子命令（设备端调试用 attach/spawn）
-    └── server.c             # server 子命令（frida 式守护进程，TCP 27042）
+├── server/
+│   └── server.c             # frida 式守护进程（TCP 27042，主机 CLI 入口）
+├── cli/
+│   ├── main.c               # 设备端 CLI 工具分发入口
+│   ├── README.md            # CLI 扩展说明
+│   ├── shadow.c             # shadow 子命令
+│   └── hook.c               # hook 子命令（设备端调试用 attach/spawn）
 ```
 
 ## 当前工具：shadow
