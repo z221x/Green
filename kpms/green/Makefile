@@ -68,15 +68,15 @@ CLI_GUM_SRCS := green_hook/gummemory-green.c \
                 $(CLI_GUM_VENDOR_DIR)/gummetalarray.c \
                 $(CLI_GUM_VENDOR_DIR)/gummetalhash.c \
                 $(CLI_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
-CLI_SRCS := server/main.c common/common.c common/agentops.c server/shadow.c \
-            server/hook.c server/server.c $(CLI_GUM_SRCS)
+SERVER_SRCS := server/main.c common/common.c common/agentops.c server/server.c \
+               $(CLI_GUM_SRCS)
 CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
 
-$(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)
+$(CLIENT): $(SERVER_SRCS) $(CLI_HEADERS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -O2 -Wall -Wextra -Iinclude -Iagent \
-		$(CLI_GUM_SHIM_FLAGS) -o $@ $(CLI_SRCS) -ldl
+		$(CLI_GUM_SHIM_FLAGS) -o $@ $(SERVER_SRCS) -ldl
 
 .PHONY: testhook
 TESTHOOK := $(BUILD_DIR)/test_hook

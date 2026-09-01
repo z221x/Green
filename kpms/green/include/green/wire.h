@@ -18,11 +18,36 @@ enum green_wire_type {
     GREEN_WIRE_LIST = 1,   /* no payload */
     GREEN_WIRE_ATTACH = 2, /* attach_request */
     GREEN_WIRE_SPAWN = 3,  /* spawn_request */
+    GREEN_WIRE_SHADOW_PATCH = 4,   /* shadow_patch: raw hidden patch */
+    GREEN_WIRE_SHADOW_RELEASE = 5, /* shadow_release */
+    GREEN_WIRE_SHADOW_COUNT = 6,   /* shadow_count */
+    GREEN_WIRE_SOLIST = 7,         /* solist request */
     /* server -> host */
     GREEN_WIRE_LOG = 0x80,    /* log_event */
-    GREEN_WIRE_RESULT = 0x81, /* result */
+    GREEN_WIRE_RESULT = 0x81, /* result (ok + value + message) */
     GREEN_WIRE_PROCS = 0x82,  /* process_list */
+    GREEN_WIRE_MODULES = 0x83, /* module_list (solist) */
 };
+
+struct green_wire_shadow_patch {
+    int32_t pid;
+    uint32_t len;
+    uint64_t addr;
+    /* unsigned char bytes[len] follows (len <= 4096) */
+};
+
+struct green_wire_shadow_release {
+    int32_t pid;
+    uint32_t reserved;
+    uint64_t addr; /* 0 = release every shadow page of the mm */
+};
+
+struct green_wire_solist {
+    int32_t pid;
+    uint8_t has_name;
+    char name[128];
+};
+
 
 struct green_wire_frame {
     uint32_t magic;
@@ -46,7 +71,8 @@ struct green_wire_log {
 };
 
 struct green_wire_result {
-    int32_t ok;
+    int32_t ok;    /* 0 on failure; 1 on success (result value in `value`) */
+    int64_t value; /* command-specific (e.g. released page count) */
     uint32_t len;
     /* char msg[len] follows */
 };

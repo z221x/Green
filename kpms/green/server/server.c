@@ -15,6 +15,7 @@
  */
 
 #include <green/agentops.h>
+#include <green/abi.h>
 #include <green/cli.h>
 #include <green/wire.h>
 #include <green_agent.h>
@@ -99,17 +100,20 @@ static int write_frame(int fd, uint16_t type, const void *payload,
     return 0;
 }
 
-static int send_result(int fd, int32_t ok, const char *msg)
+static int send_result(int fd, int32_t ok, int64_t value, const char *msg)
 {
-    unsigned char buf[8 + 256];
+    unsigned char buf[20 + 256];
     uint32_t len = (uint32_t)strlen(msg);
 
-    if (len > sizeof(buf) - 8)
-        len = sizeof(buf) - 8;
+    if (len > sizeof(buf) - 20)
+        len = sizeof(buf) - 20;
     put_u32(buf + 0, (uint32_t)ok);
-    put_u32(buf + 4, len);
-    memcpy(buf + 8, msg, len);
-    return write_frame(fd, GREEN_WIRE_RESULT, buf, 8 + len);
+    put_u32(buf + 4, 0); /* reserved */
+    put_u32(buf + 8, (uint32_t)(uint64_t)value);
+    put_u32(buf + 12, (uint32_t)((uint64_t)value >> 32));
+    put_u32(buf + 16, len);
+    memcpy(buf + 20, msg, len);
+    return write_frame(fd, GREEN_WIRE_RESULT, buf, 20 + len);
 }
 
 struct session {
@@ -236,7 +240,7 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
         pid_t found = green_agentops_find_package(package);
 
         if (found <= 0) {
-            send_result(fd, 0, "no running process for package");
+            send_result(fd, 0, 0, "no running process for package");
             free(script);
             return;
         }
@@ -245,13 +249,13 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
     s.pid = (pid_t)pid;
 
     if (green_agentops_ensure_injected(s.pid, err, sizeof(err)) != 0) {
-        send_result(fd, 0, err);
+        send_result(fd, 0, 0, err);
         free(script);
         return;
     }
     if (green_agentops_deploy_script(s.pid, NULL, script, dest, sizeof(dest),
                                      err, sizeof(err)) != 0) {
-        send_result(fd, 0, err);
+        send_result(fd, 0, 0, err);
         free(script);
         return;
     }
@@ -263,7 +267,7 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
         green_agentops_broker_attach(s.pid, broker_fd) != 0) {
         if (broker_fd >= 0)
             close(broker_fd);
-        send_result(fd, 0, "broker attach failed");
+        send_result(fd, 0, 0, "broker attach failed");
         free(script);
         return;
     }
@@ -272,7 +276,7 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
     if (cmd_fd < 0 ||
         green_agentops_send_request(cmd_fd, GREEN_AGENT_TOOL_JS,
                                     GREEN_AGENT_CMD_JS_LOAD, 0, 0, 0) != 0) {
-        send_result(fd, 0, "agent request failed");
+        send_result(fd, 0, 0, "agent request failed");
         goto out;
     }
 
@@ -298,7 +302,8 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
             if (green_agentops_read_response(cmd_fd, &response) != 0)
                 break;
             pthread_mutex_lock(&s.send_lock);
-            send_result(fd, response.status == 0 ? 1 : 0, response.message);
+            send_result(fd, response.status == 0 ? 1 : 0,
+                        (int64_t)response.value, response.message);
             pthread_mutex_unlock(&s.send_lock);
             ok = response.status == 0;
             break;
@@ -320,6 +325,150 @@ out:
         close(cmd_fd);
     if (broker_fd >= 0)
         close(broker_fd);
+}
+
+
+/* ---- host-driven shadow operations (run here, on the device, as root) */
+
+struct module_list_ctx {
+    unsigned char *buf;
+    size_t cap;
+    size_t used;
+    uint32_t count;
+};
+
+static int module_list_cb(const char *name, unsigned long base,
+                          unsigned long size, void *ud)
+{
+    struct module_list_ctx *m = ud;
+    size_t name_len = strlen(name);
+    size_t need = 8 + 2 + name_len;
+
+    if (m->used + need + 16 > m->cap) {
+        m->cap = m->cap * 2 + need;
+        m->buf = realloc(m->buf, m->cap);
+        if (!m->buf)
+            return -1;
+    }
+    m->buf[m->used++] = (unsigned char)(base & 0xff);
+    m->buf[m->used++] = (unsigned char)((base >> 8) & 0xff);
+    m->buf[m->used++] = (unsigned char)((base >> 16) & 0xff);
+    m->buf[m->used++] = (unsigned char)((base >> 24) & 0xff);
+    m->buf[m->used++] = (unsigned char)((base >> 32) & 0xff);
+    m->buf[m->used++] = (unsigned char)((base >> 40) & 0xff);
+    m->buf[m->used++] = (unsigned char)((base >> 48) & 0xff);
+    m->buf[m->used++] = (unsigned char)((base >> 56) & 0xff);
+    /* size stored as u64 */
+    m->buf[m->used++] = (unsigned char)(size & 0xff);
+    m->buf[m->used++] = (unsigned char)((size >> 8) & 0xff);
+    m->buf[m->used++] = (unsigned char)((size >> 16) & 0xff);
+    m->buf[m->used++] = (unsigned char)((size >> 24) & 0xff);
+    m->buf[m->used++] = (unsigned char)((size >> 32) & 0xff);
+    m->buf[m->used++] = (unsigned char)((size >> 40) & 0xff);
+    m->buf[m->used++] = (unsigned char)((size >> 48) & 0xff);
+    m->buf[m->used++] = (unsigned char)((size >> 56) & 0xff);
+    m->buf[m->used++] = (unsigned char)(name_len & 0xff);
+    m->buf[m->used++] = (unsigned char)((name_len >> 8) & 0xff);
+    memcpy(m->buf + m->used, name, name_len);
+    m->used += name_len;
+    m->count++;
+    return 0;
+}
+
+static void handle_shadow_patch(int fd, const unsigned char *payload,
+                                uint32_t len)
+{
+    int32_t pid;
+    uint32_t plen;
+    uint64_t addr;
+    unsigned char bytes[4096];
+    long ret;
+
+    if (len < 16)
+        return;
+    pid = (int32_t)get_u32(payload + 0);
+    plen = get_u32(payload + 4);
+    addr = get_u32(payload + 8) | ((uint64_t)get_u32(payload + 12) << 32);
+    if (plen == 0 || plen > sizeof(bytes) || len - 16 < plen) {
+        send_result(fd, 0, 0, "invalid patch payload");
+        return;
+    }
+    memcpy(bytes, payload + 16, plen);
+    ret = green_cli_prctl(PR_GREEN_SHADOW_PATCH, (unsigned long)pid,
+                          (unsigned long)addr, (unsigned long)bytes, plen);
+    if (ret < 0)
+        send_result(fd, 0, ret, strerror((int)-ret));
+    else
+        send_result(fd, 1, ret, "patched");
+}
+
+static void handle_shadow_release(int fd, const unsigned char *payload,
+                                  uint32_t len)
+{
+    int32_t pid;
+    uint64_t addr;
+    long ret;
+    char msg[96];
+
+    if (len < 16)
+        return;
+    pid = (int32_t)get_u32(payload + 0);
+    addr = get_u32(payload + 8) | ((uint64_t)get_u32(payload + 12) << 32);
+    ret = green_cli_prctl(PR_GREEN_SHADOW_RELEASE, (unsigned long)pid,
+                          (unsigned long)addr, 0, 0);
+    if (ret < 0) {
+        send_result(fd, 0, ret, strerror((int)-ret));
+        return;
+    }
+    snprintf(msg, sizeof(msg), "released %ld shadow page(s) for pid %d", ret,
+             (int)pid);
+    send_result(fd, 1, ret, msg);
+}
+
+static void handle_shadow_count(int fd, const unsigned char *payload,
+                                uint32_t len)
+{
+    int32_t pid;
+    long ret;
+
+    if (len < 4)
+        return;
+    pid = (int32_t)get_u32(payload + 0);
+    ret = green_cli_prctl(PR_GREEN_SHADOW_COUNT, (unsigned long)pid, 0, 0, 0);
+    if (ret < 0)
+        send_result(fd, 0, ret, strerror((int)-ret));
+    else
+        send_result(fd, 1, ret, "ok");
+}
+
+static void handle_solist(int fd, const unsigned char *payload, uint32_t len)
+{
+    /* payload: i32 pid | u8 has_name | char name[128] (133 bytes, packed) */
+    const uint32_t SOLIST_HDR = 133;
+    struct module_list_ctx m;
+    int32_t pid;
+    uint32_t count;
+
+    if (len < SOLIST_HDR)
+        return;
+    pid = (int32_t)get_u32(payload + 0);
+
+    memset(&m, 0, sizeof(m));
+    m.cap = 64 * 1024;
+    m.buf = malloc(m.cap);
+    if (!m.buf)
+        return;
+    put_u32(m.buf, 0);
+    m.used = 4;
+
+    if (green_cli_list_solist((pid_t)pid, module_list_cb, &m) == 0) {
+        count = m.count;
+        put_u32(m.buf, count);
+        write_frame(fd, GREEN_WIRE_MODULES, m.buf, (uint32_t)m.used);
+    } else {
+        send_result(fd, 0, 0, "solist enumeration failed");
+    }
+    free(m.buf);
 }
 
 static void *conn_main(void *arg)
@@ -356,7 +505,19 @@ static void *conn_main(void *arg)
             handle_attach(fd, payload, len);
             break;
         case GREEN_WIRE_SPAWN:
-            send_result(fd, 0, "spawn is not implemented yet");
+            send_result(fd, 0, 0, "spawn is not implemented yet");
+            break;
+        case GREEN_WIRE_SHADOW_PATCH:
+            handle_shadow_patch(fd, payload, len);
+            break;
+        case GREEN_WIRE_SHADOW_RELEASE:
+            handle_shadow_release(fd, payload, len);
+            break;
+        case GREEN_WIRE_SHADOW_COUNT:
+            handle_shadow_count(fd, payload, len);
+            break;
+        case GREEN_WIRE_SOLIST:
+            handle_solist(fd, payload, len);
             break;
         default:
             break;
@@ -368,34 +529,11 @@ static void *conn_main(void *arg)
     return NULL;
 }
 
-static void server_usage(const char *prog)
-{
-    fprintf(stderr,
-            "Green server: frida-style daemon driving the agent payload\n\n"
-            "Usage:\n"
-            "  %s server [--port PORT]\n\n"
-            "Defaults: port %d, all interfaces.\n"
-            "Host side: adb forward tcp:%d tcp:%d, then run cli/green.py\n",
-            prog, GREEN_WIRE_DEFAULT_PORT, GREEN_WIRE_DEFAULT_PORT,
-            GREEN_WIRE_DEFAULT_PORT);
-}
-
-int green_server_main(int argc, char **argv)
+int green_server_run(int port)
 {
     struct sockaddr_in address;
     int listen_fd;
-    int port = GREEN_WIRE_DEFAULT_PORT;
-    int i;
     int one = 1;
-
-    for (i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc)
-            port = atoi(argv[++i]);
-        else {
-            server_usage(argv[0]);
-            return 2;
-        }
-    }
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -439,10 +577,3 @@ int green_server_main(int argc, char **argv)
     close(listen_fd);
     return 0;
 }
-
-const struct green_cli_tool green_cli_server_tool = {
-    .name = "server",
-    .summary = "run the frida-style daemon for host CLIs (default port 27042)",
-    .main = green_server_main,
-    .usage = server_usage,
-};

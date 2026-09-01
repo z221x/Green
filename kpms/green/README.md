@@ -41,13 +41,11 @@ kpms/green/
 │   └── symbol.c             # KPM 内核符号提取与地址解析
 ├── tests/
 │   └── test_hook.c          # green_hook 端到端用例（patch/读原始/恢复）
-├── server/                  # ★ 手机端二进制源码（等于 frida-server）
-│   ├── main.c               #    入口与子命令分发（server/shadow/hook）
-│   ├── server.c             #    TCP 守护进程（默认 27042，供主机 CLI 连接）
-│   ├── shadow.c             #    shadow 子命令
-│   └── hook.c               #    hook attach 子命令（设备端调试）
+├── server/                  # ★ 手机端二进制源码（≈ frida-server，无命令行）
+│   ├── main.c               #    入口：直接运行守护进程
+│   └── server.c             #    TCP 守护进程（默认 27042），承载全部特权操作
 ├── cli/                     # ★ 主机端 CLI（Python，跨平台）
-│   ├── green.py             #    green.py ps / attach，实时日志回流
+│   ├── green.py             #    ps / attach / shadow 全部功能
 │   └── README.md            #    使用说明与 wire 协议文档
 ```
 
@@ -62,7 +60,7 @@ Green 的 shadow 工具重新实现了一个 patch-oriented 的 R^X / W^X shadow
 - 代码和数据位于同一页时，使用 `emu/` 中的单指令 ARM64 模拟器从 original page 读取数据并推进 `pt_regs->pc`，避免整页切换造成 fault 循环。
 - hook `follow_page_pte` 时临时暴露 original PTE，覆盖 `/proc/pid/mem`、`process_vm_readv`、`ptrace` 等 GUP 读取路径。
 - hook `exit_mmap` 自动释放进程退出时遗留的 shadow 页。
-- 控制入口是 `prctl`，只允许 root 调用。注入到目标进程的 agent 没有内核特权：broker 请求（页面快照 + GumArm64Writer 编码 + prctl）由设备端 `green hook`/`green server` 或主机端 Python CLI 代为执行（详见 `agent/README.md` 与 `../../host/README.md`）。
+- 控制入口是 `prctl`，只允许 root 调用。注入到目标进程的 agent 没有内核特权：broker 请求（页面快照 + GumArm64Writer 编码 + prctl）与全部 shadow 操作由设备端 `green`（server）代主机 CLI 执行。设备端没有命令行工具，所有功能（含 shadow patch/nop/branch/release/maps）都在主机端 `cli/green.py`（详见 `agent/README.md` 与 `cli/README.md`）。
 
 内核符号统一由 `common/symbol.c` 提取和解析，地址变量及公共声明集中在 `include/green/symbol.h`；其他 KPM 工具只通过该头文件使用已解析地址。
 
@@ -86,7 +84,7 @@ CLI 工具示例（单二进制）：
 
 ```sh
 adb push build/green /data/local/tmp/green
-adb shell su -c "/data/local/tmp/green shadow count -p <pid>"
+python3 kpms/green/cli/green.py shadow count -p <pid>
 
 # hook：注入 + 加载 JS hook 脚本一步完成
 adb push build/libgreen_agent.so /data/local/tmp/libgreen_agent.so
@@ -138,31 +136,7 @@ adb shell su -c /data/local/tmp/test_hook
 
 ## CLI 用法
 
-```sh
-# 解析 linker64 的 solist 链表，打印所有已加载库
-./build/green shadow solist -p <pid>
-
-# maps 仍作为兼容别名，但不再从 maps 枚举 so
-./build/green shadow maps -p <pid>
-
-# 查看当前 shadow 页数量
-./build/green shadow count -p <pid>
-
-# 写入任意 hidden patch，hex 为小端机器码
-./build/green shadow patch -p <pid> -a 0xADDR -x d503201f
-
-# 按 linker64 solist 中的库名 + 偏移寻址
-./build/green shadow patch -p <pid> -b libc.so -o 0x12345 -x d503201f
-
-# NOP N 条 AArch64 指令
-./build/green shadow nop -p <pid> -a 0xADDR -n 2
-
-# 写入近跳 B target，范围 +/-128MB
-./build/green shadow branch -p <pid> -a 0xADDR -t 0xTARGET
-
-# 释放指定页 / 全部页
-./build/green shadow release -p <pid> -a 0xADDR
-./build/green shadow release -p <pid>
+shadow 命令全部在主机端执行（见上）。
 ```
 
 ## prctl ABI

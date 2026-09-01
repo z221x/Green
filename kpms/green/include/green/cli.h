@@ -6,15 +6,6 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-struct green_cli_tool {
-    const char *name;
-    const char *summary;
-    int (*main)(int argc, char **argv);
-    void (*usage)(const char *prog);
-};
-
-void green_cli_global_usage(const char *prog);
-const struct green_cli_tool *green_cli_find_tool(const char *name);
 int green_cli_parse_ulong(const char *s, unsigned long *out);
 int green_cli_parse_pid(const char *s, pid_t *out);
 int green_cli_hex_to_bytes(const char *hex, unsigned char **out, size_t *out_len);
@@ -31,8 +22,8 @@ unsigned long green_cli_show_exec_solist(pid_t pid, const char *lib_name);
 unsigned long green_cli_find_solist(pid_t pid, const char *needle);
 pid_t green_cli_effective_pid(pid_t pid);
 
-extern const struct green_cli_tool green_cli_shadow_tool;
-extern const struct green_cli_tool green_cli_hook_tool;
-extern const struct green_cli_tool green_cli_server_tool;
+typedef int (*green_cli_solist_cb)(const char *name, unsigned long base,
+                                   unsigned long size, void *ud);
+int green_cli_list_solist(pid_t pid, green_cli_solist_cb cb, void *ud);
 
 #endif /* GREEN_CLI_H */

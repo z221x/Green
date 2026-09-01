@@ -36,6 +36,21 @@ python3 cli/green.py --host <device-ip> --port 27042 ps   # 免 adb forward
 `attach` 会保持连接并实时回流脚本 `console.log()/log()/send()` 输出，
 Ctrl-C 断开（hook 与 shadow 页保留，重复 attach 会重载脚本）。
 
+## shadow 命令（全部在主机端执行）
+
+```sh
+python3 cli/green.py shadow maps   -p PID [filter]        # 枚举模块（solist）
+python3 cli/green.py shadow count  -p PID                 # shadow 页计数
+python3 cli/green.py shadow patch  -p PID -a 0xADDR -x d503201f
+python3 cli/green.py shadow patch  -p PID -b libc.so -o 0x12345 -x d503201f
+python3 cli/green.py shadow patch  -p PID -a 0xADDR -n 2   # 写 N 条 NOP
+python3 cli/green.py shadow patch  -p PID -a 0xADDR -t 0xTARGET  # B 跳转
+python3 cli/green.py shadow release -p PID [ -a 0xADDR ]   # 省略 -a 释放全部
+```
+
+patch/nop/branch 只写 shadow 物理页：执行看到补丁，读取看到原始字节。
+server 端收到 PATCH 帧后直接调用 `prctl(PR_GREEN_SHADOW_*)`。
+
 ## 协议
 
 帧格式（小端）：`u32 magic("GGR1") | u16 type | u16 flags | u32 len | payload`。

@@ -19,38 +19,6 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-static const struct green_cli_tool *const green_cli_tools[] = {
-    &green_cli_shadow_tool,
-    &green_cli_hook_tool,
-    &green_cli_server_tool,
-};
-
-const struct green_cli_tool *green_cli_find_tool(const char *name)
-{
-    size_t i;
-
-    if (!name)
-        return NULL;
-    for (i = 0; i < sizeof(green_cli_tools) / sizeof(green_cli_tools[0]); i++) {
-        if (!strcmp(name, green_cli_tools[i]->name))
-            return green_cli_tools[i];
-    }
-    return NULL;
-}
-
-void green_cli_global_usage(const char *prog)
-{
-    size_t i;
-
-    fprintf(stderr, "Green CLI\n\n");
-    fprintf(stderr, "Usage:\n  %s <tool> [args...]\n\n", prog);
-    fprintf(stderr, "Tools:\n");
-    for (i = 0; i < sizeof(green_cli_tools) / sizeof(green_cli_tools[0]); i++)
-        fprintf(stderr, "  %-10s %s\n", green_cli_tools[i]->name,
-                green_cli_tools[i]->summary);
-    fprintf(stderr, "\nUse '%s <tool> --help' for tool-specific help.\n", prog);
-}
-
 int green_cli_parse_ulong(const char *s, unsigned long *out)
 {
     char *end = NULL;
@@ -541,8 +509,13 @@ out:
     return -1;
 }
 
+typedef int (*green_cli_solist_cb)(const char *name, unsigned long base,
+                                   unsigned long size, void *ud);
+
+/* print 模式逐项打印；cb 非空时逐项回调（needle 仍生效）。 */
 static int green_cli_walk_solist(pid_t pid, const char *needle, int print,
-                                 unsigned long *found_base)
+                                 unsigned long *found_base,
+                                 green_cli_solist_cb cb, void *ud)
 {
     struct green_linker_image linker;
     unsigned long solist_symbol, head, node;
@@ -600,8 +573,12 @@ static int green_cli_walk_solist(pid_t pid, const char *needle, int print,
         if (have_name && (!needle || strstr(name, needle))) {
             if (found_base)
                 *found_base = base;
-            if (!print)
+            if (cb) {
+                if (cb(name, base, size, ud) != 0)
+                    return -1;
+            } else if (!print) {
                 return 0;
+            }
         }
         if (print && (!needle || (have_name && strstr(name, needle))))
             printf("  [%04lu] soinfo=0x%lx base=0x%lx size=0x%lx %s\n",
@@ -628,14 +605,20 @@ static int green_cli_walk_solist(pid_t pid, const char *needle, int print,
 
 unsigned long green_cli_show_exec_solist(pid_t pid, const char *lib_name)
 {
-    return green_cli_walk_solist(pid, lib_name, 1, NULL) < 0 ? 1 : 0;
+    return green_cli_walk_solist(pid, lib_name, 1, NULL, NULL, NULL) < 0 ? 1 : 0;
 }
 
 unsigned long green_cli_find_solist(pid_t pid, const char *needle)
 {
     unsigned long base = 0;
 
-    if (!needle || !*needle || green_cli_walk_solist(pid, needle, 0, &base) < 0)
+    if (!needle || !*needle ||
+        green_cli_walk_solist(pid, needle, 0, &base, NULL, NULL) < 0)
         return 0;
     return base;
+}
+
+int green_cli_list_solist(pid_t pid, green_cli_solist_cb cb, void *ud)
+{
+    return green_cli_walk_solist(pid, NULL, 0, NULL, cb, ud);
 }
