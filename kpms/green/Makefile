@@ -97,8 +97,8 @@ $(TESTHOOK): tests/test_hook.c green_hook/green_gum.h $(GUM_SRCS) include/green/
 
 .PHONY: agent
 AGENT_PAYLOAD := $(BUILD_DIR)/libgreen_agent.so
-# Payload: pure transport (no gum).  Privileged page-table operations are
-# performed by the root-side broker inside the green CLI.
+# Payload: transport + embedded QuickJS (no gum).  Privileged page-table
+# operations are performed by the root-side broker inside the green CLI.
 GUM_PREFIX := vendor/prefix
 agent: $(AGENT_PAYLOAD)
 

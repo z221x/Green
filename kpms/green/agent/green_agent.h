@@ -92,9 +92,9 @@ static inline int green_agent_socket_name(pid_t pid, char *out, size_t out_size)
 }
 
 /* Broker protocol: the agent has no kernel privileges and never calls the
- * Green prctl ABI itself.  A root-side `green shadow broker` listens on
- * @green.broker.<target-pid>, and the agent forwards privileged page-table
- * operations (patch/release/count) to it. */
+ * Green prctl ABI itself.  The root controller attaches a dedicated
+ * connection to @green.agent.<target-pid>, and the agent forwards privileged
+ * page-table operations (patch/release/count) over that connection. */
 enum green_broker_command {
     GREEN_BROKER_PATCH = 1,
     GREEN_BROKER_RELEASE = 2,

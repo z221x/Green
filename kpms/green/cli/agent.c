@@ -86,30 +86,6 @@ static int find_map_containing(pid_t pid, uintptr_t address,
     return -1;
 }
 
-static int find_stack(pid_t pid, struct map_entry *out)
-{
-    char path[64];
-    char line[1024];
-    FILE *maps;
-
-    snprintf(path, sizeof(path), "/proc/%d/maps", (int)pid);
-    maps = fopen(path, "re");
-    if (!maps)
-        return -1;
-    while (fgets(line, sizeof(line), maps)) {
-        struct map_entry entry;
-        if (parse_map_line(line, &entry) == 0 &&
-            !strncmp(entry.path, "[stack", 6) &&
-            entry.perms[0] == 'r' && entry.perms[1] == 'w') {
-            *out = entry;
-            fclose(maps);
-            return 0;
-        }
-    }
-    fclose(maps);
-    return -1;
-}
-
 static const char *map_basename(const char *path)
 {
     const char *slash = strrchr(path, '/');
@@ -220,7 +196,6 @@ static int remote_dlopen(pid_t pid, const char *payload)
     struct user_pt_regs call;
     struct map_entry local_map;
     struct map_entry target_map;
-    struct map_entry stack;
     void *local_dlopen;
     uintptr_t remote_dlopen;
     uintptr_t remote_path;
@@ -432,6 +407,8 @@ static int write_full(int fd, const void *buf, size_t size)
                 continue;
             return -1;
         }
+        if (n == 0)
+            return -1;
         done += (size_t)n;
     }
     return 0;
@@ -469,14 +446,6 @@ static int broker_patch(pid_t target, unsigned long target_addr,
     gum_arm64_writer_flush(&writer);
     gum_arm64_writer_clear(&writer);
 
-    fprintf(stderr, "broker: image head at target: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-            snapshot[offset], snapshot[offset+1], snapshot[offset+2],
-            snapshot[offset+3], snapshot[offset+4], snapshot[offset+5],
-            snapshot[offset+6], snapshot[offset+7]);
-    fprintf(stderr, "broker: image head: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-            snapshot[offset], snapshot[offset+1], snapshot[offset+2],
-            snapshot[offset+3], snapshot[offset+4], snapshot[offset+5],
-            snapshot[offset+6], snapshot[offset+7]);
     pr = green_cli_prctl(PR_GREEN_SHADOW_PATCH, target, page,
                          (unsigned long)snapshot, sizeof(snapshot));
     *out_value = pr;
@@ -490,161 +459,138 @@ static int broker_patch(pid_t target, unsigned long target_addr,
 static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
                          uint64_t arg0, uint64_t arg1, uint64_t arg2);
 
-/* Deploy the user script into the app's cache and run it through the JS
- * tool, then call the probe so a registered Interceptor hook fires. */
+/* Deploy the user script to the path used by the target-side runtime, load
+ * it, then call the probe so the registered hook is exercised. */
 static int agent_js_load(pid_t pid, const char *script_path)
 {
+    char proc_path[64];
     char cmdline[128] = {0};
+    char package[128];
     char dest[300];
-    char pkg[128] = {0};
-    const char *slash;
-    char status_path[64];
-    char line[256];
-    unsigned int uid = 0;
-    FILE *status;
-    int src, dst;
     char buf[8192];
+    const char *slash;
+    const char *colon;
+    struct stat process_stat;
+    struct stat source_stat;
+    struct stat dest_stat;
     ssize_t n;
+    int src;
+    int dst;
     int r;
-    struct green_agent_request request;
-    struct green_agent_response response;
-    int cmd_fd;
-    int broker_fd;
 
-    /* target package name */
-    snprintf(status_path, sizeof(status_path), "/proc/%d/cmdline", (int)pid);
-    src = open(status_path, O_RDONLY);
-    if (src >= 0) {
-        n = read(src, pkg, sizeof(pkg) - 1);
-        close(src);
-        if (n > 0) pkg[n] = '\0';
-    }
-    slash = strrchr(pkg, '/');
-    if (slash) {
-        /* binary path (non-app target): deploy next to it */
-        size_t dir_len = (size_t)(slash - pkg) + 1;
-        snprintf(dest, sizeof(dest), "%.*sgreen_hook.js", (int)dir_len, pkg);
-    } else {
-        snprintf(pkg, sizeof(pkg), "%s", pkg);
-        snprintf(dest, sizeof(dest), "/data/user/0/%s/cache/green_hook.js", pkg);
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", (int)pid);
+    if (stat(proc_path, &process_stat) != 0) {
+        fprintf(stderr, "js: target %d is not running: %s\n", (int)pid,
+                strerror(errno));
+        return 1;
     }
 
-    /* copy script into place as the target uid */
-    fprintf(stderr, "js: copying %s -> %s\n", script_path, dest);
-    if (strcmp(script_path, dest) == 0) {
-        /* already deployed at the destination */
-        return agent_request(pid, GREEN_AGENT_TOOL_JS,
-                             GREEN_AGENT_CMD_JS_LOAD, 0, 0, 0);
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/cmdline", (int)pid);
+    src = open(proc_path, O_RDONLY);
+    if (src < 0) {
+        fprintf(stderr, "js: open %s: %s\n", proc_path, strerror(errno));
+        return 1;
     }
-    src = open(script_path, O_RDONLY);
-    if (src < 0) { perror("open script"); return 1; }
-    dst = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-    if (dst < 0) { perror("open dest"); close(src); return 1; }
-    while ((n = read(src, buf, sizeof(buf))) > 0) {
-        if (write(dst, buf, n) != n) { perror("write"); close(src); close(dst); return 1; }
-    }
+    n = read(src, cmdline, sizeof(cmdline) - 1);
     close(src);
-    fchown(dst, uid, uid);
-    close(dst);
-    fchown(dst, uid, uid);
+    if (n <= 0) {
+        fprintf(stderr, "js: read %s: %s\n", proc_path,
+                n < 0 ? strerror(errno) : "empty cmdline");
+        return 1;
+    }
+    cmdline[n] = '\0';
 
-    {
-        struct stat st;
-        if (stat(dest, &st) == 0)
-            fchown(dst, st.st_uid, st.st_gid); /* keep owner: app uid */
+    slash = strrchr(cmdline, '/');
+    if (slash) {
+        /* Non-app target: deploy next to its executable. */
+        size_t dir_len = (size_t)(slash - cmdline) + 1;
+        snprintf(dest, sizeof(dest), "%.*sgreen_hook.js", (int)dir_len,
+                 cmdline);
+    } else {
+        /* App services use "package:process" as cmdline; their data
+         * directory is still named after the base package. */
+        colon = strchr(cmdline, ':');
+        snprintf(package, sizeof(package), "%.*s",
+                 colon ? (int)(colon - cmdline) : (int)strlen(cmdline),
+                 cmdline);
+        snprintf(dest, sizeof(dest), "/data/user/0/%s/cache/green_hook.js",
+                 package);
     }
 
-    /* LOAD + CALL over the SAME connection pair: the JS hook registers on
-     * the broker channel and the probe call exercises it in-process. */
-    /* JS_LOAD then JS_CALL over the same connection pair; the broker
-     * channel (conn B) stays attached for the whole sequence. */
-    memset(&request, 0, sizeof(request));
-    request.magic = GREEN_AGENT_MAGIC;
-    request.version = GREEN_AGENT_VERSION;
-    request.tool = GREEN_AGENT_TOOL_JS;
-    request.command = GREEN_AGENT_CMD_JS_LOAD;
-    request.size = sizeof(request);
-    if (write(cmd_fd, &request, sizeof(request)) !=
-        (ssize_t)sizeof(request)) {
-        close(cmd_fd);
-        close(broker_fd);
-        return 1;
-    }
-    if (read_full(cmd_fd, &response, sizeof(response)) != 0) {
-        close(cmd_fd);
-        close(broker_fd);
-        return 1;
-    }
-    printf("status=%d value=0x%" PRIx64 " %s\n", response.status,
-           response.value, response.message);
+    fprintf(stderr, "js: script %s -> %s\n", script_path, dest);
+    if (strcmp(script_path, dest) != 0) {
+        src = open(script_path, O_RDONLY);
+        if (src < 0) {
+            fprintf(stderr, "js: open %s: %s\n", script_path,
+                    strerror(errno));
+            return 1;
+        }
+        if (fstat(src, &source_stat) != 0) {
+            perror("js: fstat script");
+            close(src);
+            return 1;
+        }
 
-    memset(&request, 0, sizeof(request));
-    request.magic = GREEN_AGENT_MAGIC;
-    request.version = GREEN_AGENT_VERSION;
-    request.tool = GREEN_AGENT_TOOL_JS;
-    request.command = GREEN_AGENT_CMD_JS_CALL;
-    request.size = sizeof(request);
-    if (write(cmd_fd, &request, sizeof(request)) !=
-        (ssize_t)sizeof(request)) {
-        close(cmd_fd);
-        close(broker_fd);
-        return 1;
+        /* Different path strings can still name the same inode.  Never open
+         * the destination with O_TRUNC in that case. */
+        if (stat(dest, &dest_stat) == 0 &&
+            source_stat.st_dev == dest_stat.st_dev &&
+            source_stat.st_ino == dest_stat.st_ino) {
+            close(src);
+        } else {
+            dst = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (dst < 0) {
+                fprintf(stderr, "js: open %s: %s\n", dest, strerror(errno));
+                close(src);
+                return 1;
+            }
+            while ((n = read(src, buf, sizeof(buf))) > 0) {
+                if (write_full(dst, buf, (size_t)n) != 0) {
+                    perror("js: write script");
+                    close(src);
+                    close(dst);
+                    return 1;
+                }
+            }
+            close(src);
+            if (n < 0 || fchmod(dst, 0644) != 0 ||
+                fchown(dst, process_stat.st_uid, process_stat.st_gid) != 0) {
+                perror("js: finalize script");
+                close(dst);
+                return 1;
+            }
+            close(dst);
+        }
     }
-    if (read_full(cmd_fd, &response, sizeof(response)) != 0) {
-        close(cmd_fd);
-        close(broker_fd);
-        return 1;
-    }
-    printf("status=%d value=0x%" PRIx64 " %s\n", response.status,
-           response.value, response.message);
-    {
-        int rc = response.status == 0 ? 0 : 1;
-        close(cmd_fd);
-        close(broker_fd);
-        return rc;
-    }
+
+    /* Each request owns a broker connection until its response arrives.
+     * The JS state and committed shadow page persist between requests. */
+    r = agent_request(pid, GREEN_AGENT_TOOL_JS, GREEN_AGENT_CMD_JS_LOAD,
+                      0, 0, 0);
+    if (r != 0)
+        return r;
+    return agent_request(pid, GREEN_AGENT_TOOL_JS, GREEN_AGENT_CMD_JS_CALL,
+                         0, 0, 0);
 }
 
 static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
                          uint64_t arg0, uint64_t arg1, uint64_t arg2)
 {
-    struct sockaddr_un address;
     struct green_agent_request request;
     struct green_agent_response response;
-    char name[sizeof(address.sun_path) - 1];
     int cmd_fd;
     int broker_fd;
-    int name_len;
     int status = 1;
-
-    name_len = green_agent_socket_name(pid, name, sizeof(name));
-    if (name_len < 0)
-        return -1;
 
     /* conn A: the command; conn B: attached as the broker so the agent can
      * forward its privileged page-table requests while the command runs. */
-    cmd_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    broker_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (cmd_fd < 0 || broker_fd < 0) {
-        close(cmd_fd);
-        close(broker_fd);
+    cmd_fd = connect_agent(pid);
+    if (cmd_fd < 0)
         return 1;
-    }
-
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    address.sun_path[0] = '\0';
-    memcpy(address.sun_path + 1, name, (size_t)name_len);
-    {
-        socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
-                                        1 + name_len);
-        if (connect(cmd_fd, (struct sockaddr *)&address, addrlen) != 0 ||
-            connect(broker_fd, (struct sockaddr *)&address, addrlen) != 0) {
-            fprintf(stderr, "connect green agent: %s\n", strerror(errno));
-            close(cmd_fd);
-            close(broker_fd);
-            return 1;
-        }
+    broker_fd = connect_agent(pid);
+    if (broker_fd < 0) {
+        close(cmd_fd);
+        return 1;
     }
 
     memset(&request, 0, sizeof(request));
@@ -653,8 +599,7 @@ static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
     request.tool = GREEN_AGENT_TOOL_CORE;
     request.command = GREEN_AGENT_CMD_BROKER_ATTACH;
     request.size = sizeof(request);
-    if (write(broker_fd, &request, sizeof(request)) !=
-        (ssize_t)sizeof(request)) {
+    if (write_full(broker_fd, &request, sizeof(request)) != 0) {
         close(broker_fd);
         close(cmd_fd);
         return 1;
@@ -676,8 +621,7 @@ static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
     request.arg0 = arg0;
     request.arg1 = arg1;
     request.arg2 = arg2;
-    if (write(cmd_fd, &request, sizeof(request)) !=
-        (ssize_t)sizeof(request)) {
+    if (write_full(cmd_fd, &request, sizeof(request)) != 0) {
         close(cmd_fd);
         close(broker_fd);
         return 1;
@@ -690,7 +634,6 @@ static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
         };
         struct green_broker_request breq;
         struct green_broker_response bresp;
-        unsigned char image[4096];
         long pr = 0;
 
         if (poll(fds, 2, -1) < 0) {
@@ -761,8 +704,8 @@ static void agent_usage(const char *prog)
             "Green agent tool (injector, broker, client)\n\n"
             "Usage:\n"
             "  %s agent inject --pid PID --so /path/in/target/libgreen_agent.so\n"
-            "  %s agent broker --pid PID\n"
             "  %s agent ping --pid PID\n"
+            "  %s agent js --pid PID --file /path/to/script.js\n"
             "  %s agent self-test --pid PID\n"
             "  %s agent hook --pid PID --target ADDR --replacement ADDR\n"
             "  %s agent release --pid PID --target ADDR\n",

@@ -2,10 +2,10 @@
 /*
  * In-process Green agent.
  *
- * This is the payload loaded into a target process.  It intentionally contains
- * only transport and dispatch glue; Green hook implementation stays in
- * green_hook/.  New tools can register another handler through the small
- * registry instead of growing the injector protocol.
+ * This is the payload loaded into a target process.  It contains transport,
+ * dispatch, and the built-in QuickJS bridge; privileged Green hook operations
+ * stay in the root controller.  New tools can register another handler through
+ * the small registry instead of growing the injector protocol.
  */
 #include "green_agent.h"
 
@@ -18,13 +18,14 @@
 #include <string.h>
 #include <android/log.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <linux/un.h>
 #include <unistd.h>
 
 #include <quickjs.h>
 
 #define AGLOG(...) __android_log_print(ANDROID_LOG_INFO, "green-agent", __VA_ARGS__)
-
+#define GREEN_AGENT_MAX_SCRIPT_SIZE (1024U * 1024U)
 
 struct green_agent_registry {
     pthread_mutex_t lock;
@@ -37,14 +38,14 @@ struct green_agent_registry {
  * controller.  A script calls the native global `hook(target, fn)` which
  * registers `fn` and asks the root broker to redirect `target` to
  * green_agent_js_trampoline; every call of the hooked function then runs
- * the JS callback with the live register arguments and uses its return
- * value as the function result. ------------------------------------------------------------------ */
+ * the JS callback with an array containing x0-x7 and uses its return value
+ * as the function result.
+ * ------------------------------------------------------------------ */
 
 static JSRuntime *g_js_rt;
 static JSContext *g_js_ctx;
 static pthread_mutex_t g_js_lock = PTHREAD_MUTEX_INITIALIZER;
 static JSValue g_js_fn;
-static uint64_t g_js_hook_target;
 static int g_js_ready;
 static int green_agent_test_target(int value);
 static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
@@ -59,7 +60,8 @@ __attribute__((noinline)) int64_t green_agent_js_trampoline(
 {
     int64_t out = 0;
     int64_t vals[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
-    JSValue args[8];
+    JSValue args;
+    JSValue argv[1];
     JSValue rv;
 
     pthread_mutex_lock(&g_js_lock);
@@ -67,11 +69,16 @@ __attribute__((noinline)) int64_t green_agent_js_trampoline(
         pthread_mutex_unlock(&g_js_lock);
         return 0;
     }
-    __android_log_print(ANDROID_LOG_INFO, "green-agent",
-                        "js_trampoline fired a0=%llx", (unsigned long long)a0);
+    /* QuickJS records a native stack limit.  Hooks may run on a different
+     * target thread than the one that loaded the script, so refresh it before
+     * entering the runtime. */
+    JS_UpdateStackTop(g_js_rt);
+    args = JS_NewArray(g_js_ctx);
     for (int i = 0; i < 8; i++)
-        args[i] = JS_NewInt64(g_js_ctx, vals[i]);
-    rv = JS_Call(g_js_ctx, g_js_fn, JS_UNDEFINED, 8, args);
+        JS_SetPropertyUint32(g_js_ctx, args, (uint32_t)i,
+                             JS_NewInt64(g_js_ctx, vals[i]));
+    argv[0] = args;
+    rv = JS_Call(g_js_ctx, g_js_fn, JS_UNDEFINED, 1, argv);
     if (JS_IsException(rv)) {
         JSValue exc = JS_GetException(g_js_ctx);
         const char *msg = JS_ToCString(g_js_ctx, exc);
@@ -86,8 +93,7 @@ __attribute__((noinline)) int64_t green_agent_js_trampoline(
         out = v;
     }
     JS_FreeValue(g_js_ctx, rv);
-    for (int i = 0; i < 8; i++)
-        JS_FreeValue(g_js_ctx, args[i]);
+    JS_FreeValue(g_js_ctx, args);
     pthread_mutex_unlock(&g_js_lock);
     return out;
 }
@@ -95,6 +101,7 @@ __attribute__((noinline)) int64_t green_agent_js_trampoline(
 static JSValue js_native_log(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+    (void)this_val;
     for (int i = 0; i < argc; i++) {
         const char *s = JS_ToCString(ctx, argv[i]);
         if (s) {
@@ -109,6 +116,9 @@ static JSValue js_native_selftest_target(JSContext *ctx,
                                          JSValueConst this_val,
                                          int argc, JSValueConst *argv)
 {
+    (void)this_val;
+    (void)argc;
+    (void)argv;
     return JS_NewInt64(ctx, (int64_t)(uintptr_t)green_agent_test_target);
 }
 
@@ -118,6 +128,7 @@ static JSValue js_native_hook(JSContext *ctx, JSValueConst this_val,
     uint64_t target = 0;
     int64_t status;
 
+    (void)this_val;
     if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&target, argv[0]) != 0 ||
         (target & 3) != 0 || !JS_IsFunction(ctx, argv[1]))
         return JS_ThrowInternalError(ctx, "hook(target, fn) expects an aligned address and a function");
@@ -129,7 +140,6 @@ static JSValue js_native_hook(JSContext *ctx, JSValueConst this_val,
 
     JS_FreeValue(ctx, g_js_fn);
     g_js_fn = JS_DupValue(ctx, argv[1]);
-    g_js_hook_target = target;
     g_js_ready = 1;
     return JS_NewInt32(ctx, 0);
 }
@@ -146,6 +156,8 @@ static int js_ensure_runtime(char *err, size_t errlen)
         }
         g_js_ctx = JS_NewContext(g_js_rt);
         if (!g_js_ctx) {
+            JS_FreeRuntime(g_js_rt);
+            g_js_rt = NULL;
             pthread_mutex_unlock(&g_js_lock);
             snprintf(err, errlen, "JS_NewContext failed");
             return -1;
@@ -173,6 +185,7 @@ static void green_agent_js_script_path(char *out, size_t out_size)
     char cmdline[128] = {0};
     int fd = open("/proc/self/cmdline", O_RDONLY);
     const char *slash;
+    const char *colon;
 
     if (fd >= 0) {
         ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
@@ -188,9 +201,12 @@ static void green_agent_js_script_path(char *out, size_t out_size)
         size_t dir_len = (size_t)(slash - cmdline) + 1;
         snprintf(out, out_size, "%.*sgreen_hook.js", (int)dir_len, cmdline);
     } else {
-        /* Android app process: cmdline is the package name. */
-        snprintf(out, out_size,
-                 "/data/user/0/%s/cache/green_hook.js", cmdline);
+        /* App services use "package:process" as cmdline but share the base
+         * package's data directory. */
+        colon = strchr(cmdline, ':');
+        snprintf(out, out_size, "/data/user/0/%.*s/cache/green_hook.js",
+                 colon ? (int)(colon - cmdline) : (int)strlen(cmdline),
+                 cmdline);
     }
 }
 
@@ -200,11 +216,13 @@ static int green_agent_js_tool_handler(const struct green_agent_request *request
 {
     char path[256];
     char err[192] = {0};
-    char pkg[128] = {0};
     int fd;
     ssize_t n;
-    char *source;
+    size_t done;
     size_t source_len;
+    struct stat script_stat;
+    char *source;
+    char *wrapped;
     JSValue rv;
 
     (void)userdata;
@@ -222,12 +240,30 @@ static int green_agent_js_tool_handler(const struct green_agent_request *request
                      "script not found: %s", path);
             return -ENOENT;
         }
-        source_len = (size_t)lseek(fd, 0, SEEK_END);
-        lseek(fd, 0, SEEK_SET);
+        if (fstat(fd, &script_stat) != 0 || script_stat.st_size < 0 ||
+            (uint64_t)script_stat.st_size > GREEN_AGENT_MAX_SCRIPT_SIZE) {
+            close(fd);
+            snprintf(response->message, sizeof(response->message),
+                     "invalid script size");
+            return -EFBIG;
+        }
+        source_len = (size_t)script_stat.st_size;
         source = malloc(source_len + 1);
-        n = read(fd, source, source_len);
+        if (!source) {
+            close(fd);
+            return -ENOMEM;
+        }
+        done = 0;
+        while (done < source_len) {
+            n = read(fd, source + done, source_len - done);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                break;
+            done += (size_t)n;
+        }
         close(fd);
-        if (n != (ssize_t)source_len) {
+        if (done != source_len) {
             free(source);
             snprintf(response->message, sizeof(response->message),
                      "script read failed");
@@ -236,7 +272,7 @@ static int green_agent_js_tool_handler(const struct green_agent_request *request
         source[source_len] = '\0';
 
         /* Wrap in an IIFE: repeated loads get a fresh variable scope. */
-        char * wrapped = malloc(source_len + 32);
+        wrapped = malloc(source_len + 32);
         if (!wrapped) {
             free(source);
             return -ENOMEM;
@@ -244,6 +280,8 @@ static int green_agent_js_tool_handler(const struct green_agent_request *request
         snprintf(wrapped, source_len + 32, "(function(){\n%.*s\n})()",
                  (int)source_len, source);
 
+        pthread_mutex_lock(&g_js_lock);
+        JS_UpdateStackTop(g_js_rt);
         rv = JS_Eval(g_js_ctx, wrapped, strlen(wrapped), "green_hook.js",
                      JS_EVAL_TYPE_GLOBAL);
         free(wrapped);
@@ -256,9 +294,11 @@ static int green_agent_js_tool_handler(const struct green_agent_request *request
             if (msg)
                 JS_FreeCString(g_js_ctx, msg);
             JS_FreeValue(g_js_ctx, exc);
+            pthread_mutex_unlock(&g_js_lock);
             return -EIO;
         }
         JS_FreeValue(g_js_ctx, rv);
+        pthread_mutex_unlock(&g_js_lock);
 
         snprintf(response->message, sizeof(response->message),
                  "script loaded from %s", path);
@@ -324,6 +364,8 @@ static int green_agent_write_full(int fd, const void *buf, size_t size)
                 continue;
             return -1;
         }
+        if (n == 0)
+            return -1;
         done += (size_t)n;
     }
     return 0;
@@ -493,7 +535,7 @@ static int green_agent_hook_handler(const struct green_agent_request *request,
         /* Pure forwarding: the root broker snapshots this process's page
          * via process_vm_readv and emits the GumArm64Writer redirect. */
         status = green_agent_broker_request(GREEN_BROKER_PATCH, request->arg0,
-                                            request->arg1, &response->value);
+                                            request->arg1, NULL);
         if (status != 0)
             return status;
         response->value = request->arg0;
@@ -554,7 +596,6 @@ static int green_agent_dispatch(int fd, const struct green_agent_request *reques
             int dupfd = dup(fd);
             if (dupfd < 0)
                 return -EIO;
-            AGLOG("attach: peer fd=%d dupfd=%d uid=%d", fd, dupfd, (int)uid);
             pthread_mutex_lock(&green_agent_broker_lock);
             if (green_agent_broker_fd >= 0)
                 close(green_agent_broker_fd);

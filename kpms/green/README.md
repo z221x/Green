@@ -30,10 +30,10 @@ kpms/green/
 │   ├── vendor/gum/          # frida-gum 源码（逐字未改）：GumArm64Writer 等
 │   └── shim/                # glib/capstone 最小垫片（仅外部依赖）
 ├── agent/
-│   ├── green_agent.c        # 注入目标进程后的代理与工具分发 socket
-│   ├── green_agent_ctl.c    # root 侧 AArch64 ptrace/dlopen 注入器与客户端
-│   ├── green_agent.h        # 可扩展 agent 协议和工具注册接口
-│   └── README.md            # 注入、协议和扩展说明
+│   ├── green_agent.c        # 注入 payload、工具分发 socket 与 QuickJS bridge
+│   ├── green_agent.h        # 可扩展 agent/broker 协议接口
+│   ├── example_hook.js      # QuickJS hook 示例
+│   └── README.md            # 注入、协议、JS API 和扩展说明
 ├── common/
 │   ├── common.c             # CLI 公共解析、solist、prctl、process_vm helpers
 │   └── symbol.c             # KPM 内核符号提取与地址解析
@@ -56,7 +56,7 @@ Green 的 shadow 工具重新实现了一个 patch-oriented 的 R^X / W^X shadow
 - 代码和数据位于同一页时，使用 `emu/` 中的单指令 ARM64 模拟器从 original page 读取数据并推进 `pt_regs->pc`，避免整页切换造成 fault 循环。
 - hook `follow_page_pte` 时临时暴露 original PTE，覆盖 `/proc/pid/mem`、`process_vm_readv`、`ptrace` 等 GUP 读取路径。
 - hook `exit_mmap` 自动释放进程退出时遗留的 shadow 页。
-- 控制入口是 `prctl`，只允许 root 调用。注入到目标进程的 agent 没有内核特权：它把补丁请求转发给 root 侧 `green shadow broker`，由 CLI 执行页表操作（详见 `agent/README.md`）。
+- 控制入口是 `prctl`，只允许 root 调用。注入到目标进程的 agent 没有内核特权：每个 CLI 命令会主动附着临时 root broker 连接，代 agent 执行页表操作（详见 `agent/README.md`）。
 
 内核符号统一由 `common/symbol.c` 提取和解析，地址变量及公共声明集中在 `include/green/symbol.h`；其他 KPM 工具只通过该头文件使用已解析地址。
 
@@ -82,6 +82,7 @@ CLI 工具示例（单二进制）：
 adb push build/green /data/local/tmp/green
 adb shell su -c "/data/local/tmp/green shadow count -p <pid>"
 adb shell su -c "/data/local/tmp/green agent inject --pid <pid> --so .../libgreen_agent.so"
+adb shell su -c "/data/local/tmp/green agent js --pid <pid> --file /data/local/tmp/example_hook.js"
 ```
 
 所有构建产物统一输出到 `build/`：
