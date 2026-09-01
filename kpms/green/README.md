@@ -41,13 +41,14 @@ kpms/green/
 │   └── symbol.c             # KPM 内核符号提取与地址解析
 ├── tests/
 │   └── test_hook.c          # green_hook 端到端用例（patch/读原始/恢复）
-├── server/
-│   └── server.c             # frida 式守护进程（TCP 27042，主机 CLI 入口）
-├── cli/
-│   ├── main.c               # 设备端 CLI 工具分发入口
-│   ├── README.md            # CLI 扩展说明
-│   ├── shadow.c             # shadow 子命令
-│   └── hook.c               # hook 子命令（设备端调试用 attach/spawn）
+├── server/                  # ★ 手机端二进制源码（等于 frida-server）
+│   ├── main.c               #    入口与子命令分发（server/shadow/hook）
+│   ├── server.c             #    TCP 守护进程（默认 27042，供主机 CLI 连接）
+│   ├── shadow.c             #    shadow 子命令
+│   └── hook.c               #    hook attach 子命令（设备端调试）
+├── cli/                     # ★ 主机端 CLI（Python，跨平台）
+│   ├── green.py             #    green.py ps / attach，实时日志回流
+│   └── README.md            #    使用说明与 wire 协议文档
 ```
 
 ## 当前工具：shadow

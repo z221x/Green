@@ -375,7 +375,7 @@ static void server_usage(const char *prog)
             "Usage:\n"
             "  %s server [--port PORT]\n\n"
             "Defaults: port %d, all interfaces.\n"
-            "Host side: adb forward tcp:%d tcp:%d, then run host/green.py\n",
+            "Host side: adb forward tcp:%d tcp:%d, then run cli/green.py\n",
             prog, GREEN_WIRE_DEFAULT_PORT, GREEN_WIRE_DEFAULT_PORT,
             GREEN_WIRE_DEFAULT_PORT);
 }
