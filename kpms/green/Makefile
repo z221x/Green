@@ -68,7 +68,8 @@ CLI_GUM_SRCS := green_hook/gummemory-green.c \
                 $(CLI_GUM_VENDOR_DIR)/gummetalarray.c \
                 $(CLI_GUM_VENDOR_DIR)/gummetalhash.c \
                 $(CLI_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
-CLI_SRCS := cli/main.c common/common.c cli/shadow.c cli/hook.c $(CLI_GUM_SRCS)
+CLI_SRCS := cli/main.c common/common.c common/agentops.c cli/shadow.c cli/hook.c \
+            cli/server.c $(CLI_GUM_SRCS)
 CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
 
 $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)

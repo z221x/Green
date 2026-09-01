@@ -99,6 +99,9 @@ enum green_broker_command {
     GREEN_BROKER_PATCH = 1,
     GREEN_BROKER_RELEASE = 2,
     GREEN_BROKER_COUNT = 3,
+    /* Agent -> server, one-way (never answered): script console output and
+     * send() payloads; len bytes of UTF-8 text follow the header. */
+    GREEN_BROKER_LOG = 4,
 };
 
 struct green_broker_request {

@@ -51,6 +51,55 @@ static int green_agent_test_target(int value);
 static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
                                            uint64_t arg, const void *payload,
                                            uint32_t len, int64_t *value);
+static void green_agent_broker_log(const char *text, size_t len);
+
+/* Frida-style API layer, evaluated once before any user script.  Native
+ * primitives (__green_*) are registered in js_ensure_runtime(). */
+static const char kGreenPrelude[] =
+    "var Process = {\n"
+    "    id: __green_pid(),\n"
+    "    arch: 'arm64',\n"
+    "    platform: 'linux',\n"
+    "    pageSize: 4096,\n"
+    "    enumerateModulesSync: __green_modules\n"
+    "};\n"
+    "var Module = {\n"
+    "    enumerateModulesSync: __green_modules,\n"
+    "    getBaseAddress: function (name) {\n"
+    "        var ms = __green_parse_maps();\n"
+    "        for (var i = 0; i < ms.length; i++)\n"
+    "            if (ms[i].name === name || ms[i].path === name)\n"
+    "                return ms[i].base;\n"
+    "        throw new Error('Module not found: ' + name);\n"
+    "    },\n"
+    "    findBaseAddress: function (name) {\n"
+    "        try { return Module.getBaseAddress(name); }\n"
+    "        catch (e) { return null; }\n"
+    "    }\n"
+    "};\n"
+    "var Interceptor = {\n"
+    "    replace: function (target, replacement) { hook(target, replacement); },\n"
+    "    revert: function (target) { unhook(target); },\n"
+    "    flush: function () {},\n"
+    "    attach: function () {\n"
+    "        throw new Error('Interceptor.attach is not supported yet; '\n"
+    "            + 'use Interceptor.replace(target, function(args){ ... })');\n"
+    "    }\n"
+    "};\n"
+    "var console = {\n"
+    "    log: function () { log(Array.prototype.join.call(arguments, ' ')); },\n"
+    "    info: function () { log(Array.prototype.join.call(arguments, ' ')); },\n"
+    "    warn: function () { log(Array.prototype.join.call(arguments, ' ')); },\n"
+    "    error: function () { log(Array.prototype.join.call(arguments, ' ')); }\n"
+    "};\n"
+    "var Memory = {\n"
+    "    readUtf8String: function (addr, len) { return __green_read_utf8(addr, len); },\n"
+    "    readCString: function (addr, len) { return __green_read_utf8(addr, len); },\n"
+    "    readByteArray: function (addr, len) { return __green_mem_read(addr, len); }\n"
+    "};\n"
+    "function send(message) {\n"
+    "    __green_send(typeof message === 'string' ? message : JSON.stringify(message));\n"
+    "}\n";
 
 /* The shadow redirect lands here.  Runs the registered JS callback with the
  * live register arguments (x0-x7) and returns its result to the caller. */
@@ -101,14 +150,24 @@ __attribute__((noinline)) int64_t green_agent_js_trampoline(
 static JSValue js_native_log(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+    char line[1024];
+    size_t used = 0;
+
     (void)this_val;
     for (int i = 0; i < argc; i++) {
         const char *s = JS_ToCString(ctx, argv[i]);
-        if (s) {
-            __android_log_print(ANDROID_LOG_INFO, "green-js", "%s", s);
-            JS_FreeCString(ctx, s);
-        }
+
+        if (!s)
+            continue;
+        if (used && used < sizeof(line) - 2)
+            line[used++] = ' ';
+        used += (size_t)snprintf(line + used, sizeof(line) - used, "%s", s);
+        if (used >= sizeof(line) - 1)
+            used = sizeof(line) - 1;
+        JS_FreeCString(ctx, s);
     }
+    __android_log_print(ANDROID_LOG_INFO, "green-js", "%s", line);
+    green_agent_broker_log(line, used);
     return JS_UNDEFINED;
 }
 
@@ -144,6 +203,205 @@ static JSValue js_native_hook(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt32(ctx, 0);
 }
 
+static JSValue js_native_unhook(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    uint64_t target = 0;
+    int64_t status;
+
+    (void)this_val;
+    if (argc < 1 || JS_ToInt64(ctx, (int64_t *)&target, argv[0]) != 0)
+        return JS_ThrowInternalError(ctx, "unhook(target) expects an address");
+
+    status = green_agent_broker_request_full(GREEN_BROKER_RELEASE,
+                                             target & ~4095ULL, 0, NULL, 0,
+                                             NULL);
+    if (status < 0)
+        return JS_ThrowInternalError(ctx, "broker release failed: %d",
+                                     (int)status);
+    return JS_NewInt32(ctx, 0);
+}
+
+/* Safe file read; returns null on failure. */
+static JSValue js_native_read_file(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    static char buf[256 * 1024];
+    const char *path;
+    ssize_t n;
+    int fd;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_NULL;
+    path = JS_ToCString(ctx, argv[0]);
+    if (!path)
+        return JS_NULL;
+    fd = open(path, O_RDONLY);
+    JS_FreeCString(ctx, path);
+    if (fd < 0)
+        return JS_NULL;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n < 0)
+        return JS_NULL;
+    return JS_NewStringLen(ctx, buf, (size_t)n);
+}
+
+/* Frida-style module list: file-backed mappings from /proc/self/maps,
+ * parsed natively (streamed, deduped by device:inode). */
+static JSValue js_native_modules(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    struct seen_path {
+        char path[512];
+    };
+    static struct seen_path seen[512];
+    static int seen_count;
+    char line[1024];
+    JSValue arr;
+    int n = 0;
+    FILE *maps;
+
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    maps = fopen("/proc/self/maps", "re");
+    if (!maps)
+        return JS_NewArray(ctx);
+    arr = JS_NewArray(ctx);
+    seen_count = 0;
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long start, end, offset, inode;
+        unsigned int devmaj, devmin;
+        char perms[8];
+        char path[512] = {0};
+        char name[512];
+        const char *slash;
+        JSValue obj;
+        int consumed = 0;
+        int dup = 0;
+        int i;
+
+        if (sscanf(line, "%llx-%llx %7s %llx %x:%x %llu %n\n", &start, &end,
+                   perms, &offset, &devmaj, &devmin, &inode, &consumed) < 7)
+            continue;
+        {
+            const char *p = line + consumed;
+
+            while (*p == ' ' || *p == '\t')
+                p++;
+            snprintf(path, sizeof(path), "%s", p);
+        }
+        path[strcspn(path, "\n")] = '\0';
+        if (path[0] != '/')
+            continue; /* anon / [stack] / [heap] */
+        for (i = 0; i < seen_count; i++) {
+            if (strcmp(seen[i].path, path) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+        if (seen_count < (int)(sizeof(seen) / sizeof(seen[0])))
+            snprintf(seen[seen_count++].path, sizeof(seen[0].path), "%s",
+                     path);
+
+        slash = strrchr(path, '/');
+        snprintf(name, sizeof(name), "%s", slash ? slash + 1 : path);
+
+        obj = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, name));
+        JS_SetPropertyStr(ctx, obj, "base", JS_NewInt64(ctx, (int64_t)start));
+        JS_SetPropertyStr(ctx, obj, "size",
+                          JS_NewInt64(ctx, (int64_t)(end - start)));
+        JS_SetPropertyStr(ctx, obj, "path", JS_NewString(ctx, path));
+        JS_SetPropertyStr(ctx, obj, "protection", JS_NewString(ctx, perms));
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)n++, obj);
+    }
+    fclose(maps);
+    return arr;
+}
+
+static JSValue js_native_pid(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_NewInt32(ctx, (int32_t)getpid());
+}
+
+/* send() to the host CLI over the log channel. */
+static JSValue js_native_send(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    const char *s;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_UNDEFINED;
+    s = JS_ToCString(ctx, argv[0]);
+    if (!s)
+        return JS_UNDEFINED;
+    green_agent_broker_log(s, strlen(s));
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
+}
+
+/* Safe arbitrary reads through /proc/self/mem (no SIGSEGV on unmapped). */
+static JSValue js_native_mem_read(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    static uint8_t membuf[65536];
+    static int mem_fd = -1;
+    uint64_t address = 0;
+    int64_t length = 0;
+    ssize_t n;
+
+    (void)this_val;
+    if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0 ||
+        JS_ToInt64(ctx, &length, argv[1]) != 0 || length <= 0 ||
+        length > (int64_t)sizeof(membuf))
+        return JS_NULL;
+    if (mem_fd < 0)
+        mem_fd = open("/proc/self/mem", O_RDONLY);
+    if (mem_fd < 0)
+        return JS_NULL;
+    n = pread(mem_fd, membuf, (size_t)length, (off_t)address);
+    if (n <= 0)
+        return JS_NULL;
+    return JS_NewArrayBufferCopy(ctx, membuf, (size_t)n);
+}
+
+static JSValue js_native_read_utf8(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    static char strbuf[4096];
+    static int str_fd = -1;
+    uint64_t address = 0;
+    int64_t length = (int64_t)sizeof(strbuf) - 1;
+    ssize_t n;
+
+    (void)this_val;
+    if (argc < 1 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0)
+        return JS_NULL;
+    if (argc >= 2 &&
+        (JS_ToInt64(ctx, &length, argv[1]) != 0 || length <= 0))
+        return JS_NULL;
+    if (length > (int64_t)sizeof(strbuf) - 1)
+        length = (int64_t)sizeof(strbuf) - 1;
+    if (str_fd < 0)
+        str_fd = open("/proc/self/mem", O_RDONLY);
+    if (str_fd < 0)
+        return JS_NULL;
+    n = pread(str_fd, strbuf, (size_t)length, (off_t)address);
+    if (n <= 0)
+        return JS_NULL;
+    return JS_NewStringLen(ctx, strbuf, (size_t)n);
+}
+
 static int js_ensure_runtime(char *err, size_t errlen)
 {
     pthread_mutex_lock(&g_js_lock);
@@ -166,15 +424,50 @@ static int js_ensure_runtime(char *err, size_t errlen)
             JSValue global = JS_GetGlobalObject(g_js_ctx);
             JS_SetPropertyStr(g_js_ctx, global, "hook",
                 JS_NewCFunction(g_js_ctx, js_native_hook, "hook", 2));
+            JS_SetPropertyStr(g_js_ctx, global, "unhook",
+                JS_NewCFunction(g_js_ctx, js_native_unhook, "unhook", 1));
             JS_SetPropertyStr(g_js_ctx, global, "log",
                 JS_NewCFunction(g_js_ctx, js_native_log, "log", 1));
             JS_SetPropertyStr(g_js_ctx, global, "selfTestTarget",
                 JS_NewCFunction(g_js_ctx, js_native_selftest_target,
                                 "selfTestTarget", 0));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_pid",
+                JS_NewCFunction(g_js_ctx, js_native_pid, "__green_pid", 0));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_read_file",
+                JS_NewCFunction(g_js_ctx, js_native_read_file,
+                                "__green_read_file", 1));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_modules",
+                JS_NewCFunction(g_js_ctx, js_native_modules,
+                                "__green_modules", 0));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_send",
+                JS_NewCFunction(g_js_ctx, js_native_send, "__green_send", 1));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_mem_read",
+                JS_NewCFunction(g_js_ctx, js_native_mem_read,
+                                "__green_mem_read", 2));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_read_utf8",
+                JS_NewCFunction(g_js_ctx, js_native_read_utf8,
+                                "__green_read_utf8", 2));
             JS_FreeValue(g_js_ctx, global);
         }
         g_js_fn = JS_UNDEFINED;
         g_js_ready = 0;
+
+        /* Frida-style API layer, global scope (user scripts run in an IIFE). */
+        {
+            JSValue rv = JS_Eval(g_js_ctx, kGreenPrelude, strlen(kGreenPrelude),
+                                 "<green-prelude>", JS_EVAL_TYPE_GLOBAL);
+            if (JS_IsException(rv)) {
+                JSValue exc = JS_GetException(g_js_ctx);
+                const char *msg = JS_ToCString(g_js_ctx, exc);
+                snprintf(err, errlen, "prelude error: %s", msg ? msg : "?");
+                if (msg)
+                    JS_FreeCString(g_js_ctx, msg);
+                JS_FreeValue(g_js_ctx, exc);
+                pthread_mutex_unlock(&g_js_lock);
+                return -1;
+            }
+            JS_FreeValue(g_js_ctx, rv);
+        }
     }
     pthread_mutex_unlock(&g_js_lock);
     return 0;
@@ -397,6 +690,24 @@ int green_agent_register_tool(const struct green_agent_tool *tool)
 /* Forward a privileged operation to the root-side broker over the
  * connection the broker established.  Returns -ENOENT while no broker is
  * attached. */
+/* One-way script log line to the attached server (best effort). */
+static void green_agent_broker_log(const char *text, size_t len)
+{
+    struct green_broker_request request;
+
+    pthread_mutex_lock(&green_agent_broker_lock);
+    if (green_agent_broker_fd >= 0 && len <= 8192) {
+        memset(&request, 0, sizeof(request));
+        request.magic = GREEN_AGENT_MAGIC;
+        request.command = GREEN_BROKER_LOG;
+        request.len = (uint32_t)len;
+        if (green_agent_write_full(green_agent_broker_fd, &request,
+                                   sizeof(request)) == 0)
+            green_agent_write_full(green_agent_broker_fd, text, len);
+    }
+    pthread_mutex_unlock(&green_agent_broker_lock);
+}
+
 static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
                                            uint64_t arg, const void *payload,
                                            uint32_t len, int64_t *value)

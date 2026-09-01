@@ -33,5 +33,6 @@ pid_t green_cli_effective_pid(pid_t pid);
 
 extern const struct green_cli_tool green_cli_shadow_tool;
 extern const struct green_cli_tool green_cli_hook_tool;
+extern const struct green_cli_tool green_cli_server_tool;
 
 #endif /* GREEN_CLI_H */
