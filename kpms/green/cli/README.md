@@ -16,17 +16,13 @@ green shadow nop
 green shadow branch
 green shadow release
 
-green agent inject
-green agent ping
-green agent js
-green agent self-test
-green agent hook
-green agent release
+green hook attach -f <package> | -p <pid> (-l <script.js> | -c "<js>")
+green hook spawn <package>
 ```
 
-`green agent` 负责向目标进程注入 `libgreen_agent.so`。每次命令会建立一条命令
-连接和一条临时 root broker 连接；QuickJS 脚本通过 `green agent js --pid PID
---file SCRIPT` 部署并执行。详细协议与 JS API 见 `../agent/README.md`。
+`green hook` 向目标进程注入 `libgreen_agent.so` 并加载 QuickJS hook 脚本；每次
+请求会建立一条命令连接和一条临时 root broker 连接。详细协议与 JS API 见
+`../agent/README.md`。
 
 ## 添加工具
 

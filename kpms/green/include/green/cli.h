@@ -32,6 +32,6 @@ unsigned long green_cli_find_solist(pid_t pid, const char *needle);
 pid_t green_cli_effective_pid(pid_t pid);
 
 extern const struct green_cli_tool green_cli_shadow_tool;
-extern const struct green_cli_tool green_cli_agent_tool;
+extern const struct green_cli_tool green_cli_hook_tool;
 
 #endif /* GREEN_CLI_H */

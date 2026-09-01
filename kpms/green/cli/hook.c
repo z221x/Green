@@ -1,17 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * `green agent` CLI tool: injector, broker and agent client.
+ * `green hook` CLI: attach to a target process and run a QuickJS hook
+ * script through the in-process agent payload (libgreen_agent.so).
  *
- * - inject:  ptrace + remote dlopen of the agent payload into the target.
- * - broker:  attach to the agent as root and serve its privileged
- *            page-table requests (snapshot + GumArm64Writer + prctl).
- * - ping/self-test/hook/release: protocol requests to the agent.
+ * - attach: resolve the target (-p pid / -f package), inject the payload if
+ *   the agent socket is not up yet, deploy the script (-l file or -c inline
+ *   code) to the target's script path and evaluate it.  Each request
+ *   attaches its own root broker connection; the agent forwards its
+ *   privileged page-table requests (snapshot + GumArm64Writer + prctl)
+ *   over that connection.
+ * - spawn:  reserved (not implemented yet).
  */
 
 #include <green/cli.h>
 #include <green/abi.h>
 #include <green_agent.h>
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
@@ -27,12 +32,18 @@
 #include <sys/ptrace.h>
 #include <poll.h>
 #include <sys/socket.h>
-#include <linux/un.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <linux/un.h>
+#include <stddef.h>
 #include <unistd.h>
 
 #include <gum/arch-arm64/gumarm64writer.h>
+
+/* Well-known device paths; push both there before attaching. */
+#define HOOK_SO_SOURCE "/data/local/tmp/libgreen_agent.so"
+#define HOOK_SCRIPT_NAME "green_hook.js"
+
 struct map_entry {
     uintptr_t start;
     uintptr_t end;
@@ -204,16 +215,14 @@ static int remote_dlopen(pid_t pid, const char *payload)
     int result = -1;
 
     local_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
-    fprintf(stderr, "inject: local dlopen=%p\n", local_dlopen);
-    if (!local_dlopen) {
+    if (!local_dlopen)
         return -1;
-    }
     if (find_map_containing(getpid(), (uintptr_t)local_dlopen, &local_map) != 0) {
-        fprintf(stderr, "inject: local dlopen map not found\n");
+        fprintf(stderr, "hook: local dlopen map not found\n");
         return -1;
     }
     if (find_target_library_map(pid, &local_map, &target_map) != 0) {
-        fprintf(stderr, "inject: target map for %s not found\n",
+        fprintf(stderr, "hook: target map for %s not found\n",
                 local_map.path[0] ? local_map.path : "(anon)");
         return -1;
     }
@@ -234,8 +243,6 @@ static int remote_dlopen(pid_t pid, const char *payload)
     }
     if (get_regs(pid, &saved) != 0)
         return -1;
-    fprintf(stderr, "inject: calling target dlopen at %lx (path @%lx)\n",
-            (unsigned long)remote_dlopen, (unsigned long)remote_path);
     call = saved;
     call.regs[0] = remote_path;
     call.regs[1] = RTLD_NOW | RTLD_GLOBAL;
@@ -261,15 +268,15 @@ static int remote_dlopen(pid_t pid, const char *payload)
             if (get_regs(pid, &after) == 0 && after.pc == 0) {
                 if (after.regs[0] != 0) {
                     result = 0;
-                    fprintf(stderr, "inject: remote dlopen handle=%llx\n",
-                            (unsigned long long)after.regs[0]);
+                    fprintf(stderr, "hook: injected %s (handle=%llx)\n",
+                            payload, (unsigned long long)after.regs[0]);
                 } else {
                     /* dlopen failed: pull dlerror() text from the target. */
                     struct user_pt_regs call = after;
                     void *local_dlerror = dlsym(RTLD_DEFAULT, "dlerror");
                     struct map_entry lmap, tmap;
 
-                    fprintf(stderr, "inject: remote dlopen returned NULL\n");
+                    fprintf(stderr, "hook: remote dlopen returned NULL\n");
                     if (local_dlerror &&
                         find_map_containing(getpid(),
                                             (uintptr_t)local_dlerror,
@@ -296,7 +303,7 @@ static int remote_dlopen(pid_t pid, const char *payload)
                                         .iov_base = (void *)r2.regs[0],
                                         .iov_len = sizeof(err) - 1 };
                                     process_vm_readv(pid, &lo, 1, &ro, 1, 0);
-                                    fprintf(stderr, "inject: dlerror: %s\n",
+                                    fprintf(stderr, "hook: dlerror: %s\n",
                                             err);
                                     break;
                                 }
@@ -322,34 +329,25 @@ restore:
 
 static int inject_payload(pid_t pid, const char *payload)
 {
-    int attached = 0;
-    int result = -1;
+    int result;
 
-    fprintf(stderr, "inject: attaching to %d\n", (int)pid);
+    fprintf(stderr, "hook: attaching to %d\n", (int)pid);
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) != 0) {
         perror("PTRACE_ATTACH");
-        goto disable;
+        return -1;
     }
-    attached = 1;
     if (wait_initial_stop(pid) != 0) {
-        fprintf(stderr, "target did not stop\n");
+        fprintf(stderr, "hook: target did not stop\n");
+        result = -1;
         goto detach;
     }
-    result = remote_dlopen(pid, payload);
+    result = remote_dlopen(pid, payload) == 0 ? 0 : -1;
 
 detach:
-    if (attached)
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
-    if (result != 0)
-        goto disable;
-    return 0;
-
-disable:
-    return -1;
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    return result;
 }
 
-/* Broker mode: attach to the agent as root, then serve the agent's
- * privileged page-table requests (snapshot + writer + prctl). */
 static int connect_agent(pid_t pid)
 {
     struct sockaddr_un address;
@@ -369,15 +367,12 @@ static int connect_agent(pid_t pid)
     memcpy(address.sun_path + 1, name, (size_t)name_len);
     if (connect(fd, (struct sockaddr *)&address,
                 (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len)) != 0) {
-        fprintf(stderr, "connect agent: %s\n", strerror(errno));
         close(fd);
         return -1;
     }
     return fd;
 }
 
-/* Snapshot the target page cross-process, emit the redirect with the real
- * GumArm64Writer, and commit it through the shadow ABI. */
 static int read_full(int fd, void *buf, size_t size)
 {
     size_t done = 0;
@@ -414,6 +409,8 @@ static int write_full(int fd, const void *buf, size_t size)
     return 0;
 }
 
+/* Snapshot the target page cross-process, emit the redirect with the real
+ * GumArm64Writer, and commit it through the shadow ABI. */
 static int broker_patch(pid_t target, unsigned long target_addr,
                         unsigned long replacement, long *out_value)
 {
@@ -434,7 +431,8 @@ static int broker_patch(pid_t target, unsigned long target_addr,
         n = process_vm_readv((pid_t)target, &local, 1, &remote, 1, 0);
     } while (n < 0 && errno == EINTR);
     if (n != (ssize_t)sizeof(snapshot)) {
-        fprintf(stderr, "broker: process_vm_readv failed: %s\n", strerror(errno));
+        fprintf(stderr, "hook: process_vm_readv failed: %s\n",
+                strerror(errno));
         return -EIO;
     }
 
@@ -452,129 +450,12 @@ static int broker_patch(pid_t target, unsigned long target_addr,
     return pr < 0 ? (int)pr : 0;
 }
 
-/* One command = one pair of connections:
+/* One request = one pair of connections:
  *   conn A: the command request and its final agent response;
  *   conn B: attached as the broker; the agent forwards its privileged
  *           page-table requests here while the command runs. */
-static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
-                         uint64_t arg0, uint64_t arg1, uint64_t arg2);
-
-/* Deploy the user script to the path used by the target-side runtime, load
- * it, then call the probe so the registered hook is exercised. */
-static int agent_js_load(pid_t pid, const char *script_path)
-{
-    char proc_path[64];
-    char cmdline[128] = {0};
-    char package[128];
-    char dest[300];
-    char buf[8192];
-    const char *slash;
-    const char *colon;
-    struct stat process_stat;
-    struct stat source_stat;
-    struct stat dest_stat;
-    ssize_t n;
-    int src;
-    int dst;
-    int r;
-
-    snprintf(proc_path, sizeof(proc_path), "/proc/%d", (int)pid);
-    if (stat(proc_path, &process_stat) != 0) {
-        fprintf(stderr, "js: target %d is not running: %s\n", (int)pid,
-                strerror(errno));
-        return 1;
-    }
-
-    snprintf(proc_path, sizeof(proc_path), "/proc/%d/cmdline", (int)pid);
-    src = open(proc_path, O_RDONLY);
-    if (src < 0) {
-        fprintf(stderr, "js: open %s: %s\n", proc_path, strerror(errno));
-        return 1;
-    }
-    n = read(src, cmdline, sizeof(cmdline) - 1);
-    close(src);
-    if (n <= 0) {
-        fprintf(stderr, "js: read %s: %s\n", proc_path,
-                n < 0 ? strerror(errno) : "empty cmdline");
-        return 1;
-    }
-    cmdline[n] = '\0';
-
-    slash = strrchr(cmdline, '/');
-    if (slash) {
-        /* Non-app target: deploy next to its executable. */
-        size_t dir_len = (size_t)(slash - cmdline) + 1;
-        snprintf(dest, sizeof(dest), "%.*sgreen_hook.js", (int)dir_len,
-                 cmdline);
-    } else {
-        /* App services use "package:process" as cmdline; their data
-         * directory is still named after the base package. */
-        colon = strchr(cmdline, ':');
-        snprintf(package, sizeof(package), "%.*s",
-                 colon ? (int)(colon - cmdline) : (int)strlen(cmdline),
-                 cmdline);
-        snprintf(dest, sizeof(dest), "/data/user/0/%s/cache/green_hook.js",
-                 package);
-    }
-
-    fprintf(stderr, "js: script %s -> %s\n", script_path, dest);
-    if (strcmp(script_path, dest) != 0) {
-        src = open(script_path, O_RDONLY);
-        if (src < 0) {
-            fprintf(stderr, "js: open %s: %s\n", script_path,
-                    strerror(errno));
-            return 1;
-        }
-        if (fstat(src, &source_stat) != 0) {
-            perror("js: fstat script");
-            close(src);
-            return 1;
-        }
-
-        /* Different path strings can still name the same inode.  Never open
-         * the destination with O_TRUNC in that case. */
-        if (stat(dest, &dest_stat) == 0 &&
-            source_stat.st_dev == dest_stat.st_dev &&
-            source_stat.st_ino == dest_stat.st_ino) {
-            close(src);
-        } else {
-            dst = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (dst < 0) {
-                fprintf(stderr, "js: open %s: %s\n", dest, strerror(errno));
-                close(src);
-                return 1;
-            }
-            while ((n = read(src, buf, sizeof(buf))) > 0) {
-                if (write_full(dst, buf, (size_t)n) != 0) {
-                    perror("js: write script");
-                    close(src);
-                    close(dst);
-                    return 1;
-                }
-            }
-            close(src);
-            if (n < 0 || fchmod(dst, 0644) != 0 ||
-                fchown(dst, process_stat.st_uid, process_stat.st_gid) != 0) {
-                perror("js: finalize script");
-                close(dst);
-                return 1;
-            }
-            close(dst);
-        }
-    }
-
-    /* Each request owns a broker connection until its response arrives.
-     * The JS state and committed shadow page persist between requests. */
-    r = agent_request(pid, GREEN_AGENT_TOOL_JS, GREEN_AGENT_CMD_JS_LOAD,
-                      0, 0, 0);
-    if (r != 0)
-        return r;
-    return agent_request(pid, GREEN_AGENT_TOOL_JS, GREEN_AGENT_CMD_JS_CALL,
-                         0, 0, 0);
-}
-
-static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
-                         uint64_t arg0, uint64_t arg1, uint64_t arg2)
+static int hook_request(pid_t pid, uint16_t tool, uint16_t command,
+                        uint64_t arg0, uint64_t arg1, uint64_t arg2)
 {
     struct green_agent_request request;
     struct green_agent_response response;
@@ -606,7 +487,7 @@ static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
     }
     if (read_full(broker_fd, &response, sizeof(response)) != 0 ||
         response.status != 0) {
-        fprintf(stderr, "broker attach failed\n");
+        fprintf(stderr, "hook: broker attach failed\n");
         close(broker_fd);
         close(cmd_fd);
         return 1;
@@ -698,110 +579,334 @@ static int agent_request(pid_t pid, uint16_t tool, uint16_t command,
     return status;
 }
 
-static void agent_usage(const char *prog)
+/* Silent liveness probe (PING needs no broker channel). */
+static int agent_alive(pid_t pid)
 {
-    fprintf(stderr,
-            "Green agent tool (injector, broker, client)\n\n"
-            "Usage:\n"
-            "  %s agent inject --pid PID --so /path/in/target/libgreen_agent.so\n"
-            "  %s agent ping --pid PID\n"
-            "  %s agent js --pid PID --file /path/to/script.js\n"
-            "  %s agent self-test --pid PID\n"
-            "  %s agent hook --pid PID --target ADDR --replacement ADDR\n"
-            "  %s agent release --pid PID --target ADDR\n",
-            prog, prog, prog, prog, prog, prog);
+    struct green_agent_request request;
+    struct green_agent_response response;
+    int cmd_fd;
+    int ok;
+
+    cmd_fd = connect_agent(pid);
+    if (cmd_fd < 0)
+        return 0;
+    memset(&request, 0, sizeof(request));
+    request.magic = GREEN_AGENT_MAGIC;
+    request.version = GREEN_AGENT_VERSION;
+    request.tool = GREEN_AGENT_TOOL_CORE;
+    request.command = GREEN_AGENT_CMD_PING;
+    request.size = sizeof(request);
+    ok = write_full(cmd_fd, &request, sizeof(request)) == 0 &&
+         read_full(cmd_fd, &response, sizeof(response)) == 0 &&
+         response.status == 0;
+    close(cmd_fd);
+    return ok;
 }
 
-static int parse_ulong(const char *text, uintptr_t *value)
+static int read_cmdline(pid_t pid, char *out, size_t out_size)
 {
-    char *end;
-    unsigned long long parsed;
+    char path[64];
+    ssize_t n;
+    int fd;
 
-    errno = 0;
-    parsed = strtoull(text, &end, 0);
-    if (errno || !end || *end || parsed == 0)
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
         return -1;
-    *value = (uintptr_t)parsed;
+    n = read(fd, out, out_size - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    out[n] = '\0';
     return 0;
 }
 
-int green_agent_main(int argc, char **argv)
+/* App services use "package:process" as cmdline but share the base
+ * package's data directory. */
+static void base_package(const char *cmdline, char *out, size_t out_size)
+{
+    const char *colon = strchr(cmdline, ':');
+
+    snprintf(out, out_size, "%.*s",
+             colon ? (int)(colon - cmdline) : (int)strlen(cmdline), cmdline);
+}
+
+static void target_file_path(const char *cmdline, const char *file,
+                             char *out, size_t out_size)
+{
+    const char *slash = strrchr(cmdline, '/');
+    char package[128];
+
+    if (slash) {
+        /* Non-app target: deploy next to its executable. */
+        size_t dir_len = (size_t)(slash - cmdline) + 1;
+        snprintf(out, out_size, "%.*s%s", (int)dir_len, cmdline, file);
+    } else {
+        base_package(cmdline, package, sizeof(package));
+        snprintf(out, out_size, "/data/user/0/%s/cache/%s", package, file);
+    }
+}
+
+static void chown_to_target(int fd, pid_t pid)
+{
+    char path[64];
+    struct stat st;
+
+    snprintf(path, sizeof(path), "/proc/%d", (int)pid);
+    if (stat(path, &st) == 0)
+        fchown(fd, st.st_uid, st.st_gid);
+}
+
+static pid_t find_pid_by_package(const char *package)
+{
+    DIR *dir;
+    struct dirent *de;
+    pid_t found = 0;
+    size_t pkg_len = strlen(package);
+
+    dir = opendir("/proc");
+    if (!dir)
+        return 0;
+    while ((de = readdir(dir)) != NULL) {
+        char cmdline[128];
+        pid_t pid;
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        pid = (pid_t)atoi(de->d_name);
+        if (pid <= 0 || read_cmdline(pid, cmdline, sizeof(cmdline)) != 0)
+            continue;
+        if (strcmp(cmdline, package) == 0) {
+            /* Exact match wins over a ":process" suffix match. */
+            closedir(dir);
+            return pid;
+        }
+        if (!found && strlen(cmdline) > pkg_len &&
+            strncmp(cmdline, package, pkg_len) == 0 &&
+            cmdline[pkg_len] == ':')
+            found = pid;
+    }
+    closedir(dir);
+    return found;
+}
+
+static int hook_attach(pid_t pid, const char *script_file,
+                       const char *inline_code)
+{
+    char cmdline[128];
+    char proc_path[64];
+    char dest[300];
+    char buf[8192];
+    struct stat pst;
+    ssize_t n;
+    int sfd;
+    int dfd;
+    int r;
+
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", (int)pid);
+    if (stat(proc_path, &pst) != 0) {
+        fprintf(stderr, "hook: target %d is not running: %s\n", (int)pid,
+                strerror(errno));
+        return 1;
+    }
+    if (read_cmdline(pid, cmdline, sizeof(cmdline)) != 0) {
+        fprintf(stderr, "hook: cannot read cmdline of %d\n", (int)pid);
+        return 1;
+    }
+
+    /* Inject the payload unless the agent socket is already serving. */
+    if (!agent_alive(pid)) {
+        char so_path[300];
+        int i;
+
+        if (access(HOOK_SO_SOURCE, R_OK) != 0) {
+            fprintf(stderr,
+                    "hook: %s not found; push libgreen_agent.so there first\n",
+                    HOOK_SO_SOURCE);
+            return 1;
+        }
+        if (!strchr(cmdline, '/')) {
+            /* App target: the payload must live inside its own data dir. */
+            target_file_path(cmdline, "libgreen_agent.so", so_path,
+                             sizeof(so_path));
+            sfd = open(HOOK_SO_SOURCE, O_RDONLY);
+            if (sfd < 0) {
+                fprintf(stderr, "hook: open %s: %s\n", HOOK_SO_SOURCE,
+                        strerror(errno));
+                return 1;
+            }
+            dfd = open(so_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+            if (dfd < 0) {
+                fprintf(stderr, "hook: open %s: %s\n", so_path,
+                        strerror(errno));
+                close(sfd);
+                return 1;
+            }
+            while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+                if (write_full(dfd, buf, (size_t)n) != 0) {
+                    perror("hook: write payload");
+                    close(sfd);
+                    close(dfd);
+                    return 1;
+                }
+            }
+            close(sfd);
+            fchmod(dfd, 0755);
+            chown_to_target(dfd, pid);
+            close(dfd);
+        } else {
+            snprintf(so_path, sizeof(so_path), "%s", HOOK_SO_SOURCE);
+        }
+
+        if (inject_payload(pid, so_path) != 0) {
+            fprintf(stderr, "hook: injection failed\n");
+            return 1;
+        }
+        for (i = 0; i < 25 && !agent_alive(pid); i++)
+            usleep(200 * 1000);
+        if (!agent_alive(pid)) {
+            fprintf(stderr, "hook: agent socket did not come up\n");
+            return 1;
+        }
+    }
+
+    /* Deploy the script where the payload's JS runtime will read it. */
+    target_file_path(cmdline, HOOK_SCRIPT_NAME, dest, sizeof(dest));
+    fprintf(stderr, "hook: script -> %s\n", dest);
+    dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dfd < 0) {
+        fprintf(stderr, "hook: open %s: %s\n", dest, strerror(errno));
+        return 1;
+    }
+    if (inline_code) {
+        if (write_full(dfd, inline_code, strlen(inline_code)) != 0 ||
+            write_full(dfd, "\n", 1) != 0) {
+            perror("hook: write script");
+            close(dfd);
+            return 1;
+        }
+    } else {
+        sfd = open(script_file, O_RDONLY);
+        if (sfd < 0) {
+            fprintf(stderr, "hook: open %s: %s\n", script_file,
+                    strerror(errno));
+            close(dfd);
+            return 1;
+        }
+        while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+            if (write_full(dfd, buf, (size_t)n) != 0) {
+                perror("hook: write script");
+                close(sfd);
+                close(dfd);
+                return 1;
+            }
+        }
+        close(sfd);
+        if (n < 0) {
+            perror("hook: read script");
+            close(dfd);
+            return 1;
+        }
+    }
+    fchmod(dfd, 0644);
+    chown_to_target(dfd, pid);
+    close(dfd);
+
+    r = hook_request(pid, GREEN_AGENT_TOOL_JS, GREEN_AGENT_CMD_JS_LOAD,
+                     0, 0, 0);
+    if (r != 0)
+        return r;
+    return 0;
+}
+
+static void hook_usage(const char *prog)
+{
+    fprintf(stderr,
+            "Green hook: attach a target and run a QuickJS hook script\n\n"
+            "Usage:\n"
+            "  %s attach -f <package> -l <script.js>\n"
+            "  %s attach -p <pid> -l <script.js>\n"
+            "  %s attach -p <pid> -c \"<js code>\"\n"
+            "  %s spawn <package>          (not implemented yet)\n\n"
+            "Options:\n"
+            "  -f <package>   target Android package (running process)\n"
+            "  -p <pid>       target pid\n"
+            "  -l <script.js> hook script file (device path)\n"
+            "  -c \"<js code>\"  inline hook script\n\n"
+            "Push the payload first: adb push libgreen_agent.so %s\n",
+            prog, prog, prog, prog, HOOK_SO_SOURCE);
+}
+
+int green_hook_main(int argc, char **argv)
 {
     const char *command;
-    const char *so = NULL;
+    const char *package = NULL;
     const char *script_file = NULL;
+    const char *inline_code = NULL;
     unsigned long pid_value = 0;
-    uintptr_t target = 0;
-    uintptr_t replacement = 0;
     int i;
 
     if (argc < 2) {
-        agent_usage("green");
-        return argc < 2 ? 1 : 0;
+        hook_usage(argv[0]);
+        return 1;
     }
     command = argv[1];
-    for (i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--pid") && i + 1 < argc)
-            green_cli_parse_pid(argv[++i], (pid_t *)&pid_value);
-        else if (!strcmp(argv[i], "--so") && i + 1 < argc)
-            so = argv[++i];
-        else if (!strcmp(argv[i], "--target") && i + 1 < argc)
-            parse_ulong(argv[++i], &target);
-        else if (!strcmp(argv[i], "--replacement") && i + 1 < argc)
-            parse_ulong(argv[++i], &replacement);
-        else if (!strcmp(argv[i], "--file") && i + 1 < argc)
-            script_file = argv[++i];
-        else {
-            agent_usage("green");
+
+    if (!strcmp(command, "spawn")) {
+        if (argc < 3) {
+            hook_usage(argv[0]);
             return 2;
         }
-    }
-    if (!pid_value || pid_value > 0x7fffffffUL) {
-        agent_usage("green");
+        fprintf(stderr, "hook: spawn %s is not implemented yet\n", argv[2]);
         return 2;
     }
 
-    if (!strcmp(command, "inject")) {
-        char socket_name[64];
+    if (strcmp(command, "attach") != 0) {
+        hook_usage(argv[0]);
+        return 2;
+    }
 
-        if (!so || inject_payload((pid_t)pid_value, so) != 0)
-            return 1;
-        if (green_agent_socket_name((pid_t)pid_value, socket_name,
-                                    sizeof(socket_name)) < 0)
-            return 1;
-        printf("injected; socket=@%s\n", socket_name);
-        return 0;
-    }
-    if (!strcmp(command, "ping"))
-        return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_CORE,
-                             GREEN_AGENT_CMD_PING, 0, 0, 0);
-    if (!strcmp(command, "js")) {
-        if (!script_file) { fprintf(stderr, "js: --file required (device path of the script)\n"); return 2; }
-        return agent_js_load((pid_t)pid_value, script_file);
-    }
-    if (!strcmp(command, "self-test"))
-        return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
-                             GREEN_AGENT_HOOK_SELF_TEST, 0, 0, 0);
-    if (!strcmp(command, "hook")) {
-        if (!target || !replacement)
+    for (i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-f") && i + 1 < argc)
+            package = argv[++i];
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc)
+            green_cli_parse_pid(argv[++i], (pid_t *)&pid_value);
+        else if (!strcmp(argv[i], "-l") && i + 1 < argc)
+            script_file = argv[++i];
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc)
+            inline_code = argv[++i];
+        else {
+            hook_usage(argv[0]);
             return 2;
-        return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
-                             GREEN_AGENT_HOOK_REDIRECT, target, replacement,
-                             16);
+        }
     }
-    if (!strcmp(command, "release")) {
-        if (!target)
-            return 2;
-        return agent_request((pid_t)pid_value, GREEN_AGENT_TOOL_GREEN_HOOK,
-                             GREEN_AGENT_HOOK_RELEASE, target, 0, 0);
+
+    if ((pid_value == 0) == (package == NULL)) {
+        fprintf(stderr, "hook: attach needs exactly one of -f/-p\n");
+        return 2;
     }
-    agent_usage("green");
-    return 2;
+    if ((script_file == NULL) == (inline_code == NULL)) {
+        fprintf(stderr, "hook: attach needs exactly one of -l/-c\n");
+        return 2;
+    }
+    if (package) {
+        pid_t pid = find_pid_by_package(package);
+
+        if (pid <= 0) {
+            fprintf(stderr, "hook: no running process for %s\n", package);
+            return 1;
+        }
+        pid_value = (unsigned long)pid;
+        fprintf(stderr, "hook: %s -> pid %ld\n", package,
+                (long)pid_value);
+    }
+
+    return hook_attach((pid_t)pid_value, script_file, inline_code);
 }
 
-const struct green_cli_tool green_cli_agent_tool = {
-    .name = "agent",
-    .summary = "inject/serve/hook through the in-process green agent",
-    .main = green_agent_main,
-    .usage = agent_usage,
+const struct green_cli_tool green_cli_hook_tool = {
+    .name = "hook",
+    .summary = "attach a target and run a QuickJS hook script",
+    .main = green_hook_main,
+    .usage = hook_usage,
 };

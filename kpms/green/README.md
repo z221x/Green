@@ -42,7 +42,8 @@ kpms/green/
 └── cli/
     ├── main.c               # CLI 工具分发入口
     ├── README.md             # CLI 扩展说明
-    └── shadow.c              # shadow 子命令
+    ├── shadow.c              # shadow 子命令
+    └── hook.c                # hook 子命令（attach/spawn）
 ```
 
 ## 当前工具：shadow
@@ -81,8 +82,12 @@ CLI 工具示例（单二进制）：
 ```sh
 adb push build/green /data/local/tmp/green
 adb shell su -c "/data/local/tmp/green shadow count -p <pid>"
-adb shell su -c "/data/local/tmp/green agent inject --pid <pid> --so .../libgreen_agent.so"
-adb shell su -c "/data/local/tmp/green agent js --pid <pid> --file /data/local/tmp/example_hook.js"
+
+# hook：注入 + 加载 JS hook 脚本一步完成
+adb push build/libgreen_agent.so /data/local/tmp/libgreen_agent.so
+adb push agent/example_hook.js /data/local/tmp/hook.js
+adb shell su -c "/data/local/tmp/green hook attach -p <pid> -l /data/local/tmp/hook.js"
+adb shell su -c "/data/local/tmp/green hook attach -f <package> -c \"log('hello')\""
 ```
 
 所有构建产物统一输出到 `build/`：

@@ -4,7 +4,7 @@
 
 - `libgreen_agent.so`：注入目标进程的 payload，提供按 PID 命名的抽象 Unix socket、
   工具分发器以及内嵌 QuickJS 运行时。
-- `green agent`：root 侧 CLI，负责注入、协议通信、跨进程页面快照、
+- `green hook`：root 侧 CLI，负责注入、协议通信、跨进程页面快照、
   GumArm64Writer 重定向编码和 KPM `prctl` 调用。
 
 ## 权限模型
@@ -46,22 +46,33 @@ kpms/green/build/green
 kpms/green/build/libgreen_agent.so
 ```
 
-## 注入
+## 注入与使用
 
-payload 必须位于目标进程可读取、可执行的位置：
+先把 payload 和脚本推到设备的固定位置：
 
 ```sh
-green agent inject --pid PID \
-  --so /data/user/0/<package>/cache/libgreen_agent.so
-
-green agent ping --pid PID
+adb push libgreen_agent.so /data/local/tmp/libgreen_agent.so
+adb push example_hook.js   /data/local/tmp/hook.js
 ```
 
-CLI 的每个命令都会自动附着临时 root broker，无需单独启动 broker 进程。
+然后一条命令完成注入 + broker + 脚本加载：
 
-## QuickJS hook
+```sh
+# 指定 pid
+green hook attach -p PID -l /data/local/tmp/hook.js
 
-示例脚本见 `agent/example_hook.js`：
+# 指定包名（自动解析运行中的进程；payload 自动复制进应用 cache 目录）
+green hook attach -f com.example.app -l /data/local/tmp/hook.js
+
+# 内联 JS 代码
+green hook attach -p PID -c "log('hello'); hook(selfTestTarget(), function(a){ return a + 100; })"
+```
+
+`attach` 内部流程：解析目标 → 未注入则自动注入（app 目标会把 payload 复制到其
+cache 目录并 chown 到应用 uid）→ 附着 root broker → 部署脚本到目标可读路径 →
+`JS_LOAD` 求值。重复执行会重新加载脚本（IIFE 包装，无重声明问题）。
+
+## QuickJS hook API
 
 ```js
 log("script loaded");
@@ -73,8 +84,6 @@ hook(target, function (args) {
 });
 ```
 
-当前原生 API：
-
 - `log(value...)`：输出到 Android logcat 的 `green-js` tag；
 - `selfTestTarget()`：返回 agent 内置测试函数地址；
 - `hook(address, callback)`：将地址重定向到 JS callback。
@@ -82,30 +91,18 @@ hook(target, function (args) {
 callback 接收一个包含 ARM64 `x0` 到 `x7` 的数组；其整数返回值作为 `x0` 返回给
 原调用者。当前桥接层只保存一个 callback，重复调用 `hook()` 会替换 callback。
 
-加载并运行内置 probe：
-
-```sh
-green agent js --pid PID --file /data/local/tmp/example_hook.js
-```
-
-成功输出：
-
-```text
-status=0 value=0x0 script loaded from .../green_hook.js
-status=0 value=0x65 probe during=101
-```
-
 QuickJS context 会在目标进程中持续存在。脚本使用 IIFE 包装后执行，因此可重复加载；
 运行 callback 的线程可能不同于加载线程，agent 会在每次进入 QuickJS 前刷新 native
 stack top，并用 mutex 串行化 runtime 访问。
 
-## 原生 hook 自测
+## KPM 回归测试
 
 ```sh
-green agent self-test --pid PID
+make testhook && adb push build/test_hook /data/local/tmp/
+adb shell su -c /data/local/tmp/test_hook
 ```
 
-该命令验证完整链路：原始结果 `2` -> shadow 重定向结果 `101` -> release 后恢复 `2`。
+验证 shadow 语义：patch 执行生效 / 读取见原始字节 / release 恢复。
 
 ## 扩展
 

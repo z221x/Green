@@ -61,12 +61,14 @@ client: $(CLIENT)
 
 CLI_GUM_VENDOR_DIR := green_hook/vendor/gum
 CLI_GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
+# gummemory-green.c doubles as the gum platform layer (page size, ptrauth,
+# internal allocator, memory access) required to link the writer.
 CLI_GUM_SRCS := green_hook/gummemory-green.c \
                 $(CLI_GUM_VENDOR_DIR)/gumlibc.c \
                 $(CLI_GUM_VENDOR_DIR)/gummetalarray.c \
                 $(CLI_GUM_VENDOR_DIR)/gummetalhash.c \
                 $(CLI_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
-CLI_SRCS := cli/main.c common/common.c cli/shadow.c cli/agent.c $(CLI_GUM_SRCS)
+CLI_SRCS := cli/main.c common/common.c cli/shadow.c cli/hook.c $(CLI_GUM_SRCS)
 CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
 
 $(CLIENT): $(CLI_SRCS) $(CLI_HEADERS)

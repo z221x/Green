@@ -21,7 +21,7 @@
 
 static const struct green_cli_tool *const green_cli_tools[] = {
     &green_cli_shadow_tool,
-    &green_cli_agent_tool,
+    &green_cli_hook_tool,
 };
 
 const struct green_cli_tool *green_cli_find_tool(const char *name)
