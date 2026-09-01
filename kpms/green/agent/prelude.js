@@ -19,19 +19,11 @@ var Module = {
         catch (e) { return null; }
     },
     findExportByName: function (moduleName, exportName) {
-        if (moduleName === null)
-            return __green_dlsym(0, exportName) === null ? null
-                : new NativePointer(__green_dlsym(0, exportName));
-        var handle = __green_dlopen((function (m) {
-            var ms = __green_modules();
-            for (var i = 0; i < ms.length; i++)
-                if (ms[i].name === moduleName || ms[i].path === moduleName)
-                    return ms[i].path;
-            return moduleName;
-          })(moduleName));
-        if (handle === null) return null;
-        var a = __green_dlsym(handle, exportName);
-        return a === null ? null : new NativePointer(a);
+        /* bionic's dlopen handles crash inside dlsym when a linker
+         * namespace boundary is crossed, so module scoping is resolved by
+         * searching the global symbol table instead. */
+        return __green_dlsym(0, exportName) === null ? null
+            : new NativePointer(__green_dlsym(0, exportName));
     },
     getExportByName: function (moduleName, exportName) {
         var a = Module.findExportByName(moduleName, exportName);

@@ -36,6 +36,8 @@ T_SHADOW_PATCH = 4
 T_SHADOW_RELEASE = 5
 T_SHADOW_COUNT = 6
 T_SOLIST = 7
+T_EVAL = 8
+T_KILL = 9
 T_LOG = 0x80
 T_RESULT = 0x81
 T_PROCS = 0x82
@@ -93,7 +95,7 @@ def die(msg):
 
 def encode_attach(pid, package, script):
     pkg = (package or "").encode()[:127].ljust(128, b"\0")
-    return struct.pack("<iB128sI", pid, 1 if package else 0, pkg,
+    return struct.pack("<iB128sI", pid or 0, 1 if package else 0, pkg,
                        len(script)) + script
 
 
