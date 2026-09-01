@@ -119,6 +119,16 @@ static int green_agent_write_full(int fd, const void *buf, size_t size)
     return 0;
 }
 
+/* gumjs 消息回调：由 gumjs 在 JS 线程上调用，将 JSON 消息转发到 broker。 */
+static void green_agent_broker_log(const char *text, size_t len);
+static int green_agent_broker_request(uint32_t command, uint64_t addr,
+                                      uint64_t arg, int64_t *value);
+static void green_agent_on_message(GumScript * script, const gchar * message,
+                                   gpointer user_data)
+{
+    green_agent_broker_log(message, strlen(message));
+}
+
 /* One-way message to the attached server (script logs, send(), errors). */
 static void green_agent_broker_log(const char *text, size_t len)
 {
@@ -193,21 +203,8 @@ int green_agent_broker_page_commit(uint64_t page_address, const void *image,
 }
 
 /* ---- script runtime (official frida-gum gumjs backend) ---------------- */
-
-static void green_agent_on_message(GumScript * script, const gchar * message,
-                                   gpointer user_data)
-{
-    /* message is JSON: {"type":"log"|"send"|"error","payload":...} */
-    __android_log_print(ANDROID_LOG_INFO, "green-debug",
-                        "on_message: %.*s", (int) strnlen(message, 120),
-                        message);
-    green_agent_broker_log(message, strlen(message));
-}
-
-/* ---- script runtime (official frida-gum gumjs backend) ---------------- */
-/* frida-server 的模式：一个线程跑 default GMainContext 的循环。
- * gumjs 把脚本消息（console/send）作为 idle source 挂在该上下文上，
- * 没有线程迭代它，消息就永远不会派发。 */
+/* frida-server 模式：一个线程持续迭代 default GMainContext——gumjs 把
+ * 脚本消息（console/send）作为 idle source 挂在该上下文上。 */
 
 static void *
 green_main_loop_thread (void *unused)
@@ -306,14 +303,18 @@ static int green_agent_js_load(const struct green_agent_request *request,
     }
     source[source_len] = '\0';
 
+    __android_log_print(ANDROID_LOG_INFO, "green-debug", "js_load: submitting to gumjs");
+
     if (g_script != NULL) {
         gum_script_unload_sync(g_script, NULL);
         g_object_unref(g_script);
         g_script = NULL;
     }
 
+    __android_log_print(ANDROID_LOG_INFO, "green-debug", "js_load: create_sync...");
     script = gum_script_backend_create_sync(g_script_backend, "green",
                                             source, NULL, NULL, &error);
+    __android_log_print(ANDROID_LOG_INFO, "green-debug", "js_load: create done %p", script);
     free(source);
     if (script == NULL) {
         snprintf(response->message, sizeof(response->message), "%s",
@@ -324,12 +325,15 @@ static int green_agent_js_load(const struct green_agent_request *request,
     }
     g_script = script;
 
+    __android_log_print(ANDROID_LOG_INFO, "green-debug", "js_load: load_sync...");
     gum_script_load_sync(script, NULL);
-
+    __android_log_print(ANDROID_LOG_INFO, "green-debug", "js_load: load done");
     snprintf(response->message, sizeof(response->message),
              "script loaded from %s", path);
     return 0;
 }
+
+
 
 
 static int green_agent_js_eval(const struct green_agent_request *request,
