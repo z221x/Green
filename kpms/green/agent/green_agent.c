@@ -17,6 +17,7 @@
 
 #include <gum/gum.h>
 
+#include <android/log.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -197,43 +198,27 @@ static void green_agent_on_message(GumScript * script, const gchar * message,
                                    gpointer user_data)
 {
     /* message is JSON: {"type":"log"|"send"|"error","payload":...} */
+    __android_log_print(ANDROID_LOG_INFO, "green-debug",
+                        "on_message: %.*s", (int) strnlen(message, 120),
+                        message);
     green_agent_broker_log(message, strlen(message));
 }
 
-static int green_agent_script_create(const char *name, const char *source,
-                                     GumScript ** out_script, char *err,
-                                     size_t errlen)
+/* ---- script runtime (official frida-gum gumjs backend) ---------------- */
+/* frida-server 的模式：一个线程跑 default GMainContext 的循环。
+ * gumjs 把脚本消息（console/send）作为 idle source 挂在该上下文上，
+ * 没有线程迭代它，消息就永远不会派发。 */
+
+static void *
+green_main_loop_thread (void *unused)
 {
-    GError *error = NULL;
+  GMainLoop * loop;
 
-    if (!g_script_backend) {
-        gum_init_embedded();
-        g_script_backend = gum_script_backend_obtain_qjs();
-        if (!g_script_backend) {
-            snprintf(err, errlen, "no QuickJS script backend");
-            return -1;
-        }
-    }
-
-    if (g_script != NULL) {
-        /* Replace the previously loaded script. */
-        gum_script_unload_sync(g_script, NULL);
-        g_object_unref(g_script);
-        g_script = NULL;
-    }
-
-    *out_script = gum_script_backend_create_sync(g_script_backend, name,
-                                                 source, NULL, NULL, &error);
-    if (*out_script == NULL) {
-        snprintf(err, errlen, "%s",
-                 error ? error->message : "script creation failed");
-        if (error)
-            g_error_free(error);
-        return -1;
-    }
-    gum_script_set_message_handler(*out_script, green_agent_on_message, NULL,
-                                   NULL);
-    return 0;
+  (void) unused;
+  loop = g_main_loop_new (g_main_context_default (), TRUE);
+  g_main_loop_run (loop);
+  g_main_loop_unref (loop);
+  return NULL;
 }
 
 /* ---- JS tool ---------------------------------------------------------- */
@@ -272,13 +257,13 @@ static int green_agent_js_load(const struct green_agent_request *request,
                                struct green_agent_response *response)
 {
     char path[256];
-    char err[192] = {0};
     int fd;
     size_t done;
     size_t source_len;
     struct stat script_stat;
     char *source;
     GumScript *script = NULL;
+    GError *error = NULL;
 
     (void)request;
     green_agent_js_script_path(path, sizeof(path));
@@ -321,21 +306,31 @@ static int green_agent_js_load(const struct green_agent_request *request,
     }
     source[source_len] = '\0';
 
-    if (green_agent_script_create("green", source, &script, err,
-                                  sizeof(err)) != 0) {
-        free(source);
-        snprintf(response->message, sizeof(response->message), "%s", err);
+    if (g_script != NULL) {
+        gum_script_unload_sync(g_script, NULL);
+        g_object_unref(g_script);
+        g_script = NULL;
+    }
+
+    script = gum_script_backend_create_sync(g_script_backend, "green",
+                                            source, NULL, NULL, &error);
+    free(source);
+    if (script == NULL) {
+        snprintf(response->message, sizeof(response->message), "%s",
+                 error ? error->message : "script creation failed");
+        if (error)
+            g_error_free(error);
         return -EIO;
     }
-    free(source);
     g_script = script;
 
-    gum_script_load(script, NULL); /* async: scheduler owns the load */
+    gum_script_load_sync(script, NULL);
 
     snprintf(response->message, sizeof(response->message),
              "script loaded from %s", path);
     return 0;
 }
+
 
 static int green_agent_js_eval(const struct green_agent_request *request,
                                struct green_agent_response *response)
@@ -350,9 +345,9 @@ static int green_agent_js_eval(const struct green_agent_request *request,
     char *wrapped;
     size_t wrapped_len;
     GumScript *script = NULL;
-    char err[192] = {0};
-    char name[64];
+    GError *error = NULL;
 
+    (void)request;
     green_agent_js_script_path(eval_path, sizeof(eval_path));
     slash = strrchr(eval_path, '/');
     snprintf(slash + 1, sizeof(eval_path) - (slash + 1 - eval_path),
@@ -377,23 +372,26 @@ static int green_agent_js_eval(const struct green_agent_request *request,
         close(fd);
         return -ENOMEM;
     }
-    {
-        ssize_t n;
+    done = 0;
+    while (done < code_len) {
+        ssize_t n = read(fd, code + done, code_len - done);
 
-        while (done < code_len) {
-            n = read(fd, code + done, code_len - done);
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n <= 0)
-                break;
-            done += (size_t)n;
-        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        done += (size_t)n;
     }
     close(fd);
+    if (done != code_len) {
+        free(code);
+        snprintf(response->message, sizeof(response->message),
+                 "eval read failed");
+        return -EIO;
+    }
     code[done] = '\0';
 
-    /* Wrap: evaluate and send the result as a message. */
-    wrapped_len = done + 96;
+    wrapped_len = code_len + 96;
     wrapped = malloc(wrapped_len);
     if (!wrapped) {
         free(code);
@@ -402,29 +400,28 @@ static int green_agent_js_eval(const struct green_agent_request *request,
     snprintf(wrapped, wrapped_len,
              "send(String((function(){ %s })()));", code);
 
-    if (green_agent_script_create("green-eval", wrapped, &script, err,
-                                  sizeof(err)) != 0) {
-        free(wrapped);
-        free(code);
-        snprintf(response->message, sizeof(response->message), "%s", err);
-        return -EIO;
+    if (g_script != NULL) {
+        /* 已有脚本时复用其 runtime：卸载旧 eval 脚本不需要。 */
     }
-    snprintf(name, sizeof(name), "green-eval-%d", (int)getpid());
-    (void)name;
 
-    gum_script_set_message_handler(script, green_agent_on_message, NULL,
-                                   NULL);
-    gum_script_load_sync(script, NULL);
-    /* The script's send() already reached the host through the log
-     * channel; the eval itself has no single return value. */
-    gum_script_unload_sync(script, NULL);
-    g_object_unref(script);
+    script = gum_script_backend_create_sync(g_script_backend, "green-eval",
+                                            wrapped, NULL, NULL, &error);
     free(wrapped);
     free(code);
+    if (script == NULL) {
+        snprintf(response->message, sizeof(response->message), "%s",
+                 error ? error->message : "eval creation failed");
+        if (error)
+            g_error_free(error);
+        return -EIO;
+    }
+    gum_script_load_sync(script, NULL);
+    g_object_unref(script);
 
     snprintf(response->message, sizeof(response->message), "eval ok");
     return 0;
 }
+
 
 static int green_agent_js_tool_handler(const struct green_agent_request *request,
                                        struct green_agent_response *response,
@@ -671,6 +668,19 @@ static void green_agent_start_once(void)
     pthread_t thread;
     struct sigaction ignored;
 
+    /* frida's glib fork has no auto-init constructor: the embedder must
+     * call glib_init() explicitly.  gumjs attaches script-message sources
+     * to the default main context, so a dedicated thread iterates it. */
+    extern void glib_init (void);
+    glib_init ();
+    gum_init_embedded ();
+    g_script_backend = gum_script_backend_obtain_qjs ();
+    {
+        pthread_t loop_thread;
+
+        pthread_create(&loop_thread, NULL, green_main_loop_thread, NULL);
+        pthread_detach(loop_thread);
+    }
     green_agent_register_tool(&green_agent_hook_tool);
     green_agent_register_tool(&green_agent_js_tool);
     memset(&ignored, 0, sizeof(ignored));

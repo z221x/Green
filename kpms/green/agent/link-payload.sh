@@ -17,8 +17,10 @@ $CC -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
   -Iinclude -Ivendor/frida-gum -Ivendor/frida-gum/bindings -Ivendor/frida-gum/build-gumjs -Ivendor/frida-gum/gum \
   -Ivendor/frida-gum/subprojects/capstone/include/capstone \
   -I$ROOT/tmp/prefix/include/glib-2.0 -I$ROOT/tmp/prefix/lib/glib-2.0/include \
-  -Ivendor/prefix/include/quickjs \
+  -Ivendor/prefix/include/quickjs -Igreen_hook/vendor/gum \
   -o build/libgreen_agent.so agent/green_agent.c \
+  agent/gummemory-green-payload.c \
+  -Wl,--allow-multiple-definition \
   -Wl,--start-group \
   $FGJ/libfrida-gumjs-1.0.a \
   $FG/libfrida-gum-1.0.a \

@@ -36,7 +36,7 @@
 #include "gummemory-priv.h"
 #include "gumprocess.h"
 
-#include <green_agent.h>
+#include "green_agent.h"
 #include <green/abi.h>
 
 #include <errno.h>
