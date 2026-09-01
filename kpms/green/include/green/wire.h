@@ -22,6 +22,8 @@ enum green_wire_type {
     GREEN_WIRE_SHADOW_RELEASE = 5, /* shadow_release */
     GREEN_WIRE_SHADOW_COUNT = 6,   /* shadow_count */
     GREEN_WIRE_SOLIST = 7,         /* solist request */
+    GREEN_WIRE_EVAL = 8,           /* eval: {i32 pid, u32 code_len, code} */
+    GREEN_WIRE_KILL = 9,           /* kill: {i32 pid} */
     /* server -> host */
     GREEN_WIRE_LOG = 0x80,    /* log_event */
     GREEN_WIRE_RESULT = 0x81, /* result (ok + value + message) */

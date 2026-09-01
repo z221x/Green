@@ -109,8 +109,19 @@ $(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
-		-Iagent -I$(CURDIR)/$(GUM_PREFIX)/include/quickjs \
-		-o $@ agent/green_agent.c $(GUM_PREFIX)/lib/libquickjs.a -lm -llog -pthread
+		-Iagent -I$(CURDIR)/include -I$(CURDIR)/$(GUM_PREFIX)/include/quickjs \
+		-I$(CURDIR)/vendor/frida-gum/subprojects/capstone/include/capstone \
+		-I$(CURDIR)/green_hook/shim -I$(CURDIR)/green_hook/vendor \
+		-I$(CURDIR)/green_hook/vendor/gum \
+		-o $@ agent/green_agent.c agent/gummemory-green-payload.c \
+		green_hook/vendor/gum/arch-arm64/gumarm64reader.c \
+		green_hook/vendor/gum/arch-arm64/gumarm64relocator.c \
+		green_hook/vendor/gum/arch-arm64/gumarm64writer.c \
+		green_hook/vendor/gum/gumlibc.c \
+		green_hook/vendor/gum/gummetalarray.c \
+		green_hook/vendor/gum/gummetalhash.c \
+		$(GUM_PREFIX)/lib/libquickjs.a \
+		$(GUM_PREFIX)/lib/libcapstone.a -lm -llog -pthread
 
 .PHONY: clean
 clean:

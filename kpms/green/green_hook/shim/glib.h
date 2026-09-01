@@ -53,6 +53,94 @@ typedef float gfloat;
 typedef struct _GArray GArray;
 typedef struct _GPtrArray GPtrArray;
 typedef struct _GHashTable GHashTable;
+typedef struct _GHashTableIter GHashTableIter;
+typedef void (*GDestroyNotify) (gpointer);
+typedef guint (*GHashFunc) (gconstpointer);
+typedef gboolean (*GEqualFunc) (gconstpointer, gconstpointer);
+
+struct _GHashEntry { gpointer key; gpointer value; int used; };
+struct _GHashTable { struct _GHashEntry *entries; size_t cap; size_t len;
+    GHashFunc hash; GEqualFunc equal; };
+struct _GHashTableIter { GHashTable *ht; size_t pos; };
+
+static inline GHashTable *
+g_hash_table_new_full (GHashFunc h, GEqualFunc e,
+    GDestroyNotify kd, GDestroyNotify vd)
+{
+  GHashTable *ht = (GHashTable *) malloc (sizeof (GHashTable));
+  ht->cap = 64; ht->len = 0; ht->hash = h; ht->equal = e;
+  ht->entries = (struct _GHashEntry *) calloc (ht->cap,
+      sizeof (struct _GHashEntry));
+  return ht;
+}
+static inline GHashTable * g_hash_table_new (GHashFunc h, GEqualFunc e)
+{ return g_hash_table_new_full (h, e, NULL, NULL); }
+static inline void g_hash_table_insert (GHashTable *ht, gpointer k, gpointer v)
+{
+  size_t i;
+  for (i = 0; i < ht->len; i++)
+  {
+    if (ht->entries[i].used &&
+        (ht->equal ? ht->equal (ht->entries[i].key, k)
+                   : ht->entries[i].key == k))
+    { ht->entries[i].value = v; return; }
+  }
+  if (ht->len == ht->cap)
+  { ht->cap *= 2;
+    ht->entries = (struct _GHashEntry *) realloc (ht->entries,
+        ht->cap * sizeof (struct _GHashEntry)); }
+  ht->entries[ht->len].key = k;
+  ht->entries[ht->len].value = v;
+  ht->entries[ht->len].used = 1;
+  ht->len++;
+}
+static inline void g_hash_table_add (GHashTable *ht, gpointer k)
+{ g_hash_table_insert (ht, k, k); }
+static inline int g_hash_table_contains (const GHashTable *ht,
+    gconstpointer k)
+{
+  size_t i;
+  for (i = 0; i < ht->len; i++)
+  {
+    if (ht->entries[i].used &&
+        (ht->equal ? ht->equal (ht->entries[i].key, k)
+                   : ht->entries[i].key == k))
+      return 1;
+  }
+  return 0;
+}
+static inline void g_hash_table_iter_remove (GHashTableIter *it)
+{
+  if (it->pos > 0)
+    it->ht->entries[it->pos - 1].used = 0;
+}
+static inline gpointer g_hash_table_lookup (GHashTable *ht, gconstpointer k)
+{
+  size_t i;
+  for (i = 0; i < ht->len; i++)
+  {
+    if (ht->entries[i].used &&
+        (ht->equal ? ht->equal (ht->entries[i].key, k)
+                   : ht->entries[i].key == k))
+      return ht->entries[i].value;
+  }
+  return NULL;
+}
+static inline void g_hash_table_iter_init (GHashTableIter *it, GHashTable *ht)
+{ it->ht = ht; it->pos = 0; }
+static inline int g_hash_table_iter_next (GHashTableIter *it, gpointer *k,
+    gpointer *v)
+{
+  while (it->pos < it->ht->len)
+  {
+    struct _GHashEntry *e = &it->ht->entries[it->pos++];
+    if (e->used)
+    { if (k) *k = e->key; if (v) *v = e->value; return 1; }
+  }
+  return 0;
+}
+static inline void g_hash_table_unref (GHashTable *ht)
+{ free (ht->entries); free (ht); }
 typedef struct _GRegex GRegex;
 typedef struct _GMatchInfo GMatchInfo;
 typedef struct _GThreadPool GThreadPool;
@@ -85,6 +173,10 @@ typedef gsize GType;
 
 #define g_slice_new(type) ((type *) g_slice_alloc (sizeof (type)))
 #define g_slice_new0(type) ((type *) g_slice_alloc0 (sizeof (type)))
+#define g_new(type, n)         ((type *) g_slice_alloc (sizeof (type) * (n)))
+#define g_new0(type, n)        ((type *) g_slice_alloc0 (sizeof (type) * (n)))
+#define g_alloca(size)         __builtin_alloca (size)
+#define g_renew(type, mem, n)  ((type *) g_realloc (mem, sizeof (type) * (n)))
 #define g_slice_dup(type, mem) \
     ((type *) g_slice_copy (sizeof (type), (mem)))
 #define g_slice_free(type, mem) g_free (mem)
@@ -172,9 +264,6 @@ G_GNUC_NORETURN static inline void g_assertion_message_abort (void)
 #define g_abort() abort ()
 
 typedef gint (*GCompareFunc) (gconstpointer a, gconstpointer b);
-typedef void (*GDestroyNotify) (gpointer data);
-typedef guint (*GHashFunc) (gconstpointer key);
-typedef gboolean (*GEqualFunc) (gconstpointer a, gconstpointer b);
 typedef void (*GHFunc) (gpointer key, gpointer value, gpointer user_data);
 typedef gboolean (*GHRFunc) (gpointer key, gpointer value, gpointer user_data);
 

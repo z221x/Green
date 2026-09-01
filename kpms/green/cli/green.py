@@ -152,6 +152,80 @@ def cmd_attach(args):
             print("[%s] %s" % ("+" if ok else "!", msg))
             if not ok:
                 return 1
+            if args.repl or sys.stdin.isatty():
+                return repl_loop(sock, args)
+
+
+def repl_loop(sock, args):
+    """Frida-style interactive loop: expressions are evaluated in the
+    target's persistent QuickJS context; script logs stream meanwhile."""
+    import threading
+
+    done = threading.Event()
+
+    def reader():
+        while not done.is_set():
+            try:
+                ftype, _, payload = recv_frame(sock)
+            except Exception:
+                break
+            if ftype == T_LOG:
+                (pid, length) = struct.unpack_from("<iI", payload, 0)
+                text = payload[8:8 + length].decode(errors="replace")
+                sys.stdout.write("[%d] %s\n" % (pid, text.rstrip("\n")))
+                sys.stdout.flush()
+            elif ftype == T_RESULT:
+                ok = struct.unpack_from("<i", payload, 0)[0]
+                length = struct.unpack_from("<I", payload, 16)[0]
+                msg = payload[20:20 + length].decode(errors="replace")
+                print("[%s] %s" % ("+" if ok else "!", msg))
+                sys.stdout.flush()
+            elif ftype == T_PROCS:
+                pass
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    print("[*] REPL ready -- type an expression, or exit/quit to detach")
+    while True:
+        try:
+            line = input("green> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        line = line.strip()
+        if not line:
+            continue
+        if line in ("exit", "quit", ".exit"):
+            break
+        code = ("(function(){ var __r; try { __r = eval(%s); }"
+                " catch (e) { return 'Error: ' + e.message; }"
+                " return typeof __r === 'object' && __r !== null ?"
+                " JSON.stringify(__r) : String(__r); })()" %
+                __import__("json").dumps(line))
+        send_frame(sock, T_EVAL, struct.pack("<iI", args.pid, len(code)) +
+                   code.encode())
+    done.set()
+    return 0
+
+
+def cmd_eval(args):
+    code = args.code if args.code else read_script(args).decode()
+    sock = connect(args)
+    payload = struct.pack("<iI", args.pid, len(code)) + code.encode()
+    send_frame(sock, T_EVAL, payload)
+    ok, _, msg = recv_result(sock)
+    sock.close()
+    print("[%s] %s" % ("+" if ok else "!", msg))
+    return 0 if ok else 1
+
+
+def cmd_kill(args):
+    sock = connect(args)
+    send_frame(sock, T_KILL, struct.pack("<i", args.pid))
+    ok, _, msg = recv_result(sock)
+    sock.close()
+    print("[%s] %s" % ("+" if ok else "!", msg))
+    return 0 if ok else 1
 
 
 def cmd_spawn(args):
@@ -299,9 +373,20 @@ def main():
     src = p_att.add_mutually_exclusive_group(required=True)
     src.add_argument("-l", "--script", help="hook script file (host path)")
     src.add_argument("-c", "--code", help="inline JS hook code")
+    p_att.add_argument("--repl", action="store_true",
+                       help="enter interactive REPL after loading")
 
     p_sp = sub.add_parser("spawn", help="spawn an app (reserved)")
     p_sp.add_argument("package")
+
+    p_ev = sub.add_parser("eval", help="evaluate a JS expression in a target")
+    p_ev.add_argument("-p", "--pid", type=int, required=True)
+    grp_ev = p_ev.add_mutually_exclusive_group(required=True)
+    grp_ev.add_argument("-c", "--code")
+    grp_ev.add_argument("-l", "--script")
+
+    p_ki = sub.add_parser("kill", help="kill a process on the device")
+    p_ki.add_argument("-p", "--pid", type=int, required=True)
 
     p_sh = sub.add_parser("shadow", help="hidden patch / hook operations")
     sh = p_sh.add_subparsers(dest="shadow_command", required=True)
@@ -339,6 +424,8 @@ def main():
         "ps": cmd_list,
         "attach": cmd_attach,
         "spawn": cmd_spawn,
+        "eval": cmd_eval,
+        "kill": cmd_kill,
         "shadow": {
             "maps": cmd_shadow_maps,
             "count": cmd_shadow_count,

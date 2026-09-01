@@ -1,13 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * `green server`: frida-server-style daemon.  Listens on TCP (default
- * 27042) and drives the in-process agent payload on behalf of a host CLI:
+ * `green` device daemon (frida-server equivalent).  Listens on TCP
+ * (default 27042) and drives the in-process agent payload on behalf of
+ * the host CLI:
  *
- *   LIST   enumerate running processes;
- *   ATTACH resolve target, inject libgreen_agent.so when needed, deploy
- *          the hook script and evaluate it, then stream script logs back
- *          to the host while the broker channel stays attached;
- *   SPAWN  reserved (not implemented yet).
+ *   LIST            enumerate running processes;
+ *   ATTACH          inject the payload when needed, deploy and evaluate
+ *                   the hook script, then stream script logs and serve
+ *                   REPL evaluations until the host disconnects;
+ *   SPAWN           reserved;
+ *   SHADOW_PATCH / SHADOW_RELEASE / SHADOW_COUNT
+ *                   hidden patch operations (privileged prctl);
+ *   SOLIST          module enumeration of a target;
+ *   EVAL / KILL     standalone evaluation / process kill.
  *
  * Wire protocol (see include/green/wire.h): frames of
  *   u32 magic, u16 type, u16 flags, u32 payload_len, payload
@@ -23,6 +28,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -108,7 +114,7 @@ static int send_result(int fd, int32_t ok, int64_t value, const char *msg)
     if (len > sizeof(buf) - 20)
         len = sizeof(buf) - 20;
     put_u32(buf + 0, (uint32_t)ok);
-    put_u32(buf + 4, 0); /* reserved */
+    put_u32(buf + 4, 0);
     put_u32(buf + 8, (uint32_t)(uint64_t)value);
     put_u32(buf + 12, (uint32_t)((uint64_t)value >> 32));
     put_u32(buf + 16, len);
@@ -203,6 +209,81 @@ static int handle_list(int fd)
  * u32 script_len | script bytes. */
 #define ATTACH_HDR 137
 
+/* Serve the broker channel: PATCH/RELEASE/COUNT requests from the payload
+ * and one-way script log frames; the latter are relayed to the host. */
+static int session_broker_step(struct session *s, int broker_fd)
+{
+    return green_agentops_broker_serve_one(s->pid, broker_fd, session_log_cb,
+                                           s);
+}
+
+/* Evaluate a JS snippet in the target's persistent QuickJS context.  The
+ * code travels through a well-known file next to the hook script. */
+static void write_eval_file(pid_t pid, const char *code)
+{
+    char cmdline[128];
+    char path[300];
+    int r;
+
+    if (green_agentops_read_cmdline(pid, cmdline, sizeof(cmdline)) != 0)
+        return;
+    green_agentops_target_path(cmdline, "green_eval.js", path, sizeof(path));
+    r = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (r < 0)
+        return;
+    write_full_fd(r, code, strlen(code));
+    close(r);
+}
+
+/* Evaluate with the given broker channel; sends the RESULT frame. */
+static void eval_with_broker(int fd, struct session *s, int broker_fd,
+                             const char *code)
+{
+    struct green_agent_response response;
+    int cmd_fd = -1;
+
+    write_eval_file(s->pid, code);
+    cmd_fd = green_agentops_connect(s->pid);
+    if (cmd_fd < 0) {
+        send_result(fd, 0, 0, "cannot connect to agent");
+        return;
+    }
+    if (green_agentops_send_request(cmd_fd, GREEN_AGENT_TOOL_JS,
+                                    GREEN_AGENT_CMD_JS_EVAL, 0, 0, 0) != 0) {
+        send_result(fd, 0, 0, "agent request failed");
+        close(cmd_fd);
+        return;
+    }
+    for (;;) {
+        struct pollfd fds[2] = {
+            { .fd = broker_fd, .events = POLLIN },
+            { .fd = cmd_fd, .events = POLLIN },
+        };
+
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (fds[0].revents & POLLIN) {
+            if (session_broker_step(s, broker_fd) != 0)
+                break;
+        }
+        if (fds[1].revents & POLLIN) {
+            if (green_agentops_read_response(cmd_fd, &response) != 0)
+                break;
+            pthread_mutex_lock(&s->send_lock);
+            send_result(fd, response.status == 0 ? 1 : 0,
+                        (int64_t)response.value, response.message);
+            pthread_mutex_unlock(&s->send_lock);
+            break;
+        }
+    }
+    close(cmd_fd);
+}
+
+/* ATTACH: resolve target, inject when needed, deploy + evaluate the
+ * script, then stream logs and serve REPL evals until disconnect. */
 static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
 {
     struct session s;
@@ -234,6 +315,7 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
 
     memset(&s, 0, sizeof(s));
     s.host_fd = fd;
+    s.pid = (pid_t)pid;
     pthread_mutex_init(&s.send_lock, NULL);
 
     if (has_package) {
@@ -245,8 +327,8 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
             return;
         }
         pid = (int32_t)found;
+        s.pid = found;
     }
-    s.pid = (pid_t)pid;
 
     if (green_agentops_ensure_injected(s.pid, err, sizeof(err)) != 0) {
         send_result(fd, 0, 0, err);
@@ -280,8 +362,7 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
         goto out;
     }
 
-    /* Serve broker traffic while the LOAD request runs (hook() inside the
-     * script blocks on its PATCH response). */
+    /* Serve broker traffic while the LOAD request runs. */
     for (;;) {
         struct pollfd fds[2] = {
             { .fd = broker_fd, .events = POLLIN },
@@ -294,8 +375,7 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
             break;
         }
         if (fds[0].revents & POLLIN) {
-            if (green_agentops_broker_serve_one(s.pid, broker_fd,
-                                                session_log_cb, &s) != 0)
+            if (session_broker_step(&s, broker_fd) != 0)
                 break;
         }
         if (fds[1].revents & POLLIN) {
@@ -311,11 +391,46 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
     }
 
     if (ok) {
-        /* Keep streaming script logs until the host disconnects. */
+        /* Steady state: stream logs and serve REPL evals. */
         for (;;) {
-            if (green_agentops_broker_serve_one(s.pid, broker_fd,
-                                                session_log_cb, &s) != 0)
+            struct pollfd fds[2] = {
+                { .fd = broker_fd, .events = POLLIN },
+                { .fd = fd, .events = POLLIN },
+            };
+
+            if (poll(fds, 2, -1) < 0) {
+                if (errno == EINTR)
+                    continue;
                 break;
+            }
+            if (fds[0].revents & POLLIN) {
+                if (session_broker_step(&s, broker_fd) != 0)
+                    break;
+            }
+            if (fds[1].revents & POLLIN) {
+                unsigned char header[12];
+                unsigned char *pl;
+                uint32_t magic, plen;
+                uint16_t type;
+
+                if (read_full_fd(fd, header, sizeof(header)) != 0)
+                    break;
+                magic = get_u32(header + 0);
+                type = (uint16_t)(get_u32(header + 4) & 0xffff);
+                plen = get_u32(header + 8);
+                if (magic != GREEN_WIRE_MAGIC || plen > 4u * 1024 * 1024)
+                    break;
+                pl = malloc(plen ? plen : 1);
+                if (!pl)
+                    break;
+                if (plen != 0 && read_full_fd(fd, pl, plen) != 0) {
+                    free(pl);
+                    break;
+                }
+                if (type == GREEN_WIRE_EVAL)
+                    eval_with_broker(fd, &s, broker_fd, (const char *)pl);
+                free(pl);
+            }
         }
     }
 
@@ -327,53 +442,7 @@ out:
         close(broker_fd);
 }
 
-
 /* ---- host-driven shadow operations (run here, on the device, as root) */
-
-struct module_list_ctx {
-    unsigned char *buf;
-    size_t cap;
-    size_t used;
-    uint32_t count;
-};
-
-static int module_list_cb(const char *name, unsigned long base,
-                          unsigned long size, void *ud)
-{
-    struct module_list_ctx *m = ud;
-    size_t name_len = strlen(name);
-    size_t need = 8 + 2 + name_len;
-
-    if (m->used + need + 16 > m->cap) {
-        m->cap = m->cap * 2 + need;
-        m->buf = realloc(m->buf, m->cap);
-        if (!m->buf)
-            return -1;
-    }
-    m->buf[m->used++] = (unsigned char)(base & 0xff);
-    m->buf[m->used++] = (unsigned char)((base >> 8) & 0xff);
-    m->buf[m->used++] = (unsigned char)((base >> 16) & 0xff);
-    m->buf[m->used++] = (unsigned char)((base >> 24) & 0xff);
-    m->buf[m->used++] = (unsigned char)((base >> 32) & 0xff);
-    m->buf[m->used++] = (unsigned char)((base >> 40) & 0xff);
-    m->buf[m->used++] = (unsigned char)((base >> 48) & 0xff);
-    m->buf[m->used++] = (unsigned char)((base >> 56) & 0xff);
-    /* size stored as u64 */
-    m->buf[m->used++] = (unsigned char)(size & 0xff);
-    m->buf[m->used++] = (unsigned char)((size >> 8) & 0xff);
-    m->buf[m->used++] = (unsigned char)((size >> 16) & 0xff);
-    m->buf[m->used++] = (unsigned char)((size >> 24) & 0xff);
-    m->buf[m->used++] = (unsigned char)((size >> 32) & 0xff);
-    m->buf[m->used++] = (unsigned char)((size >> 40) & 0xff);
-    m->buf[m->used++] = (unsigned char)((size >> 48) & 0xff);
-    m->buf[m->used++] = (unsigned char)((size >> 56) & 0xff);
-    m->buf[m->used++] = (unsigned char)(name_len & 0xff);
-    m->buf[m->used++] = (unsigned char)((name_len >> 8) & 0xff);
-    memcpy(m->buf + m->used, name, name_len);
-    m->used += name_len;
-    m->count++;
-    return 0;
-}
 
 static void handle_shadow_patch(int fd, const unsigned char *payload,
                                 uint32_t len)
@@ -441,15 +510,46 @@ static void handle_shadow_count(int fd, const unsigned char *payload,
         send_result(fd, 1, ret, "ok");
 }
 
+struct module_list_ctx {
+    unsigned char *buf;
+    size_t cap;
+    size_t used;
+    uint32_t count;
+};
+
+static int module_list_cb(const char *name, unsigned long base,
+                          unsigned long size, void *ud)
+{
+    struct module_list_ctx *m = ud;
+    size_t name_len = strlen(name);
+    size_t need = 18 + name_len;
+
+    if (m->used + need + 32 > m->cap) {
+        m->cap = m->cap * 2 + need;
+        m->buf = realloc(m->buf, m->cap);
+        if (!m->buf)
+            return -1;
+    }
+    put_u32(m->buf + m->used + 0, (uint32_t)base);
+    put_u32(m->buf + m->used + 4, (uint32_t)((uint64_t)base >> 32));
+    put_u32(m->buf + m->used + 8, (uint32_t)size);
+    put_u32(m->buf + m->used + 12, (uint32_t)((uint64_t)size >> 32));
+    m->buf[m->used + 16] = (unsigned char)(name_len & 0xff);
+    m->buf[m->used + 17] = (unsigned char)((name_len >> 8) & 0xff);
+    memcpy(m->buf + m->used + 18, name, name_len);
+    m->used += need;
+    m->count++;
+    return 0;
+}
+
+/* SOLIST payload: i32 pid | u8 has_name | char name[128]. */
 static void handle_solist(int fd, const unsigned char *payload, uint32_t len)
 {
-    /* payload: i32 pid | u8 has_name | char name[128] (133 bytes, packed) */
-    const uint32_t SOLIST_HDR = 133;
     struct module_list_ctx m;
     int32_t pid;
     uint32_t count;
 
-    if (len < SOLIST_HDR)
+    if (len < 133)
         return;
     pid = (int32_t)get_u32(payload + 0);
 
@@ -458,7 +558,6 @@ static void handle_solist(int fd, const unsigned char *payload, uint32_t len)
     m.buf = malloc(m.cap);
     if (!m.buf)
         return;
-    put_u32(m.buf, 0);
     m.used = 4;
 
     if (green_cli_list_solist((pid_t)pid, module_list_cb, &m) == 0) {
@@ -469,6 +568,73 @@ static void handle_solist(int fd, const unsigned char *payload, uint32_t len)
         send_result(fd, 0, 0, "solist enumeration failed");
     }
     free(m.buf);
+}
+
+/* EVAL payload: i32 pid | u32 code_len | code bytes. */
+static void handle_standalone_eval(int fd, const unsigned char *payload,
+                                   uint32_t len)
+{
+    int32_t pid;
+    uint32_t code_len;
+    char *code;
+    struct green_agent_response response;
+    int broker_fd = -1;
+    int cmd_fd = -1;
+    struct session s;
+
+    if (len < 8)
+        return;
+    pid = (int32_t)get_u32(payload + 0);
+    code_len = get_u32(payload + 4);
+    if ((uint32_t)code_len > len - 8)
+        return;
+    code = malloc((size_t)code_len + 1);
+    if (!code)
+        return;
+    memcpy(code, payload + 8, code_len);
+    code[code_len] = '\0';
+
+    if (!green_agentops_ping_ok((pid_t)pid)) {
+        send_result(fd, 0, 0, "target is not attached (use `attach` first)");
+        free(code);
+        return;
+    }
+
+    memset(&s, 0, sizeof(s));
+    s.host_fd = fd;
+    s.pid = (pid_t)pid;
+    pthread_mutex_init(&s.send_lock, NULL);
+
+    broker_fd = green_agentops_connect((pid_t)pid);
+    if (broker_fd < 0 ||
+        green_agentops_broker_attach((pid_t)pid, broker_fd) != 0) {
+        if (broker_fd >= 0)
+            close(broker_fd);
+        send_result(fd, 0, 0, "broker attach failed");
+        free(code);
+        return;
+    }
+
+    eval_with_broker(fd, &s, broker_fd, code);
+
+    free(code);
+    if (cmd_fd >= 0)
+        close(cmd_fd);
+    if (broker_fd >= 0)
+        close(broker_fd);
+}
+
+static void handle_kill(int fd, const unsigned char *payload, uint32_t len)
+{
+    int32_t pid;
+
+    if (len < 4)
+        return;
+    pid = (int32_t)get_u32(payload + 0);
+    if (kill(pid, SIGKILL) == 0)
+        send_result(fd, 1, 0, "killed");
+    else
+        send_result(fd, 0, 0, strerror(errno));
 }
 
 static void *conn_main(void *arg)
@@ -518,6 +684,12 @@ static void *conn_main(void *arg)
             break;
         case GREEN_WIRE_SOLIST:
             handle_solist(fd, payload, len);
+            break;
+        case GREEN_WIRE_EVAL:
+            handle_standalone_eval(fd, payload, len);
+            break;
+        case GREEN_WIRE_KILL:
+            handle_kill(fd, payload, len);
             break;
         default:
             break;

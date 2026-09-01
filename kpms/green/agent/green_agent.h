@@ -26,6 +26,8 @@ enum green_agent_tool_id {
 enum green_agent_js_command {
     GREEN_AGENT_CMD_JS_LOAD = 1, /* eval the script at the well-known path */
     GREEN_AGENT_CMD_JS_CALL = 2, /* call the probe; returns the hooked value */
+    GREEN_AGENT_CMD_JS_EVAL = 3, /* evaluate response.arg0 as global JS code;
+                                  * message carries the JSON result (truncated) */
 };
 
 enum green_agent_core_command {
@@ -102,6 +104,19 @@ enum green_broker_command {
     /* Agent -> server, one-way (never answered): script console output and
      * send() payloads; len bytes of UTF-8 text follow the header. */
     GREEN_BROKER_LOG = 4,
+    /* Interceptor.attach: addr = target; a green_hook_attach_req follows. */
+    GREEN_BROKER_HOOK_ATTACH = 6,
+};
+
+/* Interceptor.attach support: the server relocates the target's prologue
+ * into the caller-provided r-x slot and redirects the entry to it via the
+ * slot dispatch stub (which publishes hook_id through id_addr). */
+struct green_hook_attach_req {
+    uint64_t slot;         /* r-x slot page in the target */
+    uint64_t shared_tramp; /* payload shared attach trampoline */
+    uint64_t id_addr;      /* payload u32 global receiving the hook id */
+    uint32_t hook_id;
+    uint32_t reserved;
 };
 
 struct green_broker_request {
