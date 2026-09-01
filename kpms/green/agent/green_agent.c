@@ -66,7 +66,7 @@ static const char kGreenPrelude[] =
     "var Module = {\n"
     "    enumerateModulesSync: __green_modules,\n"
     "    getBaseAddress: function (name) {\n"
-    "        var ms = __green_parse_maps();\n"
+    "        var ms = __green_modules();\n"
     "        for (var i = 0; i < ms.length; i++)\n"
     "            if (ms[i].name === name || ms[i].path === name)\n"
     "                return ms[i].base;\n"
