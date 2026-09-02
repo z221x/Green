@@ -66,9 +66,63 @@ int green_shadow_detect_paging(void)
     return 0;
 }
 
+/* Splits a block descriptor (2MB/1GB) at `table[idx]` into a next-level
+ * page table so the shadow engine can operate on 4K entries.  Returns the
+ * next-level table, or 0 on failure. */
+static u64 *green_shadow_split_block(u64 *table, unsigned long addr,
+                                     int shift, u64 block_desc)
+{
+    u64 *next_table;
+    unsigned long next_pa, next_va;
+    u64 block_pa, block_attr, page_attr;
+    int i;
+
+    next_table = (u64 *)green_k_get_free_pages(GREEN_GFP_KERNEL, 0);
+    if (!next_table)
+        return 0;
+    memset(next_table, 0, GREEN_PAGE_SIZE);
+
+    /* Expand the block into next-level entries preserving attributes:
+     * block bits [47:12] hold the block base; each entry covers
+     * (1 << (shift - 9)) bytes.  Keep everything except VALID+TYPE
+     * and drop the CONT hint on the derived entries. */
+    block_pa = block_desc & GREEN_PTE_ADDR_MASK;
+    if (shift == GREEN_PAGE_SHIFT + 9)
+        page_attr = block_desc & ~(u64)GREEN_PTE_ADDR_MASK;
+    else
+        page_attr = (block_desc & ~(u64)GREEN_PTE_ADDR_MASK) & ~(1UL << 52);
+
+    for (i = 0; i < 512; i++) {
+        next_table[i] = (block_pa + ((unsigned long)i << (shift - 9))) |
+                        page_attr | PTE_TYPE_PAGE;
+    }
+
+    /* Publish the new table, then swap the descriptor atomically. */
+    next_pa = green_kva_to_phys((unsigned long)next_table);
+    asm volatile("dsb ish" ::: "memory");
+    table[(addr >> shift) & GREEN_PTE_INDEX_MASK] =
+        (next_pa & GREEN_PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE_BIT;
+    /* Invalidate the whole block region: other CPUs may hold stale
+     * block-level translations after the split. */
+    {
+        unsigned long blk_start = addr & ~((1UL << (shift + 9)) - 1);
+        unsigned long va;
+        for (va = blk_start; va < blk_start + (1UL << (shift + 9));
+             va += GREEN_PAGE_SIZE)
+            green_shadow_flush_tlb(va);
+    }
+
+    next_va = green_phys_to_kva(next_pa);
+    if (!green_is_kva(next_va)) {
+        return 0;
+    }
+    return next_table;
+}
+
 u64 *green_shadow_get_pte(void *mm, unsigned long addr)
 {
     u64 *table;
+    u64 *next_table;
     int shift;
 
     addr = green_strip_tag(addr);
@@ -81,15 +135,31 @@ u64 *green_shadow_get_pte(void *mm, unsigned long addr)
         unsigned long next_pa;
         unsigned long next_va;
 
-        if (!(desc & PTE_VALID))
+        if (!(desc & PTE_VALID)) {
+            pr_err("green_shadow: get_pte: invalid desc at shift=%d va=%lx desc=%llx\n",
+                   shift, addr, desc);
             return 0;
-        if (!(desc & PTE_TABLE_BIT))
-            return 0;
+        }
+        if (!(desc & PTE_TABLE_BIT)) {
+            /* Block mapping (e.g. shared file-backed exec pages of
+             * system libs): split into a next-level table in place. */
+            next_table = green_shadow_split_block(table, addr, shift, desc);
+            if (!next_table) {
+                pr_err("green_shadow: get_pte: split failed at shift=%d va=%lx\n",
+                       shift, addr);
+                return 0;
+            }
+            table = next_table;
+            continue;
+        }
 
         next_pa = desc & GREEN_PTE_ADDR_MASK;
         next_va = green_phys_to_kva(next_pa);
-        if (!green_is_kva(next_va))
+        if (!green_is_kva(next_va)) {
+            pr_err("green_shadow: get_pte: bad next_va at shift=%d va=%lx pa=%lx\n",
+                   shift, addr, next_pa);
             return 0;
+        }
         table = (u64 *)next_va;
     }
 

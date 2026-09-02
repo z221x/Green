@@ -14,6 +14,55 @@
  * memory primitive.  In-process dereferences ignore the tag (TBI) anyway. */
 #define GREEN_UNTAG(p) ((uint64_t)(p) & 0x00ffffffffffffffULL)
 
+/* Apps (untrusted_app domain) cannot open /proc/self/mem — validate
+ * addresses against cached /proc/self/maps and use plain memcpy. */
+struct green_range { uint64_t lo, hi; int prot; };
+static struct green_range g_maps_ranges[4096];
+static int g_maps_count;
+
+static void green_maps_refresh(void)
+{
+    FILE *f = fopen("/proc/self/maps", "re");
+    char line[512];
+    int n = 0;
+
+    g_maps_count = 0;
+    if (f == NULL)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL && n < 4096) {
+        unsigned long long lo, hi;
+        char perms[8];
+        if (sscanf(line, "%llx-%llx %4s", &lo, &hi, perms) != 3)
+            continue;
+        g_maps_ranges[n].lo = lo;
+        g_maps_ranges[n].hi = hi;
+        g_maps_ranges[n].prot = (perms[0] == 'r' ? 1 : 0) |
+                                (perms[1] == 'w' ? 2 : 0) |
+                                (perms[2] == 'x' ? 4 : 0);
+        n++;
+    }
+    fclose(f);
+    g_maps_count = n;
+}
+
+static int green_addr_ok(uint64_t addr, size_t len, int need)
+{
+    int i;
+
+    if (len == 0 || addr == 0)
+        return 0;
+    for (i = 0; i < g_maps_count; i++) {
+        if (addr >= g_maps_ranges[i].lo &&
+            addr + len <= g_maps_ranges[i].hi &&
+            (g_maps_ranges[i].prot & need) == need)
+            return 1;
+    }
+    return 0;
+}
+
+#define GREEN_PROT_R 1
+#define GREEN_PROT_W 2
+
 /* dlopen() handle table: PAC-signed soinfo pointers cannot survive a JS
  * Number round-trip, so scripts only ever see 1-based table IDs. */
 #define GREEN_MAX_DLH 64
@@ -75,6 +124,7 @@ static JSValue js_native_broker_log(JSContext *ctx, JSValueConst this_val, int a
 /* Frida-style API layer, evaluated once before any user script.  Native
  * primitives (__green_*) are registered in js_ensure_runtime(). */
 #include "prelude.inc"
+#include "fjb.inc"
 
 /* The shadow redirect lands here.  Runs the registered JS callback with the
  * live register arguments (x0-x7) and returns its result to the caller. */
@@ -152,7 +202,503 @@ static JSValue js_native_new_callback(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
 static JSValue js_native_mem_write(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
-void green_java_register_natives(JSContext *ctx, JSValue global);
+
+/* ====================================================================== */
+/* frida-java-bridge host compatibility                                   */
+/* ====================================================================== */
+
+#include <elf.h>
+#include "gumjs/gumcmodule.h"
+
+static void *green_module_dlsym(const char *mod_name, const char *sym_name)
+{
+    FILE *maps;
+    char line[512];
+    unsigned long long base = 0;
+
+    maps = fopen("/proc/self/maps", "re");
+    if (maps == NULL)
+        return NULL;
+    while (fgets(line, sizeof(line), maps) != NULL) {
+        if (strstr(line, mod_name) != NULL) {
+            unsigned long long start;
+            unsigned long off;
+            if (sscanf(line, "%llx-%*llx %*s %lx", &start, &off) == 2 &&
+                off == 0) {
+                base = start;
+                break;
+            }
+        }
+    }
+    fclose(maps);
+    if (base == 0)
+        return NULL;
+
+    {
+        Elf64_Ehdr *eh = (Elf64_Ehdr *)base;
+        Elf64_Phdr *ph = (Elf64_Phdr *)(base + eh->e_phoff);
+        Elf64_Dyn *dyn = NULL;
+        Elf64_Sym *symtab = NULL;
+        const char *strtab = NULL;
+        uint64_t hash = 0, gnu_hash = 0, strsz = 0;
+        uint32_t nsyms = 0;
+        int i;
+
+        if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0)
+            return NULL;
+        for (i = 0; i < eh->e_phnum; i++)
+            if (ph[i].p_type == PT_DYNAMIC)
+                dyn = (Elf64_Dyn *)(base + ph[i].p_vaddr);
+        if (dyn == NULL)
+            return NULL;
+        for (; dyn->d_tag != DT_NULL; dyn++) {
+            switch (dyn->d_tag) {
+            case DT_SYMTAB: symtab = (Elf64_Sym *)(base + dyn->d_un.d_ptr); break;
+            case DT_STRTAB: strtab = (const char *)(base + dyn->d_un.d_ptr); break;
+            case DT_STRSZ:  strsz = dyn->d_un.d_ptr; break;
+            case DT_HASH:   hash = dyn->d_un.d_ptr; break;
+            case DT_GNU_HASH: gnu_hash = dyn->d_un.d_ptr; break;
+            }
+        }
+        if (symtab == NULL || strtab == NULL)
+            return NULL;
+        if (strsz == 0)
+            strsz = 0x100000;
+
+        if (hash != 0)
+            nsyms = ((uint32_t *)(base + hash))[1];
+        else if (gnu_hash != 0)
+            nsyms = (uint32_t)((const uint8_t *)strtab
+                - (const uint8_t *)symtab) / sizeof(Elf64_Sym);
+        if (nsyms == 0 || nsyms > 400000)
+            return NULL;
+        for (i = 0; i < (int)nsyms; i++) {
+            if (symtab[i].st_name == 0 ||
+                (uint64_t)symtab[i].st_name >= strsz)
+                continue;
+            if (strcmp(strtab + symtab[i].st_name, sym_name) == 0 &&
+                symtab[i].st_value != 0)
+                return (void *)(base + symtab[i].st_value);
+        }
+    }
+    return NULL;
+}
+
+/* __green_module_list_imports(moduleName) -> [{name, address}]
+ * address is the GOT/PLT slot VA; the runtime has already resolved it. */
+static JSValue js_module_list_imports(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    const char *mod_name;
+    unsigned long long base = 0;
+    JSValue arr;
+    FILE *maps;
+    char line[512];
+    Elf64_Ehdr *eh;
+    Elf64_Phdr *ph;
+    Elf64_Dyn *dyn = NULL;
+    Elf64_Rela *rela = NULL, *jmprel = NULL;
+    Elf64_Sym *symtab = NULL;
+    const char *strtab = NULL;
+    uint64_t strsz = 0, relasz = 0, pltrelsz = 0;
+    size_t relaent = sizeof(Elf64_Rela);
+    int i, n = 0;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_NewArray(ctx);
+    mod_name = JS_ToCString(ctx, argv[0]);
+    if (mod_name == NULL)
+        return JS_NewArray(ctx);
+
+    maps = fopen("/proc/self/maps", "re");
+    if (maps != NULL) {
+        while (fgets(line, sizeof(line), maps) != NULL) {
+            if (strstr(line, mod_name) != NULL) {
+                unsigned long long start;
+                unsigned long off;
+                if (sscanf(line, "%llx-%*llx %*s %lx", &start, &off) == 2 &&
+                    off == 0) {
+                    base = start;
+                    break;
+                }
+            }
+        }
+        fclose(maps);
+    }
+    arr = JS_NewArray(ctx);
+    if (base == 0) {
+        JS_FreeCString(ctx, mod_name);
+        return arr;
+    }
+
+    eh = (Elf64_Ehdr *)base;
+    ph = (Elf64_Phdr *)(base + eh->e_phoff);
+    for (i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_DYNAMIC)
+            dyn = (Elf64_Dyn *)(base + ph[i].p_vaddr);
+    if (dyn == NULL) {
+        JS_FreeCString(ctx, mod_name);
+        return arr;
+    }
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        switch (dyn->d_tag) {
+        case DT_RELA:   rela = (Elf64_Rela *)(base + dyn->d_un.d_ptr); break;
+        case DT_RELASZ: relasz = dyn->d_un.d_val; break;
+        case DT_JMPREL: jmprel = (Elf64_Rela *)(base + dyn->d_un.d_ptr); break;
+        case DT_PLTRELSZ: pltrelsz = dyn->d_un.d_val; break;
+        case DT_SYMTAB: symtab = (Elf64_Sym *)(base + dyn->d_un.d_ptr); break;
+        case DT_STRTAB: strtab = (const char *)(base + dyn->d_un.d_ptr); break;
+        case DT_STRSZ:  strsz = dyn->d_un.d_val; break;
+        case DT_RELAENT: relaent = (size_t)dyn->d_un.d_val; break;
+        }
+    }
+    if (strtab == NULL || symtab == NULL || strsz == 0) {
+        JS_FreeCString(ctx, mod_name);
+        return arr;
+    }
+
+    for (i = 0; i < 2; i++) {
+        Elf64_Rela *r = (i == 0) ? jmprel : rela;
+        uint64_t rsz = (i == 0) ? pltrelsz : relasz;
+        size_t cnt, k;
+
+        if (r == NULL || rsz == 0)
+            continue;
+        cnt = rsz / relaent;
+        if (cnt > 20000)
+            cnt = 20000;
+        for (k = 0; k < cnt && n < 20000; k++) {
+            uint32_t sym_idx = (uint32_t)(ELF64_R_SYM(r[k].r_info));
+            const char *name = (sym_idx != 0 &&
+                symtab[sym_idx].st_name < strsz)
+                ? strtab + symtab[sym_idx].st_name : NULL;
+            if (name == NULL || name[0] == 0)
+                continue;
+            {
+                JSValue o = JS_NewObject(ctx);
+                JS_SetPropertyStr(ctx, o, "name", JS_NewString(ctx, name));
+                JS_SetPropertyStr(ctx, o, "address",
+                    JS_NewInt64(ctx, (int64_t)(base + r[k].r_offset)));
+                JS_SetPropertyUint32(ctx, arr, (uint32_t)n++, o);
+            }
+        }
+    }
+    JS_FreeCString(ctx, mod_name);
+    return arr;
+}
+
+static JSValue js_find_export_any(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    static const char *candidates[] = {
+        "libart.so", "libnativehelper.so", "libandroid_runtime.so",
+        "libartbase.so", "libc.so", NULL,
+    };
+    const char *name;
+    void *sym = NULL;
+    int i;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_NULL;
+    name = JS_ToCString(ctx, argv[0]);
+    if (name == NULL)
+        return JS_NULL;
+    sym = dlsym(RTLD_DEFAULT, name);
+    for (i = 0; sym == NULL && candidates[i] != NULL; i++)
+        sym = green_module_dlsym(candidates[i], name);
+    JS_FreeCString(ctx, name);
+    return sym ? JS_NewInt64(ctx, (int64_t)(uintptr_t)sym) : JS_NULL;
+}
+
+static JSValue js_icache_flush(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    uint64_t address = 0;
+    int64_t length = 0;
+
+    (void)this_val;
+    if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0 ||
+        JS_ToInt64(ctx, &length, argv[1]) != 0)
+        return JS_FALSE;
+    address = GREEN_UNTAG(address);
+    __builtin___clear_cache((char *)(uintptr_t)address,
+                            (char *)(uintptr_t)(address + (uint64_t)length));
+    return JS_TRUE;
+}
+
+static JSValue js_native_getuid(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt64(ctx, (int64_t)getuid());
+}
+
+static JSValue js_module_list_syms(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    const char *mod_name, *mod_path = NULL;
+    int dynsym_only = 0;
+    unsigned long long base = 0;
+    JSValue arr;
+    FILE *maps, *f = NULL;
+    char line[512];
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_NewArray(ctx);
+    mod_name = JS_ToCString(ctx, argv[0]);
+    if (mod_name == NULL)
+        return JS_NewArray(ctx);
+    if (argc >= 2)
+        JS_ToInt32(ctx, &dynsym_only, argv[1]);
+
+    maps = fopen("/proc/self/maps", "re");
+    if (maps != NULL) {
+        while (fgets(line, sizeof(line), maps) != NULL) {
+            if (strstr(line, mod_name) != NULL) {
+                unsigned long long start;
+                unsigned long off;
+                char path[512] = {0};
+                if (sscanf(line, "%llx-%*llx %*s %lx %*x:%*x %*llu %511s",
+                           &start, &off, path) >= 2) {
+                    if (off == 0 && base == 0)
+                        base = start;
+                    if (path[0] == '/' && mod_path == NULL)
+                        mod_path = strdup(path);
+                }
+            }
+        }
+        fclose(maps);
+    }
+    arr = JS_NewArray(ctx);
+    if (base == 0) {
+        JS_FreeCString(ctx, mod_name);
+        return arr;
+    }
+
+    if (dynsym_only) {
+        Elf64_Ehdr *eh = (Elf64_Ehdr *)base;
+        Elf64_Phdr *ph = (Elf64_Phdr *)(base + eh->e_phoff);
+        Elf64_Dyn *dyn = NULL;
+        Elf64_Sym *symtab = NULL;
+        const char *strtab = NULL;
+        uint64_t hash = 0, gnu_hash = 0, strsz = 0;
+        uint32_t nsyms = 0;
+        int i, n = 0;
+
+        for (i = 0; i < eh->e_phnum; i++)
+            if (ph[i].p_type == PT_DYNAMIC)
+                dyn = (Elf64_Dyn *)(base + ph[i].p_vaddr);
+        if (dyn != NULL) {
+            for (; dyn->d_tag != DT_NULL; dyn++) {
+                switch (dyn->d_tag) {
+                case DT_SYMTAB: symtab = (Elf64_Sym *)(base + dyn->d_un.d_ptr); break;
+                case DT_STRTAB: strtab = (const char *)(base + dyn->d_un.d_ptr); break;
+                case DT_STRSZ:  strsz = dyn->d_un.d_ptr; break;
+                case DT_HASH:   hash = dyn->d_un.d_ptr; break;
+                case DT_GNU_HASH: gnu_hash = dyn->d_un.d_ptr; break;
+                }
+            }
+            if (strsz == 0)
+                strsz = 0x400000;
+            if (hash != 0)
+                nsyms = ((uint32_t *)(base + hash))[1];
+            else if (gnu_hash != 0 && strtab != NULL && symtab != NULL)
+                nsyms = (uint32_t)((const uint8_t *)strtab
+                    - (const uint8_t *)symtab) / sizeof(Elf64_Sym);
+            if (nsyms > 200000)
+                nsyms = 200000;
+            for (i = 0; i < (int)nsyms && n < 200000; i++) {
+                if (symtab[i].st_name == 0 || symtab[i].st_value == 0 ||
+                    (uint64_t)symtab[i].st_name >= strsz)
+                    continue;
+                JSValue o = JS_NewObject(ctx);
+                JS_SetPropertyStr(ctx, o, "name",
+                    JS_NewString(ctx, strtab + symtab[i].st_name));
+                JS_SetPropertyStr(ctx, o, "address",
+                    JS_NewInt64(ctx, (int64_t)(base + symtab[i].st_value)));
+                JS_SetPropertyUint32(ctx, arr, (uint32_t)n++, o);
+            }
+        }
+    } else if (mod_path != NULL) {
+        f = fopen(mod_path, "re");
+        if (f != NULL) {
+            Elf64_Ehdr eh;
+            if (fread(&eh, sizeof(eh), 1, f) == 1 &&
+                memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0 &&
+                eh.e_shoff != 0) {
+                Elf64_Shdr *sh = malloc(eh.e_shentsize * eh.e_shnum);
+                if (sh != NULL &&
+                    fseek(f, (long)eh.e_shoff, SEEK_SET) == 0 &&
+                    fread(sh, eh.e_shentsize, eh.e_shnum, f) == eh.e_shnum) {
+                    Elf64_Shdr *symh = NULL, *strh = NULL;
+                    int i;
+                    for (i = 0; i < eh.e_shnum; i++) {
+                        if (sh[i].sh_type == SHT_SYMTAB) {
+                            symh = &sh[i];
+                            strh = &sh[symh->sh_link];
+                            break;
+                        }
+                    }
+                    if (symh != NULL && strh != NULL) {
+                        Elf64_Sym *syms = malloc(symh->sh_size);
+                        char *strs = malloc(strh->sh_size);
+                        int n = 0;
+                        if (syms != NULL && strs != NULL &&
+                            fseek(f, (long)symh->sh_offset, SEEK_SET) == 0 &&
+                            fread(syms, 1, symh->sh_size, f) == symh->sh_size &&
+                            fseek(f, (long)strh->sh_offset, SEEK_SET) == 0 &&
+                            fread(strs, 1, strh->sh_size, f) == strh->sh_size) {
+                            size_t cnt = symh->sh_size / sizeof(Elf64_Sym);
+                            for (i = 0; i < (int)cnt && n < 200000; i++) {
+                                if (syms[i].st_name == 0 ||
+                                    syms[i].st_name >= strh->sh_size ||
+                                    syms[i].st_value == 0 ||
+                                    ELF64_ST_TYPE(syms[i].st_info) ==
+                                        STT_FILE)
+                                    continue;
+                                JSValue o = JS_NewObject(ctx);
+                                JS_SetPropertyStr(ctx, o, "name",
+                                    JS_NewString(ctx, strs + syms[i].st_name));
+                                JS_SetPropertyStr(ctx, o, "address",
+                                    JS_NewInt64(ctx,
+                                        (int64_t)(base + syms[i].st_value)));
+                                JS_SetPropertyUint32(ctx, arr,
+                                    (uint32_t)n++, o);
+                            }
+                        }
+                        free(syms);
+                        free(strs);
+                    }
+                }
+                free(sh);
+            }
+            fclose(f);
+        }
+    }
+    free(mod_path);
+    JS_FreeCString(ctx, mod_name);
+    return arr;
+}
+
+#define GREEN_MAX_CMOD 8
+static GumCModule *g_cmods[GREEN_MAX_CMOD];
+
+static JSValue js_cmodule_new(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    const char *source;
+    GError *err = NULL;
+    GumCModule *cm;
+    int i, slot = -1;
+
+    (void)this_val;
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowInternalError(ctx, "CModule(source, symbols)");
+    for (i = 0; i < GREEN_MAX_CMOD; i++)
+        if (g_cmods[i] == NULL) { slot = i; break; }
+    if (slot < 0)
+        return JS_ThrowInternalError(ctx, "too many CModules");
+    source = JS_ToCString(ctx, argv[0]);
+    if (source == NULL)
+        return JS_EXCEPTION;
+    {
+        /* gum dereferences options unconditionally — pass ANY toolchain */
+        GumCModuleOptions opts;
+        opts.toolchain = GUM_CMODULE_TOOLCHAIN_ANY;
+        cm = gum_cmodule_new(source, NULL, &opts, &err);
+    }
+    JS_FreeCString(ctx, source);
+    if (cm == NULL) {
+        JSValue e = JS_ThrowInternalError(ctx, "CModule compile: %s",
+            err && err->message ? err->message : "?");
+        if (err)
+            g_error_free(err);
+        return e;
+    }
+    g_cmods[slot] = cm;
+    return JS_NewInt32(ctx, slot);
+}
+
+static GumCModule *cmod_get(int h)
+{
+    return (h >= 0 && h < GREEN_MAX_CMOD) ? g_cmods[h] : NULL;
+}
+
+static JSValue js_cmodule_add_symbol(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    int h = -1;
+    const char *name;
+    int64_t value = 0;
+    GumCModule *cm;
+
+    (void)this_val;
+    if (argc < 3 || JS_ToInt32(ctx, &h, argv[0]) != 0)
+        return JS_FALSE;
+    cm = cmod_get(h);
+    if (cm == NULL)
+        return JS_FALSE;
+    name = JS_ToCString(ctx, argv[1]);
+    if (name == NULL)
+        return JS_FALSE;
+    JS_ToInt64(ctx, &value, argv[2]);
+    gum_cmodule_add_symbol(cm, name, (gconstpointer)(uintptr_t)value);
+    JS_FreeCString(ctx, name);
+    return JS_TRUE;
+}
+
+static JSValue js_cmodule_link(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    int h = -1;
+    GError *err = NULL;
+    GumCModule *cm;
+
+    (void)this_val;
+    if (argc < 1 || JS_ToInt32(ctx, &h, argv[0]) != 0)
+        return JS_FALSE;
+    cm = cmod_get(h);
+    if (cm == NULL)
+        return JS_FALSE;
+    if (!gum_cmodule_link(cm, &err)) {
+        __android_log_print(ANDROID_LOG_ERROR, "green-agent",
+            "CModule link: %s", err && err->message ? err->message : "?");
+        if (err)
+            g_error_free(err);
+        return JS_FALSE;
+    }
+    return JS_TRUE;
+}
+
+static JSValue js_cmodule_get(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    int h = -1;
+    const char *name;
+    GumCModule *cm;
+    void *sym;
+
+    (void)this_val;
+    if (argc < 2 || JS_ToInt32(ctx, &h, argv[0]) != 0)
+        return JS_NewInt64(ctx, 0);
+    cm = cmod_get(h);
+    if (cm == NULL)
+        return JS_NewInt64(ctx, 0);
+    name = JS_ToCString(ctx, argv[1]);
+    if (name == NULL)
+        return JS_NewInt64(ctx, 0);
+    sym = gum_cmodule_find_symbol_by_name(cm, name);
+    JS_FreeCString(ctx, name);
+    return JS_NewInt64(ctx, (int64_t)(uintptr_t)sym);
+}
+
+static JSValue js_a64w_new(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv);
+static JSValue js_a64w(JSContext *ctx, JSValueConst this_val, int argc,
+                       JSValueConst *argv);
 
 static JSValue js_native_mem_alloc(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
@@ -389,14 +935,15 @@ static JSValue js_native_mem_read(JSContext *ctx, JSValueConst this_val,
         length > (int64_t)sizeof(membuf))
         return JS_NULL;
     address = GREEN_UNTAG(address);
-    if (mem_fd < 0)
-        mem_fd = open("/proc/self/mem", O_RDONLY);
-    if (mem_fd < 0)
-        return JS_NULL;
-    n = pread(mem_fd, membuf, (size_t)length, (off_t)address);
-    if (n <= 0)
-        return JS_NULL;
-    return JS_NewArrayBufferCopy(ctx, membuf, (size_t)n);
+    if (g_maps_count == 0)
+        green_maps_refresh();
+    if (!green_addr_ok(address, (size_t)length, GREEN_PROT_R)) {
+        green_maps_refresh();
+        if (!green_addr_ok(address, (size_t)length, GREEN_PROT_R))
+            return JS_NULL;
+    }
+    memcpy(membuf, (const void *)(uintptr_t)address, (size_t)length);
+    return JS_NewArrayBufferCopy(ctx, membuf, (size_t)length);
 }
 
 static JSValue js_native_read_utf8(JSContext *ctx, JSValueConst this_val,
@@ -417,13 +964,27 @@ static JSValue js_native_read_utf8(JSContext *ctx, JSValueConst this_val,
         return JS_NULL;
     if (length > (int64_t)sizeof(strbuf) - 1)
         length = (int64_t)sizeof(strbuf) - 1;
-    if (str_fd < 0)
-        str_fd = open("/proc/self/mem", O_RDONLY);
-    if (str_fd < 0)
-        return JS_NULL;
-    n = pread(str_fd, strbuf, (size_t)length, (off_t)address);
-    if (n <= 0)
-        return JS_NULL;
+    if (g_maps_count == 0)
+        green_maps_refresh();
+    if (!green_addr_ok(address, 1, GREEN_PROT_R)) {
+        green_maps_refresh();
+        if (!green_addr_ok(address, 1, GREEN_PROT_R))
+            return JS_NULL;
+    }
+    {
+        size_t avail = (size_t)length;
+        for (int i = 0; i < g_maps_count; i++) {
+            if (address >= g_maps_ranges[i].lo &&
+                address < g_maps_ranges[i].hi) {
+                uint64_t room = g_maps_ranges[i].hi - address;
+                if (room < (uint64_t)avail)
+                    avail = (size_t)room;
+                break;
+            }
+        }
+        memcpy(strbuf, (const void *)(uintptr_t)address, avail);
+        n = (ssize_t)avail;
+    }
     return JS_NewStringLen(ctx, strbuf, (size_t)n);
 }
 
@@ -514,7 +1075,41 @@ static int js_ensure_runtime(char *err, size_t errlen)
             JS_SetPropertyStr(g_js_ctx, global, "__green_file_write",
                 JS_NewCFunction(g_js_ctx, js_native_file_write,
                                 "__green_file_write", 2));
-            green_java_register_natives(g_js_ctx, global);
+            JS_SetPropertyStr(g_js_ctx, global, "__green_find_export_any",
+                JS_NewCFunction(g_js_ctx, js_find_export_any,
+                                "__green_find_export_any", 1));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_icache_flush",
+                JS_NewCFunction(g_js_ctx, js_icache_flush,
+                                "__green_icache_flush", 2));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_getuid",
+                JS_NewCFunction(g_js_ctx, js_native_getuid,
+                                "__green_getuid", 0));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_module_list_imports",
+                JS_NewCFunction(g_js_ctx, js_module_list_imports,
+                                "__green_module_list_imports", 1));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_module_list_syms",
+                JS_NewCFunction(g_js_ctx, js_module_list_syms,
+                                "__green_module_list_syms", 2));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_cmodule_new",
+                JS_NewCFunction(g_js_ctx, js_cmodule_new,
+                                "__green_cmodule_new", 1));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_cmodule_add_symbol",
+                JS_NewCFunction(g_js_ctx, js_cmodule_add_symbol,
+                                "__green_cmodule_add_symbol", 3));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_cmodule_link",
+                JS_NewCFunction(g_js_ctx, js_cmodule_link,
+                                "__green_cmodule_link", 1));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_cmodule_get",
+                JS_NewCFunction(g_js_ctx, js_cmodule_get,
+                                "__green_cmodule_get", 2));
+            {
+                extern void green_writer_register_natives(JSContext *,
+                                                          JSValue);
+                extern void green_insn_register_natives(JSContext *,
+                                                        JSValue);
+                green_writer_register_natives(g_js_ctx, global);
+                green_insn_register_natives(g_js_ctx, global);
+            }
             JS_FreeValue(g_js_ctx, global);
         }
         g_js_fn = JS_UNDEFINED;
@@ -535,6 +1130,43 @@ static int js_ensure_runtime(char *err, size_t errlen)
                 return -1;
             }
             JS_FreeValue(g_js_ctx, rv);
+        }
+
+        /* frida-java-bridge bundle: globalThis.Java = __fjb.default */
+        {
+            JSValue rv = JS_Eval(g_js_ctx, kFjbBundle, strlen(kFjbBundle),
+                                 "<fjb>", JS_EVAL_TYPE_GLOBAL);
+            if (JS_IsException(rv)) {
+                JSValue exc = JS_GetException(g_js_ctx);
+                const char *msg = JS_ToCString(g_js_ctx, exc);
+                snprintf(err, errlen, "fjb error: %s", msg ? msg : "?");
+                __android_log_print(ANDROID_LOG_ERROR, "green-agent",
+                    "fjb eval: %s", msg ? msg : "?");
+                if (msg)
+                    JS_FreeCString(g_js_ctx, msg);
+                JS_FreeValue(g_js_ctx, exc);
+                pthread_mutex_unlock(&g_js_lock);
+                return -1;
+            }
+            JS_FreeValue(g_js_ctx, rv);
+        }
+        {
+            static const char kFjbGlue[] =
+                "globalThis.Java = globalThis.__fjb.default; "
+                "delete globalThis.__fjb;";
+            JSValue glue = JS_Eval(g_js_ctx, kFjbGlue, strlen(kFjbGlue),
+                                   "<fjb-glue>", JS_EVAL_TYPE_GLOBAL);
+            if (JS_IsException(glue)) {
+                JSValue exc = JS_GetException(g_js_ctx);
+                const char *msg = JS_ToCString(g_js_ctx, exc);
+                snprintf(err, errlen, "fjb glue: %s", msg ? msg : "?");
+                if (msg)
+                    JS_FreeCString(g_js_ctx, msg);
+                JS_FreeValue(g_js_ctx, exc);
+                pthread_mutex_unlock(&g_js_lock);
+                return -1;
+            }
+            JS_FreeValue(g_js_ctx, glue);
         }
     }
     pthread_mutex_unlock(&g_js_lock);
@@ -1190,6 +1822,10 @@ static void green_agent_start_once(void)
 
 __attribute__((constructor)) static void green_agent_constructor(void)
 {
+    /* Full frida embedded init BEFORE any glib/JS allocation: installs
+     * glib thread/fd callbacks, the gum allocator and runs glib_init. */
+    extern void gum_init_embedded (void);
+    gum_init_embedded();
     pthread_once(&green_agent_once, green_agent_start_once);
 }
 
@@ -1458,13 +2094,14 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
     }
 
     /* 3. Redirect the target entry to the slot via the broker. */
-    fd = open("/proc/self/mem", O_RDONLY);
-    if (fd < 0)
-        return JS_ThrowInternalError(ctx, "open /proc/self/mem failed");
-    n = pread(fd, page, sizeof(page), (off_t)(target & ~4095ULL));
-    close(fd);
-    if (n != (ssize_t)sizeof(page))
-        return JS_ThrowInternalError(ctx, "read target page failed");
+    if (g_maps_count == 0)
+        green_maps_refresh();
+    if (!green_addr_ok(target & ~4095ULL, 4096, GREEN_PROT_R)) {
+        green_maps_refresh();
+        if (!green_addr_ok(target & ~4095ULL, 4096, GREEN_PROT_R))
+            return JS_ThrowInternalError(ctx, "target page unreadable");
+    }
+    memcpy(page, (const void *)(uintptr_t)(target & ~4095ULL), sizeof(page));
     {
         uint32_t redirect[2] = { 0x58000050u, 0xD61F0200u };
         uint64_t lit = (uint64_t)(uintptr_t)slot;
@@ -1540,37 +2177,27 @@ static JSValue js_native_mem_write(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
     uint64_t address = 0;
-    int64_t length = 0;
-    size_t size;
+    size_t abuf_size = 0;
     uint8_t *data;
-    size_t done = 0;
-    static int wfd = -1;
-    ssize_t n;
 
     (void)this_val;
     if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0)
         return JS_FALSE;
-    size_t abuf_size;
-    uint8_t *abuf = JS_GetArrayBuffer(ctx, &abuf_size, argv[1]);
-    if (abuf) {
-        data = abuf;
-        size = abuf_size;
-    } else {
+    address = GREEN_UNTAG(address);
+    data = JS_GetArrayBuffer(ctx, &abuf_size, argv[1]);
+    if (data == NULL)
         return JS_FALSE;
-    }
-    if (wfd < 0)
-        wfd = open("/proc/self/mem", O_RDWR);
-    if (wfd < 0)
-        return JS_FALSE;
-    while (done < size) {
-        n = pwrite(wfd, data + done, size - done,
-                   (off_t)(address + done));
-        if (n <= 0)
+    if (g_maps_count == 0)
+        green_maps_refresh();
+    if (!green_addr_ok(address, abuf_size, GREEN_PROT_W)) {
+        green_maps_refresh();
+        if (!green_addr_ok(address, abuf_size, GREEN_PROT_W))
             return JS_FALSE;
-        done += (size_t)n;
     }
+    memcpy((void *)(uintptr_t)address, data, abuf_size);
     return JS_TRUE;
 }
+
 
 static JSValue js_native_mem_alloc(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)

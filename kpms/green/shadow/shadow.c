@@ -103,15 +103,20 @@ static struct green_shadow_page *green_shadow_new_page(void *mm,
     u64 pte;
 
     vma = green_k_find_vma(mm, va);
-    if (!vma || green_vma_start(vma) > va || green_vma_end(vma) <= va)
+    if (!vma || green_vma_start(vma) > va || green_vma_end(vma) <= va) {
+        pr_err("green_shadow: new_page: no vma for va=%lx\n", va);
         return 0;
+    }
 
     if (green_shadow_detect_vma_mm(mm, vma) < 0)
         return 0;
 
     ptep = green_shadow_get_pte(mm, va);
-    if (!ptep || !(*ptep & PTE_VALID))
+    if (!ptep || !(*ptep & PTE_VALID)) {
+        pr_err("green_shadow: new_page: get_pte failed va=%lx ptep=%px pte=%llx\n",
+               va, ptep, ptep ? *ptep : 0);
         return 0;
+    }
 
     pte = *ptep;
     if (!(pte & PTE_USER) || !(pte & PTE_RDONLY) || (pte & PTE_UXN)) {

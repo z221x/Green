@@ -3,12 +3,56 @@ var Process = {
     arch: 'arm64',
     platform: 'linux',
     pageSize: 4096,
+    pointerSize: 8,
+    codeSigningPolicy: 'optional',
     enumerateModulesSync: __green_modules
 };
-Process.enumerateModules = function () { return __green_modules(); };
+Process.enumerateModules = function () {
+    return __green_modules().map(__green_mod_upgrade);
+};
+function __green_mod_upgrade(m) {
+    if (m.__upgraded) return m;
+    m.__upgraded = true;
+    m.base = new NativePointer(m.base);
+    m.findExportByName = function (name) {
+        return Module.findExportByName(m.name, name);
+    };
+    m.getExportByName = function (name) {
+        return Module.getExportByName(m.name, name);
+    };
+    m.findSymbolByName = function (name) {
+        var syms = m.enumerateSymbols();
+        for (var i = 0; i < syms.length; i++)
+            if (syms[i].name === name) return syms[i].address;
+        return null;
+    };
+    m.getSymbolByName = m.findSymbolByName;
+    m.enumerateImports = function () {
+        return __green_module_list_imports(m.name).map(function (e) {
+            return { name: e.name, address: new NativePointer(e.address),
+                     module: m.name, type: 'function' };
+        });
+    };
+    m.enumerateExports = function () {
+        return __green_module_list_syms(m.name, 1).map(function (e) {
+            return { name: e.name, address: new NativePointer(e.address),
+                     type: 'function' };
+        });
+    };
+    m.enumerateSymbols = function () {
+        var dyn = __green_module_list_syms(m.name, 1);
+        var full = dyn.length > 500 ? dyn : __green_module_list_syms(m.name, 0);
+        return full.map(function (e) {
+            return { name: e.name, address: new NativePointer(e.address),
+                     type: 'function' };
+        });
+    };
+    return m;
+}
 Process.findModuleByName = function (name) {
     var ms = __green_modules();
-    for (var i = 0; i < ms.length; i++) if (ms[i].name === name) return ms[i];
+    for (var i = 0; i < ms.length; i++)
+        if (ms[i].name === name) return __green_mod_upgrade(ms[i]);
     return null;
 };
 Process.getModuleByName = function (name) {
@@ -25,7 +69,9 @@ Process.findModuleByAddress = function (addr) {
 };
 var Module = {
     enumerateModulesSync: __green_modules,
-    enumerateModules: function () { return __green_modules(); },
+    enumerateModules: function () {
+        return __green_modules().map(__green_mod_upgrade);
+    },
     getBaseAddress: function (name) {
         var ms = __green_modules();
         for (var i = 0; i < ms.length; i++)
@@ -79,8 +125,13 @@ class NativePointer {
         if (typeof v === 'string') {
             var t = v.trim().toLowerCase();
             if (!t.startsWith('0x') && /^-?[0-9a-f]+$/.test(t)) t = '0x' + t;
-            this.__v = BigInt.asUintN(64, BigInt(t));
-            return;
+            try {
+                this.__v = BigInt.asUintN(64, BigInt(t));
+                return;
+            } catch (e) {
+                log('NativePointer: unparseable: ' + JSON.stringify(String(v).slice(0, 40)));
+                throw e;
+            }
         }
         this.__v = BigInt.asUintN(64, BigInt(v));
     }
@@ -110,8 +161,16 @@ class NativePointer {
         return b;
     }
     writeByteArray(buf) {
+        if (Array.isArray(buf)) {
+            var ab = new Uint8Array(buf).buffer;
+            if (!__green_mem_write(Number(this.__v), ab))
+                throw new Error('access violation writing ' + buf.length + ' bytes');
+            return this;
+        }
         if (!__green_mem_write(Number(this.__v), buf))
-            throw new Error('access violation writing ' + buf.byteLength + ' bytes');
+            throw new Error('access violation writing ' +
+                (buf && buf.byteLength) + ' bytes');
+        return this;
     }
     readUtf8String(len) {
         var s = __green_read_utf8(Number(this.__v), len || 512);
@@ -157,14 +216,25 @@ class NativePointer {
         })(name, rw[name][0], rw[name][1]);
     }
 })();
+/* frida-compatible aliases */
+NativePointer.prototype.readInt = function (o) { return this.readS32(o); };
+NativePointer.prototype.readUInt = function (o) { return this.readU32(o); };
+NativePointer.prototype.readLong = function (o) { return this.readS64(o); };
+NativePointer.prototype.readULong = function (o) { return this.readU64(o); };
+NativePointer.prototype.writeInt = function (v, o) { return this.writeS32(v, o); };
+NativePointer.prototype.writeUInt = function (v, o) { return this.writeU32(v, o); };
+NativePointer.prototype.writeLong = function (v, o) { return this.writeS64(v, o); };
+NativePointer.prototype.writeULong = function (v, o) { return this.writeU64(v, o); };
 NativePointer.prototype.readPointer = function () {
-    return new NativePointer(this.readU64());
+    return new NativePointer(BigInt.asUintN(64, this.readU64()) &
+        0x00ffffffffffffffn);
 };
 NativePointer.prototype.writePointer = function (v) {
     this.writeU64(new NativePointer(v).__v);
     return this;
 };
 function ptr(v) { return new NativePointer(v); }
+var NULL = ptr(0);
 NativePointer.prototype.toMatchPattern = function () {
     var v = BigInt.asUintN(64, BigInt(this.__v));
     var s = [];
@@ -250,6 +320,8 @@ function __green_to_big(v) {
 }
 function __green_wrap_ret(raw, type) {
     raw = __green_to_big(raw);
+    if (type === 'pointer')
+        raw &= 0x00ffffffffffffffn;   /* strip MTE/PAC tag */
     switch (type) {
         case 'pointer': return new NativePointer(raw);
         case 'int': return Number(BigInt.asIntN(32, raw));
@@ -362,312 +434,316 @@ function __green_recv_dispatch(type, payload_json) {
 }
 var rpc = { exports: {} };
 
-/* ---- Java bridge ---------------------------------------------------- */
-var Java = { available: false, __classes: {}, __classIds: {} };
+/* ---- frida-java-bridge host compatibility layer -------------------- */
+function int64(v) { return new Int64(v); }
+function uint64(v) { return new UInt64(v); }
 
-Java.perform = function (fn) {
-    if (!Java.available) throw new Error('Java VM not available');
-    fn();
-};
-Java.use = function (name) {
-    if (!Java.available) throw new Error('Java VM not available');
-    if (Java.__classes[name]) return Java.__classes[name];
-    var clsId = __green_java_find_class(name);
-    if (clsId === null || clsId === 0) throw new Error('Class not found: ' + name);
-    Java.__classIds[name] = clsId;
-    var info = __green_java_class_info(clsId);
-    var w = Java.__classes[name] = __gj_wrap_class(name, clsId, info);
-    return w;
-};
-Java.cast = function (obj, klass) {
-    if (typeof obj === 'string') return obj;
-    return __gj_wrap_instance(klass.__name, obj);
-};
-Java.scheduleOnMainThread = function (fn) { fn(); };  /* simplification */
+Process.myUid = function () { return __green_getuid(); };
+Process.SYSTEM_UID = int64(1000);
 
-function __gj_meth(mid, name, sig, isStatic, clsName) {
-    /* One overload.  m(...) invokes it; .implementation replaces it. */
-    var m = function () {
-        return __gj_call(clsName, 0, mid, sig, isStatic, arguments);
+/* Linker-namespace-proof fallback for findExportByName(null, ...). */
+(function () {
+    var origFind = Module.findExportByName;
+    var origGet = Module.getExportByName;
+    Module.findExportByName = function (moduleName, exportName) {
+        if (moduleName === null || moduleName === undefined) {
+            var a = __green_find_export_any(exportName);
+            return a === null ? null : new NativePointer(a);
+        }
+        var r = origFind.call(Module, moduleName, exportName);
+        if (r !== null && r !== undefined) return r;
+        var b = __green_find_export_any(exportName);
+        return b === null ? null : new NativePointer(b);
     };
-    m.__mid = mid; m.__sig = sig; m.__static = isStatic;
-    m.__name = name; m.__cls = clsName;
-    m.overload = function () { return m; };  /* single-overload shortcut */
-    Object.defineProperty(m, 'implementation', {
-        set: function (fn) {
-            if (fn === null) {
-                throw new Error('implementation restore not supported yet');
+    Module.getExportByName = function (moduleName, exportName) {
+        var r = Module.findExportByName(moduleName, exportName);
+        if (r === null) throw new Error('unable to find export ' + exportName);
+        return r;
+    };
+    Module.getGlobalExportByName = function (exportName) {
+        var r = Module.findExportByName(null, exportName);
+        if (r === null) throw new Error('unable to find global export ' + exportName);
+        return r;
+    };
+    Module.findGlobalExportByName = function (exportName) {
+        return Module.findExportByName(null, exportName);
+    };
+    Module.getBaseAddress = Module.getBaseAddress || Module.prototype && undefined;
+})();
+
+/* Memory additions ------------------------------------------------- */
+Memory.allocUtf8String = function (str) {
+    var b = [];
+    for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c < 0x80) b.push(c);
+        else {
+            b.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+        }
+    }
+    b.push(0);
+    var p = Memory.alloc(b.length);
+    p.writeByteArray(b);
+    return p;
+};
+Memory.allocUtf16String = function (str) {
+    var b = [];
+    for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        b.push(c & 0xff, (c >> 8) & 0xff);
+    }
+    b.push(0, 0);
+    var p = Memory.alloc(b.length);
+    p.writeByteArray(b);
+    return p;
+};
+Memory.dup = function (p, size) {
+    var q = Memory.alloc(size);
+    Memory.copy(q, p, size);
+    return q;
+};
+Memory.copy = function (dst, src, size) {
+    var d = new NativePointer(dst), s = new NativePointer(src);
+    for (var off = 0; off < size; off += 4096) {
+        var n = Math.min(4096, size - off);
+        var chunk = new NativePointer(Number(s.__v) + off).readByteArray(n);
+        new NativePointer(Number(d.__v) + off).writeByteArray(chunk);
+    }
+};
+
+/* Match-pattern support: 'de ad ?? ef' (also '??' wildcards). */
+function __green_parse_pattern(pattern) {
+    var parts = pattern.split(/\s+/);
+    var pat = [];
+    for (var i = 0; i < parts.length; i++) {
+        var t = parts[i];
+        if (t === '') continue;
+        if (t === '??' || t === '**') pat.push(-1);
+        else pat.push(parseInt(t, 16));
+    }
+    return pat;
+}
+Memory.scanSync = function (base, size, pattern) {
+    var p = new NativePointer(base);
+    var pat = __green_parse_pattern(pattern);
+    var matches = [];
+    var CHUNK = 65536;
+    for (var off = 0; off < size; off += CHUNK) {
+        var n = Math.min(CHUNK, size - off);
+        var bytes;
+        try {
+            bytes = new NativePointer(Number(p.__v) + off).readByteArray(n);
+        } catch (e) { continue; }
+        outer:
+        for (var i = 0; i + pat.length <= n; i++) {
+            for (var j = 0; j < pat.length; j++) {
+                if (pat[j] >= 0 && bytes[i + j] !== pat[j]) continue outer;
             }
-            var orig = function () {
-                return __gj_unwrap(__green_java_call_backup(
-                    Array.prototype.slice.call(arguments)));
-            };
-            __green_java_hook(Java.__classIds[clsName], mid, name, sig,
-                              isStatic ? 1 : 0, function () {
-                /* Instance hooks receive the receiver as a raw handle id:
-                 * wrap it so `this` is a proper instance wrapper. */
-                var recvRaw = arguments[0];
-                var recv = (typeof recvRaw === 'number' && recvRaw > 0)
-                    ? __gj_wrap_instance(clsName, recvRaw)
-                    : __gj_unwrap(recvRaw);
-                var args = [];
-                for (var i = 1; i < arguments.length; i++)
-                    args.push(__gj_unwrap(arguments[i]));
-                var self = __gj_hook_self(clsName,
-                    (recv && recv.__id) || 0, m);
-                if (recv && recv.__id) {
-                    /* `this.method(...)` inside the implementation must
-                     * reach the ORIGINAL: override it on this per-call
-                     * wrapper (wrappers are fresh objects, no pollution). */
-                    recv[m.__name] = function () {
-                        return orig.apply(null, arguments);
-                    };
-                }
-                var r = fn.apply(recv && recv.__id ? recv : self, args);
-                __gj_hook_done();
-                return r;
-            });
-        },
-        get: function () { return undefined; }
+            matches.push({ address: new NativePointer(Number(p.__v) + off + i),
+                           size: pat.length });
+            if (matches.length > 4096) return matches;
+        }
+    }
+    return matches;
+};
+Memory.scan = function (base, size, pattern, callbacks) {
+    var matches = Memory.scanSync(base, size, pattern);
+    for (var i = 0; i < matches.length; i++) {
+        if (callbacks.onMatch)
+            callbacks.onMatch(matches[i].address, matches[i].size);
+    }
+    if (callbacks.onComplete) callbacks.onComplete();
+};
+
+Memory.patchCode = function (address, size, apply) {
+    var p = new NativePointer(address);
+    var page = 4096;
+    /* NOTE: JS bitwise ops are 32-bit — use division for 48-bit VAs. */
+    var start = Math.floor(Number(p.__v) / page) * page;
+    var end = Math.floor((Number(p.__v) + Number(size) + page - 1) / page) * page;
+    __green_mprotect(start, end - start, 7);          /* RWX while writing */
+    try {
+        apply(p);
+    } finally {
+        __green_mprotect(start, end - start, 5);      /* back to R-X */
+    }
+    __green_icache_flush(start, end - start);
+};
+
+/* Script runtime shims --------------------------------------------- */
+var __green_ticks = [];
+Script = {
+    nextTick: function (fn) { __green_ticks.push(fn); },
+    pin: function () {}, unpin: function () {},
+    bindWeak: function (obj, cb) {
+        /* Strong-ref registry: destructors never fire (leak-only). */
+        if (!Script.__weak) Script.__weak = [];
+        Script.__weak.push([obj, cb]);
+        return Script.__weak.length - 1;
+    },
+    unbindWeak: function (id) {
+        if (Script.__weak && Script.__weak[id]) Script.__weak[id] = null;
+    },
+    setGlobalAccessHandler: function () {}
+};
+function __green_pump_ticks() {
+    var n = __green_ticks.length;
+    for (var i = 0; i < n; i++) {
+        var fn = __green_ticks[i];
+        try { fn(); } catch (e) { log('tick error: ' + e); }
+    }
+    __green_ticks.splice(0, n);
+}
+
+/* CModule over gum's TCC backend ------------------------------------ */
+function CModule(source, symbols) {
+    var h = __green_cmodule_new(source);
+    if (typeof h !== 'number') throw new Error('CModule compile failed');
+    var names = symbols ? Object.getOwnPropertyNames(symbols) : [];
+    for (var i = 0; i < names.length; i++) {
+        var v = symbols[names[i]];
+        __green_cmodule_add_symbol(h, names[i],
+            v === null || v === undefined ? 0
+                : Number(new NativePointer(v.__v !== undefined ? v.__v : v).__v));
+    }
+    if (__green_cmodule_link(h) !== true)
+        throw new Error('CModule link failed');
+    this.__h = h;
+    var self = this;
+    return new Proxy(this, {
+        get: function (t, name) {
+            if (typeof name !== 'string') return t[name];
+            if (name in t) return t[name];
+            var a = __green_cmodule_get(h, name);
+            return a === 0 ? undefined : new NativePointer(a);
+        }
     });
-    return m;
 }
 
-function __gj_wrap_class(name, clsId, info) {
-    var w = { __name: name, __clsId: clsId, __isClass: true };
-    var byname = {};
-    /* methods (dedupe name+sig from getMethods/getDeclaredMethods) */
-    for (var i = 0; i < info.methods.length; i++) {
-        var e = info.methods[i];
-        var key = e.name + '.' + e.sig;
-        if (byname[key]) continue;
-        var mid = __green_java_get_method_id(clsId, e.name, e.sig, e['static'] ? 1 : 0);
-        if (mid === 0) continue;
-        var m = __gj_meth(mid, e.name, e.sig, e['static'], name);
-        byname[key] = m;
-        if (!w[e.name] || (e['static'] && !w[e.name].__static &&
-                           !w[e.name].__group)) {
-            w[e.name] = m;
-        } else if (w[e.name] && !w[e.name].__group) {
-            /* second overload for same name: build a dispatcher */
-            (function (mn) {
-                var first = w[mn];
-                var disp = function () {
-                    var pick = __gj_pick(disp.__group, arguments);
-                    return pick.apply(null, arguments);
-                };
-                disp.__group = [first];
-                disp.overload = function (sig) {
-                    for (var k = 0; k < disp.__group.length; k++)
-                        if (disp.__group[k].__sig === sig) return disp.__group[k];
-                    throw new Error('no overload ' + sig);
-                };
-                Object.defineProperty(disp, 'implementation', {
-                    set: function (fn) {
-                        for (var k = 0; k < disp.__group.length; k++)
-                            disp.__group[k].implementation = fn;
-                    },
-                    get: function () { return undefined; }
-                });
-                w[mn] = disp;
-            })(e.name);
-        }
-        if (w[e.name] && w[e.name].__group) w[e.name].__group.push(m);
+/* Arm64Writer over gum C API (subset used by frida-java-bridge). */
+var ARM64_REGS = {};
+(function () {
+    /* capstone v6 aarch64 enums */
+    for (var i = 0; i <= 30; i++) ARM64_REGS['x' + i] = 218 + i;
+    ARM64_REGS.sp = 5;
+    ARM64_REGS.xzr = 9;
+    ARM64_REGS.fp = ARM64_REGS.x29;
+    ARM64_REGS.lr = ARM64_REGS.x30;
+    for (var i = 0; i <= 30; i++) ARM64_REGS['w' + i] = 187 + i;
+    ARM64_REGS.wzr = 8;
+    for (var i = 0; i <= 31; i++) {
+        ARM64_REGS['d' + i] = 43 + i;
+        ARM64_REGS['q' + i] = 123 + i;
+        ARM64_REGS['s' + i] = 155 + i;
     }
-    /* constructors */
-    w.$new = function () {
-        var args = [];
-        for (var ai = 0; ai < arguments.length; ai++)
-            args.push(arguments[ai]);
-        var pick = null, bestScore = -1;
-        for (var i = 0; i < info.ctors.length; i++) {
-            var sig = info.ctors[i].sig;
-            var st = __gj_argtypes(sig);
-            if (st.length !== args.length) continue;
-            var sc = __gj_score(st, args);
-            if (sc > bestScore) { bestScore = sc; pick = sig; }
-        }
-        if (pick === null && info.ctors.length > 0)
-            for (var i = 0; i < info.ctors.length; i++) {
-                if (__gj_argcount(info.ctors[i].sig) === args.length) {
-                    pick = info.ctors[i].sig;
-                    break;
-                }
-            }
-        if (pick === null && info.ctors.length > 0)
-            pick = info.ctors[0].sig;
-        if (pick === null) throw new Error('no constructor for ' + name);
-        var cmid = __green_java_get_method_id(clsId, '<init>', pick, 0);
-        if (cmid === 0) throw new Error('ctor <init>' + pick + ' not found');
-        var id = __green_java_new_object(clsId, cmid, pick, args);
-        return __gj_wrap_instance(name, id);
-    };
-    w.$dispose = function () {};
-    return w;
-}
-
-function __gj_argcount(sig) {
-    var d = sig.indexOf(')');
-    var inner = sig.substring(1, d);
-    var n = 0, i = 0;
-    while (i < inner.length) {
-        var c = inner[i];
-        if (c === 'L') { while (inner[i] !== ';') i++; i++; }
-        else if (c === '[') { i++; if (inner[i] === 'L') { while (inner[i] !== ';') i++; i++; } }
-        else i++;
-        n++;
-    }
-    return n;
-}
-
-function __gj_argtypes(sig) {
-    var d = sig.indexOf(')');
-    var inner = sig.substring(1, d);
-    var t = [], i = 0;
-    while (i < inner.length) {
-        var c = inner[i];
-        if (c === 'L') { while (inner[i] !== ';') i++; i++; t.push('L'); }
-        else if (c === '[') { i++; if (inner[i] === 'L') { while (inner[i] !== ';') i++; } i++; t.push('L'); }
-        else { i++; t.push(c); }
-    }
-    return t;
-}
-
-function __gj_score(sigTypes, args) {
-    var score = 0;
-    for (var i = 0; i < sigTypes.length; i++) {
-        var t = sigTypes[i], a = args[i];
-        if (a === null || a === undefined) { score += 1; continue; }
-        var isStr = typeof a === 'string';
-        var isNum = typeof a === 'number' || typeof a === 'bigint';
-        var isObj = typeof a === 'object';
-        if (t === 'L' || t === '[') {
-            if (isStr || isObj) score += 2; else return -1;
-        } else if (t === 'J') {
-            if (isNum) score += 2; else return -1;
-        } else if (t === 'F' || t === 'D') {
-            if (isNum) score += 2; else return -1;
-        } else if (t === 'C' || t === 'Z') {
-            if (isNum && !isStr) score += 2;
-            else if (isStr && a.length === 1) score += 1;
-            else return -1;
-        } else {  /* B S I */
-            if (isNum) score += 2; else return -1;
-        }
-    }
-    return score;
-}
-
-function __gj_pick(group, args) {
-    var best = null, bestScore = -1;
-    for (var i = 0; i < group.length; i++) {
-        var st = __gj_argtypes(group[i].__sig);
-        if (st.length !== args.length) continue;
-        var sc = __gj_score(st, args);
-        if (sc > bestScore) { bestScore = sc; best = group[i]; }
-    }
-    if (best === null) {
-        var sigs = [];
-        for (var i = 0; i < group.length; i++) sigs.push(group[i].__sig);
-        throw new Error('no overload of ' + group[0].__name +
-                        ' takes ' + args.length + ' argument(s): ' +
-                        sigs.join(' '));
-    }
-    return best;
-}
-
-function __gj_unwrap(v) {
-    if (v !== null && typeof v === 'object' &&
-        v.__greenobj !== undefined) {
-        var cls = v.__greencls;
-        if (cls.charAt(0) === '[') return v;  /* arrays stay as markers */
-        if (!Java.__classes[cls]) {
-            try { Java.use(cls); } catch (e) { return v; }
-        }
-        return __gj_wrap_instance(cls, v.__greenobj);
-    }
+})();
+var ARM64_CCS = { eq:1,ne:2,hs:3,cs:3,lo:4,cc:4,mi:5,pl:6,vs:7,vc:8,
+                  hi:9,ls:10,ge:11,lt:12,gt:13,le:14,al:15,nv:16 };
+function __a64r(r) {
+    if (typeof r === 'number') return r;
+    var v = ARM64_REGS[String(r).toLowerCase()];
+    if (v === undefined) throw new Error('bad register: ' + r);
     return v;
 }
-
-function __gj_call(clsName, objId, mid, sig, isStatic, rawArgs) {
-    var args = [];
-    for (var i = 0; i < rawArgs.length; i++) args.push(rawArgs[i]);
-    return __gj_unwrap(__green_java_call(Java.__classIds[clsName], objId,
-                        mid, sig, isStatic ? 1 : 0, args));
-}
-
-/* Active-hook bookkeeping so `this.method(...)` inside implementations
- * calls the original. */
-var __gj_active = 0;
-function __gj_hook_self(clsName, recvId, m) {
-    __gj_active++;
-    var orig = function () {
-        return __gj_unwrap(__green_java_call_backup(
-            Array.prototype.slice.call(arguments)));
+function Arm64Writer(code, options) {
+    this.__h = __green_a64w_new(Number(new NativePointer(code).__v));
+    this.__labels = {};
+    this.__nextLabel = 1;
+    this.pc = options && options.pc !== undefined
+        ? new NativePointer(options.pc) : ptr(code);
+    this.__defineGetter__('offset', function () {
+        return __green_a64w(this.__h, 29);
+    });
+    var self = this;
+    this.putPushRegReg = function (a, b) { __green_a64w(this.__h, 1, __a64r(a), __a64r(b)); };
+    this.putPopRegReg = function (a, b) { __green_a64w(this.__h, 2, __a64r(a), __a64r(b)); };
+    this.putLabel = function (name) {
+        var id = this.__nextLabel++;
+        this.__labels[name] = id;
+        __green_a64w(this.__h, 3, id);
     };
-    var self = { __recv: recvId, $className: clsName, $orig: orig };
-    var klass = Java.__classes[clsName];
-    if (klass) {
-        for (var k in klass) {
-            if (k[0] === '$' || k.indexOf('__') === 0) continue;
-            (function (mn) {
-                var slot = klass[mn];
-                self[mn] = function () {
-                    var a = [];
-                    for (var i = 0; i < arguments.length; i++)
-                        a.push(arguments[i]);
-                    var m0 = slot && slot.__group
-                        ? __gj_pick(slot.__group, a) : slot;
-                    if (m0.__mid === m.__mid && m0.__sig === m.__sig)
-                        /* The hooked method itself: invoke the ORIGINAL
-                         * through this thread's backup ArtMethod. */
-                        return orig.apply(null, a);
-                    if (m0.__static)
-                        return __gj_call(clsName, 0, m0.__mid, m0.__sig, 1, a);
-                    return __gj_unwrap(__green_java_call(
-                        Java.__classIds[clsName],
-                        recvId, m0.__mid, m0.__sig, 0, a));
-                };
-            })(k);
-        }
-    }
-    return self;
+    this.__label = function (name) {
+        if (this.__labels[name] === undefined) this.__labels[name] = this.__nextLabel++;
+        return this.__labels[name];
+    };
+    this.putBCondLabel = function (cc, name) {
+        __green_a64w(this.__h, 4, ARM64_CCS[cc], this.__label(name));
+    };
+    this.putBCondLabelWide = this.putBCondLabel;
+    this.putLdrRegAddress = function (r, addr) {
+        __green_a64w(this.__h, 5, __a64r(r), Number(new NativePointer(addr).__v));
+    };
+    this.putStrRegRegOffset = function (a, b, off) {
+        __green_a64w(this.__h, 6, __a64r(a), __a64r(b), off);
+    };
+    this.putLdrRegRegOffset = function (a, b, off) {
+        __green_a64w(this.__h, 7, __a64r(a), __a64r(b), off);
+    };
+    this.putMovRegReg = function (a, b) { __green_a64w(this.__h, 8, __a64r(a), __a64r(b)); };
+    this.putMovRegRegOffsetPtr = function (a, b, off) {
+        __green_a64w(this.__h, 9, __a64r(a), __a64r(b), off);
+    };
+    this.putRet = function () { __green_a64w(this.__h, 10); };
+    this.putBrReg = function (r) { __green_a64w(this.__h, 11, __a64r(r)); };
+    this.putPushRegs = function (regs) {
+        var rs = regs.map(function (r) { return __a64r(r); });
+        __green_a64w(this.__h, 12, rs);
+    };
+    this.putPopRegs = function (regs) {
+        var rs = regs.map(function (r) { return __a64r(r); });
+        __green_a64w(this.__h, 13, rs);
+    };
+    this.putPushAllXRegisters = function () { __green_a64w(this.__h, 32); };
+    this.putPopAllXRegisters = function () { __green_a64w(this.__h, 33); };
+    this.putBytes = function (bytes) {
+        var b = bytes instanceof ArrayBuffer ? bytes : new Uint8Array(bytes).buffer;
+        __green_a64w(this.__h, 14, b);
+    };
+    this.putBranchAddress = function (addr) {
+        __green_a64w(this.__h, 15, Number(new NativePointer(addr).__v));
+    };
+    this.putCallAddressWithArguments = function (addr, args) {
+        __green_a64w(this.__h, 16, Number(new NativePointer(addr).__v), args);
+    };
+    this.putCallAddressWithAlignedArguments = function (addr, args) {
+        __green_a64w(this.__h, 16, Number(new NativePointer(addr).__v), args);
+    };
+    this.putCallAddress = function (addr) {
+        __green_a64w(this.__h, 16, Number(new NativePointer(addr).__v), []);
+    };
+    this.putCbnzRegLabel = function (r, name) {
+        __green_a64w(this.__h, 17, __a64r(r), this.__label(name));
+    };
+    this.putCbzRegLabel = function (r, name) {
+        __green_a64w(this.__h, 18, __a64r(r), this.__label(name));
+    };
+    this.putTbnzRegImmLabel = function (r, imm, name) {
+        __green_a64w(this.__h, 19, __a64r(r), imm, this.__label(name));
+    };
+    this.putTbzRegImmLabel = function (r, imm, name) {
+        __green_a64w(this.__h, 20, __a64r(r), imm, this.__label(name));
+    };
+    this.putAddRegRegImm = function (a, b, imm) {
+        __green_a64w(this.__h, 21, __a64r(a), __a64r(b), imm);
+    };
+    this.putAddRegImm = this.putAddRegRegImm;
+    this.putSubRegRegImm = function (a, b, imm) {
+        __green_a64w(this.__h, 22, __a64r(a), __a64r(b), imm);
+    };
+    this.putSubRegImm = this.putSubRegRegImm;
+    this.putCmpRegReg = function (a, b) { __green_a64w(this.__h, 23, __a64r(a), __a64r(b)); };
+    this.putCmpRegImm = this.putCmpRegReg;
+    this.putAndRegReg = function (a, b) { __green_a64w(this.__h, 24, __a64r(a), __a64r(b)); };
+    this.putMrsRegReg = function (a, sys) { __green_a64w(this.__h, 25, __a64r(a), sys); };
+    this.putMsrRegReg = function (sys, r) { __green_a64w(this.__h, 26, sys, __a64r(r)); };
+    this.putBlImm = function (target) {
+        __green_a64w(this.__h, 27, Number(new NativePointer(target).__v));
+    };
+    this.putBLabel = function (name) { __green_a64w(this.__h, 30, this.__label(name)); };
+    this.putJmpAddress = this.putBranchAddress;
+    this.putJccShortLabel = this.putBCondLabel;
+    this.putJccNearLabel = this.putBCondLabel;
+    this.putJmpNearLabel = this.putBLabel;
+    this.flush = function () { __green_a64w(this.__h, 28); };
+    this.dispose = this.clear = function () { __green_a64w(this.__h, 99); };
 }
-function __gj_hook_done() { if (__gj_active > 0) __gj_active--; }
-
-/* Instance wrapper: obj.method(...) dispatches via the class table. */
-function __gj_wrap_instance(clsName, objId) {
-    var o = { __id: objId, __cls: clsName, __isInstance: true };
-    var klass = Java.__classes[clsName];
-    if (klass) {
-        for (var k in klass) {
-            if (k[0] === '$' || k.indexOf('__') === 0) continue;
-            (function (mn) {
-                var slot = klass[mn];
-                if (slot && slot.__static) return;  /* instance only */
-                if (slot && slot.__group) {
-                    var allStatic = true;
-                    for (var gi = 0; gi < slot.__group.length; gi++)
-                        if (!slot.__group[gi].__static) allStatic = false;
-                    if (allStatic) return;
-                }
-                o[mn] = function () {
-                    var clsId = Java.__classIds[clsName];
-                    var jargs = [];
-                    for (var i = 0; i < arguments.length; i++)
-                        jargs.push(arguments[i]);
-                    var m0 = slot && slot.__group
-                        ? __gj_pick(slot.__group, jargs) : slot;
-                    return __gj_unwrap(__green_java_call(clsId, o.__id,
-                        m0.__mid, m0.__sig, 0, jargs));
-                };
-            })(k);
-        }
-    }
-    o.toString = function () { return __green_java_to_string(o.__id); };
-    o.$dispose = function () { __green_java_delete_ref(o.__id); o.__id = 0; };
-    return o;
-}
-
-/* Lazy availability probe (safe on non-JVM processes). */
-Java.available = __green_java_available() ? true : false;

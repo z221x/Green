@@ -27,6 +27,18 @@ out[-1] += ';'
 open('agent/prelude.inc','w').write('\n'.join(out) + '\n')
 PYGEN
 
+# Generate fjb.inc from the bundled frida-java-bridge IIFE
+python3 - <<'PYGEN2'
+src = open('agent/fjb.iife.js').read()
+out = ['/* Auto-generated from fjb.iife.js (frida-java-bridge) - do not edit. */',
+       'static const char kFjbBundle[] =']
+for line in src.split('\n'):
+    esc = line.replace('\\','\\\\').replace('"','\\"')
+    out.append('    "' + esc + '\\n"')
+out[-1] += ';'
+open('agent/fjb.inc','w').write('\n'.join(out) + '\n')
+PYGEN2
+
 # Compile the profiler stub
 $CC -c -O2 -w -o agent/gumprofiler-stub.o agent/gumprofiler-stub.c \
   -Iagent/stub-include \
@@ -41,9 +53,10 @@ $CC -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
   -I$ROOT/tmp/prefix/include/glib-2.0 -I$ROOT/tmp/prefix/lib/glib-2.0/include \
   -Ivendor/prefix/include/quickjs \
   -o build/libgreen_agent.so \
-  agent/green_agent.c agent/gummemory-green-payload.c agent/java_bridge.c \
+  agent/green_agent.c agent/gummemory-green-payload.c agent/gumwriter.c agent/insn.c \
   -Wl,--allow-multiple-definition \
   -Wl,--start-group \
+  agent/gumprofiler-stub.o \
   vendor/prefix/lib/libquickjs.a \
   $FGJ/libfrida-gumjs-1.0.a \
   $FG/libfrida-gum-1.0.a \
