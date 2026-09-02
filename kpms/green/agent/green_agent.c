@@ -1563,6 +1563,12 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
     if (!c->used || !c->orig_cont)
         return 0;
 
+    __android_log_print(ANDROID_LOG_INFO, "green-trace",
+        "tramp enter: id=%d used=%d orig=%llx onenter=%d onleave=%d",
+        (int)g_current_hook_id, c->used,
+        (unsigned long long)c->orig_cont,
+        !JS_IsUndefined(c->onenter), !JS_IsUndefined(c->onleave));
+
     if (!JS_IsUndefined(c->onenter)) {
         pthread_mutex_lock(&g_js_lock);
         JS_UpdateStackTop(g_js_rt);
@@ -1577,9 +1583,11 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
         pthread_mutex_unlock(&g_js_lock);
     }
 
-    /* Execute the relocated original prologue; it jumps back into the
-     * shadowed function body and returns the original result. */
+    __android_log_print(ANDROID_LOG_INFO, "green-trace",
+        "tramp calling orig_cont=%llx", (unsigned long long)c->orig_cont);
     ret = green_call_asm((const void *)(uintptr_t)c->orig_cont, vals, 8);
+    __android_log_print(ANDROID_LOG_INFO, "green-trace",
+        "tramp orig returned %lld", (long long)ret);
 
     if (!JS_IsUndefined(c->onleave)) {
         pthread_mutex_lock(&g_js_lock);
@@ -1681,6 +1689,17 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
 
     slot = g_slots + (size_t)id * 4096;
 
+    /* Save the original bytes before we overwrite the entry with our
+     * redirect (the relocator reads the LIVE target page, which is the
+     * shadow view after patching). */
+    uint32_t orig_bytes[8];
+    memcpy(orig_bytes, (const void *)(uintptr_t)target, sizeof(orig_bytes));
+
+    __android_log_print(ANDROID_LOG_INFO, "green-debug",
+        "orig: %08x %08x %08x %08x  target=%llx",
+        orig_bytes[0], orig_bytes[1], orig_bytes[2], orig_bytes[3],
+        (unsigned long long)target);
+
     /* 1. Relocate the first instructions of the target into slot+32. */
     gum_arm64_writer_init(&writer, slot + 32);
     writer.pc = target;
@@ -1692,17 +1711,25 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
      * ones we append a jump-back to target+reloc_size. */
     int hit_eob = 0;
 
+    /* NOTE: read_one returns the CUMULATIVE byte offset consumed so far
+     * (input_cur - input_start), NOT the instruction count.  See
+     * guminterceptor-arm64.c: reloc_bytes = read_one(); while (bytes < sz). */
     while (reloc_size < 16) {
-        gsize n_insn = gum_arm64_relocator_read_one(&relocator, NULL);
+        gsize total_bytes = gum_arm64_relocator_read_one(&relocator, NULL);
+        uint32_t insn_index;
 
-        if (n_insn == 0)
+        if (total_bytes == 0)
             break;
+        insn_index = (total_bytes / 4) - 1;
         gum_arm64_relocator_write_one(&relocator);
-        reloc_size += n_insn * 4;
+        reloc_size = total_bytes;
+        /* Detect RET manually: capstone v6 may not set the relocator's
+         * eob flag for d65f03c0 (ret). */
+        if ((orig_bytes[insn_index] & 0xFFFFFC1F) == 0xD65F0000) {
+            hit_eob = 1;
+            break;
+        }
         if (gum_arm64_relocator_eob(&relocator)) {
-            /* The function body ended (ret or unconditional branch).
-             * The relocated code is self-contained: it returns to the
-             * caller directly.  No jump-back is needed. */
             hit_eob = 1;
             break;
         }
@@ -1713,13 +1740,16 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
         return JS_ThrowInternalError(ctx,
             "could not relocate any instructions from target");
     }
-    if (!hit_eob && reloc_size >= 16) {
-        /* Large function: append a jump-back to the shadow page at
-         * target+reloc_size so the original body continues. */
+    if (!hit_eob) {
+        /* Append a jump-back to the shadow page at target+reloc_size so
+         * the original body continues.  This is needed even for small
+         * reloc_size (the relocator may not consume the full 16 bytes). */
         gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16,
                                              target + reloc_size);
         gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
     }
+    /* If hit_eob, the relocated code contains add+ret — self-contained:
+     * the ret returns directly to the caller (green_call_asm's BLR). */
     gum_arm64_writer_flush(&writer);
     gum_arm64_writer_clear(&writer);
     gum_arm64_relocator_clear(&relocator);
