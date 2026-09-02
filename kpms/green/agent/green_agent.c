@@ -60,6 +60,7 @@ static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
                                            uint64_t arg, const void *payload,
                                            uint32_t len, int64_t *value);
 static void green_agent_broker_log(const char *text, size_t len);
+static JSValue js_native_broker_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 
 /* Frida-style API layer, evaluated once before any user script.  Native
  * primitives (__green_*) are registered in js_ensure_runtime(). */
@@ -316,7 +317,15 @@ static const char kGreenPrelude[] =
     "            callbacks && callbacks.onEnter\n"
     "                ? function (args) { callbacks.onEnter(args.map(function (a) { return new NativePointer(a); })); } : undefined,\n"
     "            callbacks && callbacks.onLeave\n"
-    "                ? function (retval) { var r = callbacks.onLeave(retval); return r === undefined ? retval : r; } : undefined);\n"
+    "                ? function (retval_raw) {\n"
+    "                    var retval = {\n"
+    "                        _v: retval_raw,\n"
+    "                        toInt32: function () { return Number(BigInt.asIntN(32, BigInt(this._v))); },\n"
+    "                        replace: function (v) { this._v = (typeof v === 'object' && v !== null && v.__v !== undefined) ? Number(v.__v) : v; }\n"
+    "                    };\n"
+    "                    callbacks.onLeave(retval);\n"
+    "                    return retval._v;\n"
+    "                } : undefined);\n"
     "    }\n"
     "};\n"
     "var Memory = {\n"
@@ -363,7 +372,19 @@ static const char kGreenPrelude[] =
     "    }\n"
     "}\n"
     "var rpc = { exports: {} };\n"
-    "\n";
+    "\n"
+    "var console = {\n"
+    "    log: function () {\n"
+    "        var msg = Array.prototype.join.call(arguments, ' ');\n"
+    "        __green_broker_log(msg);\n"
+    "    },\n"
+    "    info: function () { this.log.apply(this, arguments); },\n"
+    "    warn: function () { this.log.apply(this, arguments); },\n"
+    "    error: function () { this.log.apply(this, arguments); }\n"
+    "};\n"
+    "function send(message) {\n"
+    "    __green_broker_log(typeof message === 'string' ? message : JSON.stringify(message));\n"
+    "}\n";
 
 /* The shadow redirect lands here.  Runs the registered JS callback with the
  * live register arguments (x0-x7) and returns its result to the caller. */
@@ -719,6 +740,9 @@ static int js_ensure_runtime(char *err, size_t errlen)
             JS_SetPropertyStr(g_js_ctx, global, "selfTestTarget",
                 JS_NewCFunction(g_js_ctx, js_native_selftest_target,
                                 "selfTestTarget", 0));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_broker_log",
+                JS_NewCFunction(g_js_ctx, js_native_broker_log,
+                                "__green_broker_log", 1));
             JS_SetPropertyStr(g_js_ctx, global, "__green_pid",
                 JS_NewCFunction(g_js_ctx, js_native_pid, "__green_pid", 0));
             JS_SetPropertyStr(g_js_ctx, global, "__green_read_file",
@@ -1089,6 +1113,22 @@ static void green_agent_broker_log(const char *text, size_t len)
             green_agent_write_full(green_agent_broker_fd, text, len);
     }
     pthread_mutex_unlock(&green_agent_broker_lock);
+}
+
+static JSValue js_native_broker_log(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    const char *msg;
+    (void)this_val;
+    if (argc >= 1) {
+        msg = JS_ToCString(ctx, argv[0]);
+        if (msg) {
+            __android_log_print(ANDROID_LOG_INFO, "green-js", "%s", msg);
+            green_agent_broker_log(msg, strlen(msg));
+            JS_FreeCString(ctx, msg);
+        }
+    }
+    return JS_UNDEFINED;
 }
 
 static int green_agent_broker_request_full(uint32_t command, uint64_t addr,

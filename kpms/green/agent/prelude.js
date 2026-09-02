@@ -250,7 +250,15 @@ var Interceptor = {
             callbacks && callbacks.onEnter
                 ? function (args) { callbacks.onEnter(args.map(function (a) { return new NativePointer(a); })); } : undefined,
             callbacks && callbacks.onLeave
-                ? function (retval) { var r = callbacks.onLeave(retval); return r === undefined ? retval : r; } : undefined);
+                ? function (retval_raw) {
+                    var retval = {
+                        _v: retval_raw,
+                        toInt32: function () { return Number(BigInt.asIntN(32, BigInt(this._v))); },
+                        replace: function (v) { this._v = (typeof v === 'object' && v !== null && v.__v !== undefined) ? Number(v.__v) : v; }
+                    };
+                    callbacks.onLeave(retval);
+                    return retval._v;
+                } : undefined);
     }
 };
 var Memory = {
