@@ -1571,12 +1571,22 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
     if (!JS_IsUndefined(c->onleave)) {
         pthread_mutex_lock(&g_js_lock);
         JS_UpdateStackTop(g_js_rt);
+        __android_log_print(ANDROID_LOG_INFO, "green-debug", "onleave: calling JS cb");
         argv[0] = JS_NewInt64(g_js_ctx, ret);
         rv = JS_Call(g_js_ctx, c->onleave, JS_UNDEFINED, 1, argv);
-        if (!JS_IsException(rv) && !JS_IsUndefined(rv)) {
+        if (JS_IsException(rv)) {
+            JSValue exc = JS_GetException(g_js_ctx);
+            const char *emsg = JS_ToCString(g_js_ctx, exc);
+            __android_log_print(ANDROID_LOG_ERROR, "green-debug",
+                "onleave JS error: %s", emsg ? emsg : "?");
+            if (emsg) JS_FreeCString(g_js_ctx, emsg);
+            JS_FreeValue(g_js_ctx, exc);
+        } else if (!JS_IsUndefined(rv)) {
             int64_t v = ret;
             JS_ToInt64(g_js_ctx, &v, rv);
-            ret = v; /* green extension: onLeave may override the result */
+            ret = v;
+            __android_log_print(ANDROID_LOG_INFO, "green-debug",
+                "onleave: ret overridden to %lld", (long long)v);
         }
         JS_FreeValue(g_js_ctx, rv);
         pthread_mutex_unlock(&g_js_lock);
