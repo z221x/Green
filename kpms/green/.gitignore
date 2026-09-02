@@ -11,3 +11,4 @@ vendor/prefix/include/quickjs/
 .clangd
 compile_commands.json
 kpms/green/vendor/quickjs/
+vendor/frida-java-bridge/
