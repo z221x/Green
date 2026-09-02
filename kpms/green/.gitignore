@@ -1,16 +1,13 @@
-# Local reference checkout supplied for research; source is not part of Green.
-tmp/
-
-# Build outputs
 build/
-*.o
-*.kpm
-
-compile_commands.json
-# Vendored open-source sources and cross-build outputs are fetched/built
-# locally (see vendor/README.md); only our own scripts and configs are committed.
+tmp/
 vendor/frida-gum/
-vendor/prefix/
 vendor/meson14/
-vendor/quickjs/
-vendor/scratch/
+vendor/prefix/lib/
+vendor/prefix/include/quickjs/
+*.o
+*.so
+*.kpm
+.DS_Store
+.clangd
+compile_commands.json
+kpms/green/vendor/quickjs/

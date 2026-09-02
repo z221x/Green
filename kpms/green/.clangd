@@ -1,6 +1,0 @@
-CompileFlags:
-  CompilationDatabase: .
-  Remove:
-    - -arch
-    - -isysroot
-    - -mmacosx-version-min=*

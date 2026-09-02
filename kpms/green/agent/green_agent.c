@@ -1563,12 +1563,6 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
     if (!c->used || !c->orig_cont)
         return 0;
 
-    __android_log_print(ANDROID_LOG_INFO, "green-trace",
-        "tramp enter: id=%d used=%d orig=%llx onenter=%d onleave=%d",
-        (int)g_current_hook_id, c->used,
-        (unsigned long long)c->orig_cont,
-        !JS_IsUndefined(c->onenter), !JS_IsUndefined(c->onleave));
-
     if (!JS_IsUndefined(c->onenter)) {
         pthread_mutex_lock(&g_js_lock);
         JS_UpdateStackTop(g_js_rt);
@@ -1583,16 +1577,11 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
         pthread_mutex_unlock(&g_js_lock);
     }
 
-    __android_log_print(ANDROID_LOG_INFO, "green-trace",
-        "tramp calling orig_cont=%llx", (unsigned long long)c->orig_cont);
     ret = green_call_asm((const void *)(uintptr_t)c->orig_cont, vals, 8);
-    __android_log_print(ANDROID_LOG_INFO, "green-trace",
-        "tramp orig returned %lld", (long long)ret);
 
     if (!JS_IsUndefined(c->onleave)) {
         pthread_mutex_lock(&g_js_lock);
         JS_UpdateStackTop(g_js_rt);
-        __android_log_print(ANDROID_LOG_INFO, "green-debug", "onleave: calling JS cb");
         argv[0] = JS_NewInt64(g_js_ctx, ret);
         rv = JS_Call(g_js_ctx, c->onleave, JS_UNDEFINED, 1, argv);
         if (JS_IsException(rv)) {
@@ -1606,8 +1595,6 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
             int64_t v = ret;
             JS_ToInt64(g_js_ctx, &v, rv);
             ret = v;
-            __android_log_print(ANDROID_LOG_INFO, "green-debug",
-                "onleave: ret overridden to %lld", (long long)v);
         }
         JS_FreeValue(g_js_ctx, rv);
         pthread_mutex_unlock(&g_js_lock);
@@ -1695,10 +1682,6 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
     uint32_t orig_bytes[8];
     memcpy(orig_bytes, (const void *)(uintptr_t)target, sizeof(orig_bytes));
 
-    __android_log_print(ANDROID_LOG_INFO, "green-debug",
-        "orig: %08x %08x %08x %08x  target=%llx",
-        orig_bytes[0], orig_bytes[1], orig_bytes[2], orig_bytes[3],
-        (unsigned long long)target);
 
     /* 1. Relocate the first instructions of the target into slot+32. */
     gum_arm64_writer_init(&writer, slot + 32);
@@ -1792,17 +1775,7 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
 
     /* 4. Make the slot executable. */
     if (mprotect(slot, 4096, PROT_READ | PROT_EXEC) != 0)
-        return JS_ThrowInternalError(ctx, "mprotect slot failed");
-
-    __android_log_print(ANDROID_LOG_INFO, "green-debug",
-        "slot+32 insn: %02x%02x%02x%02x %02x%02x%02x%02x | jumpback: %02x%02x%02x%02x %02x%02x%02x%02x | reloc=%d",
-        slot[32], slot[33], slot[34], slot[35], slot[36], slot[37],
-        slot[38], slot[39],
-        slot[32 + reloc_size], slot[33 + reloc_size],
-        slot[34 + reloc_size], slot[35 + reloc_size],
-        slot[36 + reloc_size], slot[37 + reloc_size],
-        slot[38 + reloc_size], slot[39 + reloc_size],
-        (int)reloc_size);
+        return JS_ThrowInternalError(ctx, "mprotect slot failed");;
 
     g_attach[id].used = 1;
     g_attach[id].orig_cont = (uint64_t)(uintptr_t)(slot + 32);

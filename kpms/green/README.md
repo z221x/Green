@@ -1,177 +1,168 @@
 # Green
 
-Green 是一个基于 KernelPatch Module (KPM) 的 ARM64 逆向工具集。项目采用“核心框架 + 工具模块 + CLI 子命令”的结构，后续可以继续增加新的工具，并允许工具之间复用公共 API。
+基于 KernelPatch Module (KPM) 的 Android ARM64 动态 hook 框架，采用 frida-server 架构。
 
-## 结构
+## 架构
 
-```text
-kpms/green/
-├── green.c                  # KPM 入口与工具调度
-├── emu/
-│   └── emu.c                # 可复用的 ARM64 单指令读写模拟器
-├── include/
-│   ├── green.h
-│   ├── green/abi.h          # 用户态 / 内核态共享 ABI 常量
-│   ├── green/tool.h         # Green 工具抽象
-│   ├── green/cli.h          # CLI 工具抽象与公共 helper
-│   ├── green/shadow.h       # CLI shadow client API
-│   ├── green/shadow_internal.h # KPM shadow 内部接口
-│   ├── green/emu.h          # 单指令模拟器公共接口
-│   ├── green/symbol.h       # 内核符号地址与解析接口
-│   └── green/hook.h         # shadow 工具对外 API
-├── shadow/
-│   ├── shadow.c             # shadow 工具生命周期、prctl ABI、页对象管理
-│   ├── shadow_pgtable.c     # 页表切换、TLB/cache 维护
-│   └── shadow_fault.c       # page fault / GUP / exit_mmap 处理与同页模拟
-├── green_hook/              # green_hook：gum 源码级接入
-│   ├── IO_MAP.md            # gum 内存 I/O 与调用点梳理、替换映射
-│   ├── gummemory-green.c    # gum 内存后端：hook 读写走 shadow
-│   ├── green_gum.h          # green 扩展（release）声明
-│   ├── vendor/gum/          # frida-gum 源码（逐字未改）：GumArm64Writer 等
-│   └── shim/                # glib/capstone 最小垫片（仅外部依赖）
-├── agent/
-│   ├── green_agent.c        # 注入 payload、工具分发 socket、QuickJS bridge
-│   │                        # 与 Frida 风格 API 层（Interceptor/Process/Module）
-│   ├── green_agent.h        # 可扩展 agent/broker 协议接口
-│   ├── example_hook.js      # QuickJS hook 示例
-│   └── README.md            # 注入、协议、JS API 和扩展说明
-├── common/
-│   ├── common.c             # CLI 公共解析、solist、prctl、process_vm helpers
-│   ├── agentops.c           # 注入器 / agent 协议客户端 / broker 原语
-│   └── symbol.c             # KPM 内核符号提取与地址解析
-├── tests/
-│   └── test_hook.c          # green_hook 端到端用例（patch/读原始/恢复）
-├── server/                  # ★ 手机端二进制源码（≈ frida-server，无命令行）
-│   ├── main.c               #    入口：直接运行守护进程
-│   └── server.c             #    TCP 守护进程（默认 27042），承载全部特权操作
-├── cli/                     # ★ 主机端 CLI（Python，跨平台）
-│   ├── green.py             #    ps / attach / shadow 全部功能
-│   └── README.md            #    使用说明与 wire 协议文档
+```
+主机 (cli/green.py)  ──TCP 27042──►  手机 green server (root)
+  ps / attach / shadow                  ├─ ptrace 注入 libgreen_agent.so
+                                        ├─ broker: shadow 页面操作
+                                        └─ JS 消息流回流
+                                             │ unix @green.agent.<pid>
+                                             ▼
+                                        目标进程内 QuickJS + frida API
 ```
 
-## 当前工具：shadow
+## 目录结构
 
-Green 的 shadow 工具重新实现了一个 patch-oriented 的 R^X / W^X shadow-page hook 核心：
+```
+kpms/green/
+├── green.c                  # KPM 入口（内核侧）
+├── shadow/                  # KPM shadow 引擎
+│   ├── shadow.c             #   生命周期、prctl ABI、页对象管理
+│   ├── shadow_pgtable.c     #   页表切换、TLB/cache 维护
+│   └── shadow_fault.c       #   fault/GUP/exit_mmap + 同页模拟
+├── emu/emu.c                # ARM64 单指令模拟器
+├── green_hook/              # vendored frida-gum 源码接入
+│   ├── gummemory-green.c    #   gum 内存后端（shadow 提交）
+│   ├── vendor/gum/          #   frida-gum 源码（Writer/Relocator 等）
+│   └── shim/                #   glib/capstone 头文件垫片
+├── include/green/           # 共享头文件（abi/wire/agentops/cli）
+├── common/
+│   ├── common.c             # CLI 公共 helper
+│   ├── agentops.c           # 注入器 + agent 协议 + broker 原语
+│   └── symbol.c             # KPM 内核符号解析
+├── server/                  # ★ 手机端守护进程（≈ frida-server）
+│   ├── main.c               #   入口：直接运行（--port）
+│   └── server.c             #   TCP 守护进程 + shadow 远程操作
+├── cli/                     # ★ 主机端 CLI（Python）
+│   ├── green.py             #   ps/attach/shadow 全部功能
+│   └── README.md            #   使用说明 + wire 协议
+├── agent/                   # ★ 注入目标进程的 payload
+│   ├── green_agent.c        #   transport + QuickJS + JS API
+│   ├── green_agent.h        #   agent/broker 协议
+│   ├── prelude.js           #   JS API 层（Interceptor/Memory/Module）
+│   ├── gummemory-green-payload.c  # broker 内存后端
+│   ├── gumprofiler-stub.c   #   profiler 符号桩
+│   ├── link-payload.sh      #   payload 链接脚本
+│   ├── example_hook.js      #   hook 脚本示例
+│   └── README.md
+├── tests/test_hook.c        # KPM 回归测试
+├── doc/KNOWN-ISSUES.md      # 已知问题与解决方案
+├── vendor/                  # frida-gum 源码 + 构建产物（gitignore）
+├── Makefile
+└── README.md
+```
 
-- 目标虚拟页保留两份物理页：original page 和 shadow page。
-- 执行时 PTE 指向 shadow page，并设置为用户态仅执行（`--x`）。
-- 用户态读取代码触发 data abort 后，临时切到 original page 只读不可执行（`r--`），读取校验看到原始代码。
-- 再次执行触发 instruction abort 后，切回 shadow page。
-- 代码和数据位于同一页时，使用 `emu/` 中的单指令 ARM64 模拟器从 original page 读取数据并推进 `pt_regs->pc`，避免整页切换造成 fault 循环。
-- hook `follow_page_pte` 时临时暴露 original PTE，覆盖 `/proc/pid/mem`、`process_vm_readv`、`ptrace` 等 GUP 读取路径。
-- hook `exit_mmap` 自动释放进程退出时遗留的 shadow 页。
-- 控制入口是 `prctl`，只允许 root 调用。注入到目标进程的 agent 没有内核特权：broker 请求（页面快照 + GumArm64Writer 编码 + prctl）与全部 shadow 操作由设备端 `green`（server）代主机 CLI 执行。设备端没有命令行工具，所有功能（含 shadow patch/nop/branch/release/maps）都在主机端 `cli/green.py`（详见 `agent/README.md` 与 `cli/README.md`）。
+## 快速开始
 
-内核符号统一由 `common/symbol.c` 提取和解析，地址变量及公共声明集中在 `include/green/symbol.h`；其他 KPM 工具只通过该头文件使用已解析地址。
-
-与参考项目不同：
-
-- 没有照搬 wxshadow 代码；当前实现仅保留核心页表切换思路。
-- 删除 BRK 断点命中后修改寄存器功能。
-- 当前主能力是 hidden patch / inline branch / NOP；后续工具可以通过 `green_shadow_patch_kernel()` 复用 shadow patch 能力。
-
-## 构建
+### 构建
 
 ```sh
-cd kpms/green
-make TARGET_COMPILE=aarch64-elf-
-make client
-make testhook
-make agent
+# 1. 初始化 vendor（首次）
+cd vendor && ./setup.sh
+
+# 2. 构建 KPM（需要 KernelPatch 环境）
+make TARGET_COMPILE=aarch64-elf- KP_DIR=../../kernel
+
+# 3. 构建 CLI + server + payload
+make client agent
 ```
 
-CLI 工具示例（单二进制）：
+### 部署
 
 ```sh
 adb push build/green /data/local/tmp/green
-python3 kpms/green/cli/green.py shadow count -p <pid>
-
-# hook：注入 + 加载 JS hook 脚本一步完成
 adb push build/libgreen_agent.so /data/local/tmp/libgreen_agent.so
-adb push agent/example_hook.js /data/local/tmp/hook.js
-adb shell su -c "/data/local/tmp/green hook attach -p <pid> -l /data/local/tmp/hook.js"
-adb shell su -c "/data/local/tmp/green hook attach -f <package> -c \"log('hello')\""
+adb shell su -c 'chmod 755 /data/local/tmp/green /data/local/tmp/libgreen_agent.so'
+
+# 启动守护进程
+adb shell su -c '/data/local/tmp/green'
+
+# 主机端
+adb forward tcp:27042 tcp:27042
+python3 cli/green.py ps
 ```
 
-所有构建产物统一输出到 `build/`：
+### Hook 脚本
 
-```text
-build/
-├── green.kpm              # KPM
-├── green                  # Android ARM64 CLI
-├── test_hook              # green_hook 端到端用例（需 root + 已加载 KPM）
-├── libgreen_agent.so      # 注入目标进程的 agent payload
-└── *.o                    # KPM 中间目标文件
+```js
+// example_hook.js — frida 语法
+console.log("pid:", Process.id);
+
+var openPtr = Module.getExportByName("libc.so", "open");
+console.log("open @", openPtr);
+
+Interceptor.attach(openPtr, {
+    onEnter: function (args) {
+        console.log("open:", args[0].readCString());
+    },
+    onLeave: function (retval) {
+        console.log("open returned:", retval.toInt32());
+        // retval.replace(0);  // 修改返回值
+    }
+});
 ```
-
-如果需要按设备上的 KernelPatch 版本构建：
 
 ```sh
-make TARGET_COMPILE=aarch64-elf- KP_DIR=/path/to/KernelPatch-0.13.3
+python3 cli/green.py attach -p <pid> -l example_hook.js
+python3 cli/green.py attach -f com.example.app -l example_hook.js
 ```
 
-## green_hook（gum 源码级接入）
+## JS API
 
-`green_hook/` 直接编译 frida-gum 源码（`green_hook/vendor/gum/`，未修改），hook 时的内存读写全部替换为 shadow 操作（详见 `green_hook/IO_MAP.md`）：
+| API | 状态 |
+|-----|------|
+| `Interceptor.attach` (onEnter + onLeave) | ✅ |
+| `Interceptor.replace / revert` | ✅ |
+| `retval.replace(value)` | ✅ |
+| `NativeFunction` | ✅ |
+| `NativeCallback` | ✅ |
+| `NativePointer` (read*/write*/算术) | ✅ |
+| `Int64 / UInt64` | ✅ |
+| `Module.getBaseAddress / getExportByName` | ✅ |
+| `Process.id / arch / platform` | ✅ |
+| `Process.enumerateModules()` | ✅ |
+| `Memory.alloc / free / protect / read* / write*` | ✅ |
+| `console.log` / `send()` → 主机流 | ✅ |
+| `recv(type, callback)` | ✅ |
+| `rpc.exports` | ✅ |
+| `File.read / write` | ✅ |
+| `Thread.sleep` | ✅ |
 
-- `gum_memory_patch_code()`：gum via_remap 骨架，remap 对实现为快照/提交 —— apply 回调由真实 `GumArm64Writer` 发射重定向，提交时逐页 `prctl(PR_GREEN_SHADOW_PATCH)`；执行看到补丁，读取看到原始字节。
-- `gum_memory_read()`：仍走 `process_vm_readv`，GUP hook 返回原始页。
-- `green_gum_release_page()` ↔ gum `deactivate_trampoline`：恢复原始 PTE。
-- 指令编码全部来自 gum 源码（实测输出 `58000050 d61f0200 .quad`），无任何手写二进制 hook；shim 仅覆盖 glib/capstone 枚举等外部依赖。
-
-用例（设备上以 root 运行，需先加载 KPM）：
+## shadow 命令（主机端）
 
 ```sh
-make testhook
-adb push build/test_hook /data/local/tmp/
-adb shell su -c /data/local/tmp/test_hook
+python3 cli/green.py shadow maps   -p PID [filter]
+python3 cli/green.py shadow count  -p PID
+python3 cli/green.py shadow patch  -p PID -a 0xADDR -x d503201f
+python3 cli/green.py shadow nop    -p PID -a 0xADDR -n 2
+python3 cli/green.py shadow branch -p PID -a 0xADDR -t 0xTARGET
+python3 cli/green.py shadow release -p PID [-a 0xADDR]
 ```
 
-验证点：
+## shadow 页面原理
 
-1. `target_fn()` 被重定向到 `replacement_fn()`（执行看到 shadow 补丁）；
-2. GUP 读与直接读均返回原始字节（读取看到 original page）；
-3. `ldr x16,#8` 从 shadow 页自身的 literal pool 取地址（同页自读模拟）；
-4. release 后 `target_fn()` 恢复原行为。
-
-## CLI 用法
-
-shadow 命令全部在主机端执行（见上）。
-```
+- 目标虚拟页保留两份物理页：original page 和 shadow page
+- 执行时 PTE 指向 shadow page（`--x`）
+- 数据读取 fault 后临时切到 original page（`r--`）
+- 再次执行 fault 后切回 shadow page
+- 同页自读通过 ARM64 单指令模拟器从 shadow 读取
+- GUP 读取（`process_vm_readv`、`ptrace`）看到 original 页
+- `exit_mmap` 自动清理
 
 ## prctl ABI
 
 | 命令 | 值 | 参数 |
 |------|----|------|
 | `PR_GREEN_SHADOW_PATCH` | `0x47524801` | `pid, addr, user_buf, len` |
-| `PR_GREEN_SHADOW_RELEASE` | `0x47524802` | `pid, addr, 0, 0`，`addr=0` 表示全部释放 |
+| `PR_GREEN_SHADOW_RELEASE` | `0x47524802` | `pid, addr(0=全部), 0, 0` |
 | `PR_GREEN_SHADOW_COUNT` | `0x47524803` | `pid, 0, 0, 0` |
-
-## 扩展方式
-
-### 新增 KPM 工具
-
-1. 实现一个 `const struct green_tool your_tool`。
-2. 在 `green.c` 的 `green_tools[]` 中加入它。
-3. 如果要复用 shadow 能力，include `<green/hook.h>` 后调用：
-
-```c
-green_shadow_patch_kernel(pid, addr, patch, patch_len);
-green_shadow_release_task(pid, addr);
-```
-
-### 新增 CLI 工具
-
-1. 在 `cli/` 新增 `<tool>.c`。
-2. 需要声明时，在 `include/green/` 新增对应头文件。
-3. 暴露 `const struct green_cli_tool green_cli_<tool>_tool`。
-4. 在 `common/common.c` 的工具表中注册。
-5. 可 include `<green/shadow.h>` 复用 shadow 的 patch/release/count/branch 编码能力。
 
 ## 限制
 
-- 当前只支持 ARM64 + 4K 用户页粒度。
-- `emu/` 支持常见 GPR 标量 `LDR/STR`、`LDUR/STUR`、寄存器偏移、前/后索引、`LDRSB/LDRSH/LDRSW`、literal load、`LDP/STP`，以及 SIMD/FP `LDR B/H/S/D/Q`、literal load、`LDP S/D/Q`；exclusive、跨页访问暂不模拟。
-- `patch` 不能跨目标页。
-- 当前拒绝 ARM64 contiguous PTE 页面。
-- 直接修改目标进程页表；测试前请保证设备可恢复。
+- 仅支持 ARM64 + 4K 页
+- `patch` 不能跨页
+- 拒绝 contiguous PTE
+- 详见 `doc/KNOWN-ISSUES.md`
