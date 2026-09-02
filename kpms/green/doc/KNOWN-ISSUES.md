@@ -220,3 +220,27 @@ trampoline（从 String.intern 的 quick 槽取 ClassLinker 重定位副本）�
    入口不 marshal（返回值已处理）。
 3. `implementation = null`（还原）未实现；静态方法 hook 未验证。
 4. 非静态方法在实例 wrapper 上按需绑定（跳过静态防 `valueOf` 污染）。
+
+## frida-java-bridge 移植（2026-09-02 晚）
+
+**已打通**：fjb 7.0.13 esbuild 打包嵌入；宿主 API 兼容层（patchCode/CModule/
+Arm64Writer/Instruction.parse/Module 全方法/ELF 扫描破 namespace/SELinux 下
+无 /proc/self/mem 的 maps+memcpy 内存原语）；fjb 初始化全链：
+flavor=art → GetCreatedJavaVMs（PAC 句柄 untag）→ Runtime 字段扫描
+（vm@+632/classLinker/internTable/trampoline@+360）→ CModule artController
+编译链接 → **Java.available = true**。
+
+**KPM 新能力**：`green_shadow_split_block()` —— 遇 2MB block 描述符
+（系统库 libart r-x 段是大页块映射）现场拆分为 512 项 4K 下级表，
+全块 TLB 失效。shadow 页从此可用于系统库。
+
+**已知问题**：
+1. fjb artController 会 `Interceptor.replace` 全局
+   `artQuickGenericJniTrampoline`，在 MIUI（exp_funnel 内核特性）上触发
+   后出现 `exp_funnel_lock` D 状态死锁（calculator 进程杀不掉）。候选缓解：
+   a) 用 fjb 的保守选项避免全局 trampoline 替换；b) KPM shadow 机制本身
+   对该页工作正常（拆分后），死锁疑似 MIUI 特有的内核锁与用户态 hook 交互。
+2. `Script.bindWeak` 为强引用池（对象不回收，泄漏型语义）。
+3. hook 入口最多 6 个 Java 参数；float/double 参数不 marshal。
+4. enumerateSymbols 对无 .symtab 的库（libart）只返回 dynsym；
+   fjb 需要的内部符号走 findExportByName（dlsym + ELF 扫描）。
