@@ -5,8 +5,27 @@ var Process = {
     pageSize: 4096,
     enumerateModulesSync: __green_modules
 };
+Process.enumerateModules = function () { return __green_modules(); };
+Process.findModuleByName = function (name) {
+    var ms = __green_modules();
+    for (var i = 0; i < ms.length; i++) if (ms[i].name === name) return ms[i];
+    return null;
+};
+Process.getModuleByName = function (name) {
+    var m = Process.findModuleByName(name);
+    if (m === null) throw new Error('module not found: ' + name);
+    return m;
+};
+Process.findModuleByAddress = function (addr) {
+    var a = Number(new NativePointer(addr).__v);
+    var ms = __green_modules();
+    for (var i = 0; i < ms.length; i++)
+        if (a >= ms[i].base && a < ms[i].base + ms[i].size) return ms[i];
+    return null;
+};
 var Module = {
     enumerateModulesSync: __green_modules,
+    enumerateModules: function () { return __green_modules(); },
     getBaseAddress: function (name) {
         var ms = __green_modules();
         for (var i = 0; i < ms.length; i++)
@@ -119,19 +138,21 @@ class NativePointer {
                 var dv = new DataView(b);
                 return dv[getter](0, true);
             };
-            var wname = 'write' + name.slice(5);
+            var wname = 'write' + name.slice(4);
             NativePointer.prototype[wname] = function (value, offset) {
                 var a = Number(this.__v) + (offset || 0);
                 var b = new ArrayBuffer(size);
                 var dv = new DataView(b);
-                if (size === 8 && typeof value === 'bigint')
-                    dv[getter.replace('get', 'set')](0, value, true);
+                var setter = getter.replace('get', 'set');
+                if (getter === 'getFloat32' || getter === 'getFloat64')
+                    dv[setter](0, Number(value), true);
                 else if (size === 8)
-                    dv[getter.replace('get', 'set')](0, BigInt(value), true);
+                    dv[setter](0, typeof value === 'bigint' ? value : BigInt(value), true);
                 else
-                    dv[getter.replace('get', 'set')](0, value, true);
+                    dv[setter](0, value, true);
                 if (!__green_mem_write(a, b))
                     throw new Error('access violation writing at 0x' + a.toString(16));
+                return this;
             };
         })(name, rw[name][0], rw[name][1]);
     }
@@ -141,7 +162,42 @@ NativePointer.prototype.readPointer = function () {
 };
 NativePointer.prototype.writePointer = function (v) {
     this.writeU64(new NativePointer(v).__v);
+    return this;
 };
+function ptr(v) { return new NativePointer(v); }
+NativePointer.prototype.toMatchPattern = function () {
+    var v = BigInt.asUintN(64, BigInt(this.__v));
+    var s = [];
+    for (var i = 0; i < 8; i++) {
+        var b = Number((v >> BigInt(8 * i)) & 0xffn);
+        s.push((b < 16 ? '0' : '') + b.toString(16));
+    }
+    return s.join(' ').toUpperCase();
+};
+NativePointer.prototype.toUInt32 = function () { return Number(BigInt.asUintN(32, BigInt(this.__v))); };
+function hexdump(addr, options) {
+    var o = options || {};
+    var p = new NativePointer(addr);
+    var len = o.length || 256;
+    var off = o.offset || 0;
+    var base = o.base !== undefined ? Number(new NativePointer(o.base).__v) : Number(p.__v);
+    var lines = [];
+    for (var i = 0; i < len; i += 16) {
+        var a = Number(p.__v) + off + i;
+        var bytes = new NativePointer(a).readByteArray(Math.min(16, len - i));
+        var hex = '', asc = '';
+        for (var j = 0; j < bytes.length; j++) {
+            var b = bytes[j];
+            hex += (b < 16 ? '0' : '') + b.toString(16) + ' ';
+            asc += (b >= 32 && b < 127) ? String.fromCharCode(b) : '.';
+        }
+        while (hex.length < 48) hex += ' ';
+        lines.push('0x' + (base + i).toString(16).padStart(12, '0') + '  ' + hex + ' ' + asc);
+    }
+    var out = lines.join('\n');
+    log(out);
+    return out;
+}
 class Int64 {
     constructor(v) {
         if (v instanceof Int64) { this.__v = v.__v; return; }
@@ -305,3 +361,313 @@ function __green_recv_dispatch(type, payload_json) {
     }
 }
 var rpc = { exports: {} };
+
+/* ---- Java bridge ---------------------------------------------------- */
+var Java = { available: false, __classes: {}, __classIds: {} };
+
+Java.perform = function (fn) {
+    if (!Java.available) throw new Error('Java VM not available');
+    fn();
+};
+Java.use = function (name) {
+    if (!Java.available) throw new Error('Java VM not available');
+    if (Java.__classes[name]) return Java.__classes[name];
+    var clsId = __green_java_find_class(name);
+    if (clsId === null || clsId === 0) throw new Error('Class not found: ' + name);
+    Java.__classIds[name] = clsId;
+    var info = __green_java_class_info(clsId);
+    var w = Java.__classes[name] = __gj_wrap_class(name, clsId, info);
+    return w;
+};
+Java.cast = function (obj, klass) {
+    if (typeof obj === 'string') return obj;
+    return __gj_wrap_instance(klass.__name, obj);
+};
+Java.scheduleOnMainThread = function (fn) { fn(); };  /* simplification */
+
+function __gj_meth(mid, name, sig, isStatic, clsName) {
+    /* One overload.  m(...) invokes it; .implementation replaces it. */
+    var m = function () {
+        return __gj_call(clsName, 0, mid, sig, isStatic, arguments);
+    };
+    m.__mid = mid; m.__sig = sig; m.__static = isStatic;
+    m.__name = name; m.__cls = clsName;
+    m.overload = function () { return m; };  /* single-overload shortcut */
+    Object.defineProperty(m, 'implementation', {
+        set: function (fn) {
+            if (fn === null) {
+                throw new Error('implementation restore not supported yet');
+            }
+            var orig = function () {
+                return __gj_unwrap(__green_java_call_backup(
+                    Array.prototype.slice.call(arguments)));
+            };
+            __green_java_hook(Java.__classIds[clsName], mid, name, sig,
+                              isStatic ? 1 : 0, function () {
+                /* Instance hooks receive the receiver as a raw handle id:
+                 * wrap it so `this` is a proper instance wrapper. */
+                var recvRaw = arguments[0];
+                var recv = (typeof recvRaw === 'number' && recvRaw > 0)
+                    ? __gj_wrap_instance(clsName, recvRaw)
+                    : __gj_unwrap(recvRaw);
+                var args = [];
+                for (var i = 1; i < arguments.length; i++)
+                    args.push(__gj_unwrap(arguments[i]));
+                var self = __gj_hook_self(clsName,
+                    (recv && recv.__id) || 0, m);
+                if (recv && recv.__id) {
+                    /* `this.method(...)` inside the implementation must
+                     * reach the ORIGINAL: override it on this per-call
+                     * wrapper (wrappers are fresh objects, no pollution). */
+                    recv[m.__name] = function () {
+                        return orig.apply(null, arguments);
+                    };
+                }
+                var r = fn.apply(recv && recv.__id ? recv : self, args);
+                __gj_hook_done();
+                return r;
+            });
+        },
+        get: function () { return undefined; }
+    });
+    return m;
+}
+
+function __gj_wrap_class(name, clsId, info) {
+    var w = { __name: name, __clsId: clsId, __isClass: true };
+    var byname = {};
+    /* methods (dedupe name+sig from getMethods/getDeclaredMethods) */
+    for (var i = 0; i < info.methods.length; i++) {
+        var e = info.methods[i];
+        var key = e.name + '.' + e.sig;
+        if (byname[key]) continue;
+        var mid = __green_java_get_method_id(clsId, e.name, e.sig, e['static'] ? 1 : 0);
+        if (mid === 0) continue;
+        var m = __gj_meth(mid, e.name, e.sig, e['static'], name);
+        byname[key] = m;
+        if (!w[e.name] || (e['static'] && !w[e.name].__static &&
+                           !w[e.name].__group)) {
+            w[e.name] = m;
+        } else if (w[e.name] && !w[e.name].__group) {
+            /* second overload for same name: build a dispatcher */
+            (function (mn) {
+                var first = w[mn];
+                var disp = function () {
+                    var pick = __gj_pick(disp.__group, arguments);
+                    return pick.apply(null, arguments);
+                };
+                disp.__group = [first];
+                disp.overload = function (sig) {
+                    for (var k = 0; k < disp.__group.length; k++)
+                        if (disp.__group[k].__sig === sig) return disp.__group[k];
+                    throw new Error('no overload ' + sig);
+                };
+                Object.defineProperty(disp, 'implementation', {
+                    set: function (fn) {
+                        for (var k = 0; k < disp.__group.length; k++)
+                            disp.__group[k].implementation = fn;
+                    },
+                    get: function () { return undefined; }
+                });
+                w[mn] = disp;
+            })(e.name);
+        }
+        if (w[e.name] && w[e.name].__group) w[e.name].__group.push(m);
+    }
+    /* constructors */
+    w.$new = function () {
+        var args = [];
+        for (var ai = 0; ai < arguments.length; ai++)
+            args.push(arguments[ai]);
+        var pick = null, bestScore = -1;
+        for (var i = 0; i < info.ctors.length; i++) {
+            var sig = info.ctors[i].sig;
+            var st = __gj_argtypes(sig);
+            if (st.length !== args.length) continue;
+            var sc = __gj_score(st, args);
+            if (sc > bestScore) { bestScore = sc; pick = sig; }
+        }
+        if (pick === null && info.ctors.length > 0)
+            for (var i = 0; i < info.ctors.length; i++) {
+                if (__gj_argcount(info.ctors[i].sig) === args.length) {
+                    pick = info.ctors[i].sig;
+                    break;
+                }
+            }
+        if (pick === null && info.ctors.length > 0)
+            pick = info.ctors[0].sig;
+        if (pick === null) throw new Error('no constructor for ' + name);
+        var cmid = __green_java_get_method_id(clsId, '<init>', pick, 0);
+        if (cmid === 0) throw new Error('ctor <init>' + pick + ' not found');
+        var id = __green_java_new_object(clsId, cmid, pick, args);
+        return __gj_wrap_instance(name, id);
+    };
+    w.$dispose = function () {};
+    return w;
+}
+
+function __gj_argcount(sig) {
+    var d = sig.indexOf(')');
+    var inner = sig.substring(1, d);
+    var n = 0, i = 0;
+    while (i < inner.length) {
+        var c = inner[i];
+        if (c === 'L') { while (inner[i] !== ';') i++; i++; }
+        else if (c === '[') { i++; if (inner[i] === 'L') { while (inner[i] !== ';') i++; i++; } }
+        else i++;
+        n++;
+    }
+    return n;
+}
+
+function __gj_argtypes(sig) {
+    var d = sig.indexOf(')');
+    var inner = sig.substring(1, d);
+    var t = [], i = 0;
+    while (i < inner.length) {
+        var c = inner[i];
+        if (c === 'L') { while (inner[i] !== ';') i++; i++; t.push('L'); }
+        else if (c === '[') { i++; if (inner[i] === 'L') { while (inner[i] !== ';') i++; } i++; t.push('L'); }
+        else { i++; t.push(c); }
+    }
+    return t;
+}
+
+function __gj_score(sigTypes, args) {
+    var score = 0;
+    for (var i = 0; i < sigTypes.length; i++) {
+        var t = sigTypes[i], a = args[i];
+        if (a === null || a === undefined) { score += 1; continue; }
+        var isStr = typeof a === 'string';
+        var isNum = typeof a === 'number' || typeof a === 'bigint';
+        var isObj = typeof a === 'object';
+        if (t === 'L' || t === '[') {
+            if (isStr || isObj) score += 2; else return -1;
+        } else if (t === 'J') {
+            if (isNum) score += 2; else return -1;
+        } else if (t === 'F' || t === 'D') {
+            if (isNum) score += 2; else return -1;
+        } else if (t === 'C' || t === 'Z') {
+            if (isNum && !isStr) score += 2;
+            else if (isStr && a.length === 1) score += 1;
+            else return -1;
+        } else {  /* B S I */
+            if (isNum) score += 2; else return -1;
+        }
+    }
+    return score;
+}
+
+function __gj_pick(group, args) {
+    var best = null, bestScore = -1;
+    for (var i = 0; i < group.length; i++) {
+        var st = __gj_argtypes(group[i].__sig);
+        if (st.length !== args.length) continue;
+        var sc = __gj_score(st, args);
+        if (sc > bestScore) { bestScore = sc; best = group[i]; }
+    }
+    if (best === null) {
+        var sigs = [];
+        for (var i = 0; i < group.length; i++) sigs.push(group[i].__sig);
+        throw new Error('no overload of ' + group[0].__name +
+                        ' takes ' + args.length + ' argument(s): ' +
+                        sigs.join(' '));
+    }
+    return best;
+}
+
+function __gj_unwrap(v) {
+    if (v !== null && typeof v === 'object' &&
+        v.__greenobj !== undefined) {
+        var cls = v.__greencls;
+        if (cls.charAt(0) === '[') return v;  /* arrays stay as markers */
+        if (!Java.__classes[cls]) {
+            try { Java.use(cls); } catch (e) { return v; }
+        }
+        return __gj_wrap_instance(cls, v.__greenobj);
+    }
+    return v;
+}
+
+function __gj_call(clsName, objId, mid, sig, isStatic, rawArgs) {
+    var args = [];
+    for (var i = 0; i < rawArgs.length; i++) args.push(rawArgs[i]);
+    return __gj_unwrap(__green_java_call(Java.__classIds[clsName], objId,
+                        mid, sig, isStatic ? 1 : 0, args));
+}
+
+/* Active-hook bookkeeping so `this.method(...)` inside implementations
+ * calls the original. */
+var __gj_active = 0;
+function __gj_hook_self(clsName, recvId, m) {
+    __gj_active++;
+    var orig = function () {
+        return __gj_unwrap(__green_java_call_backup(
+            Array.prototype.slice.call(arguments)));
+    };
+    var self = { __recv: recvId, $className: clsName, $orig: orig };
+    var klass = Java.__classes[clsName];
+    if (klass) {
+        for (var k in klass) {
+            if (k[0] === '$' || k.indexOf('__') === 0) continue;
+            (function (mn) {
+                var slot = klass[mn];
+                self[mn] = function () {
+                    var a = [];
+                    for (var i = 0; i < arguments.length; i++)
+                        a.push(arguments[i]);
+                    var m0 = slot && slot.__group
+                        ? __gj_pick(slot.__group, a) : slot;
+                    if (m0.__mid === m.__mid && m0.__sig === m.__sig)
+                        /* The hooked method itself: invoke the ORIGINAL
+                         * through this thread's backup ArtMethod. */
+                        return orig.apply(null, a);
+                    if (m0.__static)
+                        return __gj_call(clsName, 0, m0.__mid, m0.__sig, 1, a);
+                    return __gj_unwrap(__green_java_call(
+                        Java.__classIds[clsName],
+                        recvId, m0.__mid, m0.__sig, 0, a));
+                };
+            })(k);
+        }
+    }
+    return self;
+}
+function __gj_hook_done() { if (__gj_active > 0) __gj_active--; }
+
+/* Instance wrapper: obj.method(...) dispatches via the class table. */
+function __gj_wrap_instance(clsName, objId) {
+    var o = { __id: objId, __cls: clsName, __isInstance: true };
+    var klass = Java.__classes[clsName];
+    if (klass) {
+        for (var k in klass) {
+            if (k[0] === '$' || k.indexOf('__') === 0) continue;
+            (function (mn) {
+                var slot = klass[mn];
+                if (slot && slot.__static) return;  /* instance only */
+                if (slot && slot.__group) {
+                    var allStatic = true;
+                    for (var gi = 0; gi < slot.__group.length; gi++)
+                        if (!slot.__group[gi].__static) allStatic = false;
+                    if (allStatic) return;
+                }
+                o[mn] = function () {
+                    var clsId = Java.__classIds[clsName];
+                    var jargs = [];
+                    for (var i = 0; i < arguments.length; i++)
+                        jargs.push(arguments[i]);
+                    var m0 = slot && slot.__group
+                        ? __gj_pick(slot.__group, jargs) : slot;
+                    return __gj_unwrap(__green_java_call(clsId, o.__id,
+                        m0.__mid, m0.__sig, 0, jargs));
+                };
+            })(k);
+        }
+    }
+    o.toString = function () { return __green_java_to_string(o.__id); };
+    o.$dispose = function () { __green_java_delete_ref(o.__id); o.__id = 0; };
+    return o;
+}
+
+/* Lazy availability probe (safe on non-JVM processes). */
+Java.available = __green_java_available() ? true : false;

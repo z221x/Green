@@ -15,6 +15,18 @@ FGJ=$ROOT/vendor/frida-gum/build-gumjs/bindings/gumjs
 FG=$ROOT/vendor/frida-gum/build-gumjs/gum
 CS=$ROOT/vendor/frida-gum/subprojects/capstone/include/capstone
 
+# Generate prelude.inc from prelude.js (single source of truth)
+python3 - <<'PYGEN'
+src = open('agent/prelude.js').read()
+out = ['/* Auto-generated from prelude.js - do not edit. */',
+       'static const char kGreenPrelude[] =']
+for line in src.split('\n'):
+    esc = line.replace('\\','\\\\').replace('"','\\"')
+    out.append('    "' + esc + '\\n"')
+out[-1] += ';'
+open('agent/prelude.inc','w').write('\n'.join(out) + '\n')
+PYGEN
+
 # Compile the profiler stub
 $CC -c -O2 -w -o agent/gumprofiler-stub.o agent/gumprofiler-stub.c \
   -Iagent/stub-include \
@@ -29,9 +41,10 @@ $CC -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
   -I$ROOT/tmp/prefix/include/glib-2.0 -I$ROOT/tmp/prefix/lib/glib-2.0/include \
   -Ivendor/prefix/include/quickjs \
   -o build/libgreen_agent.so \
-  agent/green_agent.c agent/gummemory-green-payload.c \
+  agent/green_agent.c agent/gummemory-green-payload.c agent/java_bridge.c \
   -Wl,--allow-multiple-definition \
   -Wl,--start-group \
+  vendor/prefix/lib/libquickjs.a \
   $FGJ/libfrida-gumjs-1.0.a \
   $FG/libfrida-gum-1.0.a \
   $TP/libgobject-2.0.a $TP/libglib-2.0.a $TP/libgthread-2.0.a \
@@ -43,7 +56,6 @@ $CC -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
   vendor/frida-gum/build-gumjs/subprojects/libunwind/src/libunwind.a \
   vendor/frida-gum/build-gumjs/subprojects/libdwarf/src/lib/libdwarf/libdwarf.a \
   -Wl,--end-group \
-  vendor/prefix/lib/libquickjs.a \
   -lm -llog -ldl -lc++abi -lc
 
 echo "payload linked: build/libgreen_agent.so"

@@ -9,6 +9,16 @@
  */
 #include "green_agent.h"
 
+/* Android 15 MTE: malloc returns tagged pointers (0xb4...).  /proc/self/mem
+ * and process_vm_* reject tagged addresses, so strip the top byte in every
+ * memory primitive.  In-process dereferences ignore the tag (TBI) anyway. */
+#define GREEN_UNTAG(p) ((uint64_t)(p) & 0x00ffffffffffffffULL)
+
+/* dlopen() handle table: PAC-signed soinfo pointers cannot survive a JS
+ * Number round-trip, so scripts only ever see 1-based table IDs. */
+#define GREEN_MAX_DLH 64
+static void *g_dl_handles[GREEN_MAX_DLH];
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -48,11 +58,11 @@ struct green_agent_registry {
  * as the function result.
  * ------------------------------------------------------------------ */
 
-static JSRuntime *g_js_rt;
-static JSContext *g_js_ctx;
+JSRuntime *g_js_rt;
+JSContext *g_js_ctx;
 /* Recursive: a hook may fire on the same thread while the runtime lock is
  * held (e.g. a NativeFunction call made from a script under evaluation). */
-static pthread_mutex_t g_js_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+pthread_mutex_t g_js_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static JSValue g_js_fn;
 static int g_js_ready;
 static int green_agent_test_target(int value);
@@ -64,315 +74,7 @@ static JSValue js_native_broker_log(JSContext *ctx, JSValueConst this_val, int a
 
 /* Frida-style API layer, evaluated once before any user script.  Native
  * primitives (__green_*) are registered in js_ensure_runtime(). */
-static const char kGreenPrelude[] =
-    "var Process = {\n"
-    "    id: __green_pid(),\n"
-    "    arch: 'arm64',\n"
-    "    platform: 'linux',\n"
-    "    pageSize: 4096,\n"
-    "    enumerateModulesSync: __green_modules\n"
-    "};\n"
-    "var Module = {\n"
-    "    enumerateModulesSync: __green_modules,\n"
-    "    getBaseAddress: function (name) {\n"
-    "        var ms = __green_modules();\n"
-    "        for (var i = 0; i < ms.length; i++)\n"
-    "            if (ms[i].name === name || ms[i].path === name)\n"
-    "                return ms[i].base;\n"
-    "        throw new Error('Module not found: ' + name);\n"
-    "    },\n"
-    "    findBaseAddress: function (name) {\n"
-    "        try { return Module.getBaseAddress(name); }\n"
-    "        catch (e) { return null; }\n"
-    "    },\n"
-    "    findExportByName: function (moduleName, exportName) {\n"
-    "        return __green_find_export_safe(exportName);\n"
-    "    },\n"
-    "    getExportByName: function (moduleName, exportName) {\n"
-    "        var a = Module.findExportByName(moduleName, exportName);\n"
-    "        if (a === null) throw new Error('export not found: ' + exportName);\n"
-    "        return a;\n"
-    "    },\n"
-    "    load: function (path) { return new NativePointer(__green_dlopen(path)); }\n"
-    "};\n"
-    "var console = {\n"
-    "    log: function () { log(Array.prototype.join.call(arguments, ' ')); },\n"
-    "    info: function () { log(Array.prototype.join.call(arguments, ' ')); },\n"
-    "    warn: function () { log(Array.prototype.join.call(arguments, ' ')); },\n"
-    "    error: function () { log(Array.prototype.join.call(arguments, ' ')); }\n"
-    "};\n"
-    "\n"
-    "function __green_to_ptr(v) {\n"
-    "    if (v instanceof NativePointer) return v;\n"
-    "    return new NativePointer(v);\n"
-    "}\n"
-    "class NativePointer {\n"
-    "    constructor(v) {\n"
-    "        if (v instanceof NativePointer) { this.__v = v.__v; return; }\n"
-    "        if (v === null || v === undefined) { this.__v = 0n; return; }\n"
-    "        if (typeof v === 'bigint') { this.__v = BigInt.asUintN(64, v); return; }\n"
-    "        if (typeof v === 'number') { this.__v = BigInt.asUintN(64, BigInt(Math.trunc(v))); return; }\n"
-    "        if (typeof v === 'string') {\n"
-    "            var t = v.trim().toLowerCase();\n"
-    "            if (!t.startsWith('0x') && /^-?[0-9a-f]+$/.test(t)) t = '0x' + t;\n"
-    "            this.__v = BigInt.asUintN(64, BigInt(t));\n"
-    "            return;\n"
-    "        }\n"
-    "        this.__v = BigInt.asUintN(64, BigInt(v));\n"
-    "    }\n"
-    "    add(o) { return new NativePointer(this.__v + __green_to_ptr(o).__v); }\n"
-    "    sub(o) { return new NativePointer(this.__v - __green_to_ptr(o).__v); }\n"
-    "    and(o) { return new NativePointer(this.__v & __green_to_ptr(o).__v); }\n"
-    "    or(o) { return new NativePointer(this.__v | __green_to_ptr(o).__v); }\n"
-    "    xor(o) { return new NativePointer(this.__v ^ __green_to_ptr(o).__v); }\n"
-    "    shr(o) { return new NativePointer(this.__v >> BigInt(o)); }\n"
-    "    shl(o) { return new NativePointer(this.__v << BigInt(o)); }\n"
-    "    not() { return new NativePointer(~this.__v); }\n"
-    "    isNull() { return this.__v === 0n; }\n"
-    "    equals(o) { return this.__v === __green_to_ptr(o).__v; }\n"
-    "    compare(o) {\n"
-    "        var a = this.__v, b = __green_to_ptr(o).__v;\n"
-    "        return a < b ? -1 : (a > b ? 1 : 0);\n"
-    "    }\n"
-    "    toInt32() { return Number(BigInt.asIntN(32, this.__v)); }\n"
-    "    toString(radix) {\n"
-    "        radix = radix || 16;\n"
-    "        return radix === 16 ? '0x' + this.__v.toString(16) : this.__v.toString(radix);\n"
-    "    }\n"
-    "    toJSON() { return this.toString(); }\n"
-    "    readByteArray(len) {\n"
-    "        var b = __green_mem_read(Number(this.__v), len);\n"
-    "        if (b === null) throw new Error('access violation reading ' + len + ' bytes');\n"
-    "        return b;\n"
-    "    }\n"
-    "    writeByteArray(buf) {\n"
-    "        if (!__green_mem_write(Number(this.__v), buf))\n"
-    "            throw new Error('access violation writing ' + buf.byteLength + ' bytes');\n"
-    "    }\n"
-    "    readUtf8String(len) {\n"
-    "        var s = __green_read_utf8(Number(this.__v), len || 512);\n"
-    "        if (s === null) throw new Error('access violation reading string');\n"
-    "        var z = s.indexOf('\\u0000');\n"
-    "        return z >= 0 ? s.slice(0, z) : s;\n"
-    "    }\n"
-    "    readCString(len) { return this.readUtf8String(len); }\n"
-    "}\n"
-    "(function () {\n"
-    "    var rw = {\n"
-    "        readS8: [1, 'getInt8'], readU8: [1, 'getUint8'],\n"
-    "        readS16: [2, 'getInt16'], readU16: [2, 'getUint16'],\n"
-    "        readS32: [4, 'getInt32'], readU32: [4, 'getUint32'],\n"
-    "        readS64: [8, 'getBigInt64'], readU64: [8, 'getBigUint64'],\n"
-    "        readFloat: [4, 'getFloat32'], readDouble: [8, 'getFloat64']\n"
-    "    };\n"
-    "    for (var name in rw) {\n"
-    "        (function (name, size, getter) {\n"
-    "            NativePointer.prototype[name] = function (offset) {\n"
-    "                var a = Number(this.__v) + (offset || 0);\n"
-    "                var b = __green_mem_read(a, size);\n"
-    "                if (b === null) throw new Error('access violation reading ' + size + ' byte(s) at 0x' + a.toString(16));\n"
-    "                var dv = new DataView(b);\n"
-    "                return dv[getter](0, true);\n"
-    "            };\n"
-    "            var wname = 'write' + name.slice(5);\n"
-    "            NativePointer.prototype[wname] = function (value, offset) {\n"
-    "                var a = Number(this.__v) + (offset || 0);\n"
-    "                var b = new ArrayBuffer(size);\n"
-    "                var dv = new DataView(b);\n"
-    "                if (size === 8 && typeof value === 'bigint')\n"
-    "                    dv[getter.replace('get', 'set')](0, value, true);\n"
-    "                else if (size === 8)\n"
-    "                    dv[getter.replace('get', 'set')](0, BigInt(value), true);\n"
-    "                else\n"
-    "                    dv[getter.replace('get', 'set')](0, value, true);\n"
-    "                if (!__green_mem_write(a, b))\n"
-    "                    throw new Error('access violation writing at 0x' + a.toString(16));\n"
-    "            };\n"
-    "        })(name, rw[name][0], rw[name][1]);\n"
-    "    }\n"
-    "})();\n"
-    "NativePointer.prototype.readPointer = function () {\n"
-    "    return new NativePointer(this.readU64());\n"
-    "};\n"
-    "NativePointer.prototype.writePointer = function (v) {\n"
-    "    this.writeU64(new NativePointer(v).__v);\n"
-    "};\n"
-    "class Int64 {\n"
-    "    constructor(v) {\n"
-    "        if (v instanceof Int64) { this.__v = v.__v; return; }\n"
-    "        this.__v = BigInt.asIntN(64, typeof v === 'bigint' ? v : BigInt(v));\n"
-    "    }\n"
-    "    add(o) { return new Int64(this.__v + new Int64(o).__v); }\n"
-    "    sub(o) { return new Int64(this.__v - new Int64(o).__v); }\n"
-    "    and(o) { return new Int64(this.__v & new Int64(o).__v); }\n"
-    "    or(o) { return new Int64(this.__v | new Int64(o).__v); }\n"
-    "    xor(o) { return new Int64(this.__v ^ new Int64(o).__v); }\n"
-    "    shr(o) { return new Int64(this.__v >> BigInt(o)); }\n"
-    "    shl(o) { return new Int64(this.__v << BigInt(o)); }\n"
-    "    not() { return new Int64(~this.__v); }\n"
-    "    compare(o) {\n"
-    "        var a = this.__v, b = new Int64(o).__v;\n"
-    "        return a < b ? -1 : (a > b ? 1 : 0);\n"
-    "    }\n"
-    "    toNumber() { return Number(this.__v); }\n"
-    "    toString(radix) { return this.__v.toString(radix || 10); }\n"
-    "    toJSON() { return this.toString(); }\n"
-    "    valueOf() { return this.toNumber(); }\n"
-    "}\n"
-    "class UInt64 {\n"
-    "    constructor(v) {\n"
-    "        if (v instanceof UInt64) { this.__v = v.__v; return; }\n"
-    "        this.__v = BigInt.asUintN(64, typeof v === 'bigint' ? v : BigInt(v));\n"
-    "    }\n"
-    "    add(o) { return new UInt64(this.__v + new UInt64(o).__v); }\n"
-    "    sub(o) { return new UInt64(this.__v - new UInt64(o).__v); }\n"
-    "    and(o) { return new UInt64(this.__v & new UInt64(o).__v); }\n"
-    "    or(o) { return new UInt64(this.__v | new UInt64(o).__v); }\n"
-    "    xor(o) { return new UInt64(this.__v ^ new UInt64(o).__v); }\n"
-    "    shr(o) { return new UInt64(this.__v >> BigInt(o)); }\n"
-    "    shl(o) { return new UInt64(this.__v << BigInt(o)); }\n"
-    "    not() { return new UInt64(~this.__v); }\n"
-    "    compare(o) {\n"
-    "        var a = this.__v, b = new UInt64(o).__v;\n"
-    "        return a < b ? -1 : (a > b ? 1 : 0);\n"
-    "    }\n"
-    "    toNumber() { return Number(this.__v); }\n"
-    "    toString(radix) { return this.__v.toString(radix || 10); }\n"
-    "    toJSON() { return this.toString(); }\n"
-    "    valueOf() { return this.toNumber(); }\n"
-    "}\n"
-    "function __green_to_big(v) {\n"
-    "    if (typeof v === 'bigint') return v;\n"
-    "    if (typeof v === 'number') return BigInt(Math.trunc(v));\n"
-    "    if (v && v.__v !== undefined) return v.__v;\n"
-    "    return BigInt(v);\n"
-    "}\n"
-    "function __green_wrap_ret(raw, type) {\n"
-    "    raw = __green_to_big(raw);\n"
-    "    switch (type) {\n"
-    "        case 'pointer': return new NativePointer(raw);\n"
-    "        case 'int': return Number(BigInt.asIntN(32, raw));\n"
-    "        case 'uint': return Number(BigInt.asUintN(32, raw));\n"
-    "        case 'long': case 'int64': return new Int64(raw);\n"
-    "        case 'ulong': case 'uint64': return new UInt64(raw);\n"
-    "        case 'char': return Number(BigInt.asIntN(8, raw));\n"
-    "        case 'size_t': return new UInt64(raw);\n"
-    "        default: return Number(BigInt.asIntN(32, raw));\n"
-    "    }\n"
-    "}\n"
-    "function __green_wrap_args(raw, type) {\n"
-    "    raw = __green_to_big(raw);\n"
-    "    switch (type) {\n"
-    "        case 'pointer': return new NativePointer(raw);\n"
-    "        case 'uint': return Number(BigInt.asUintN(32, raw));\n"
-    "        case 'int64': return new Int64(raw);\n"
-    "        case 'uint64': return new UInt64(raw);\n"
-    "        default: return Number(BigInt.asIntN(32, raw));\n"
-    "    }\n"
-    "}\n"
-    "function NativeFunction(addr, retType, argTypes) {\n"
-    "    var target = Number(new NativePointer(addr).__v);\n"
-    "    var f = function () {\n"
-    "        var args = [];\n"
-    "        for (var i = 0; i < argTypes.length; i++) {\n"
-    "            var a = arguments[i];\n"
-    "            args.push(a instanceof NativePointer ? Number(a.__v)\n"
-    "                : (a === undefined || a === null ? 0 : a));\n"
-    "        }\n"
-    "        return __green_wrap_ret(__green_native_call(target, args), retType);\n"
-    "    };\n"
-    "    f.address = new NativePointer(addr);\n"
-    "    f.retType = retType;\n"
-    "    f.argTypes = argTypes;\n"
-    "    return f;\n"
-    "}\n"
-    "function NativeCallback(fn, retType, argTypes) {\n"
-    "    return new NativePointer(__green_new_callback(function (args) {\n"
-    "        var a = [];\n"
-    "        for (var i = 0; i < argTypes.length; i++)\n"
-    "            a.push(__green_wrap_args(args[i], argTypes[i]));\n"
-    "        var r = fn.apply(null, a);\n"
-    "        return r === undefined ? 0 : r;\n"
-    "    }));\n"
-    "}\n"
-    "var Interceptor = {\n"
-    "    replace: function (target, replacement) { hook(target, replacement); },\n"
-    "    revert: function (target) { unhook(target); },\n"
-    "    flush: function () {},\n"
-    "    attach: function (target, callbacks) {\n"
-    "        var t = Number(new NativePointer(target).__v);\n"
-    "        return __green_interceptor_attach(t,\n"
-    "            callbacks && callbacks.onEnter\n"
-    "                ? function (args) { callbacks.onEnter(args.map(function (a) { return new NativePointer(a); })); } : undefined,\n"
-    "            callbacks && callbacks.onLeave\n"
-    "                ? function (retval_raw) {\n"
-    "                    var retval = {\n"
-    "                        _v: retval_raw,\n"
-    "                        toInt32: function () { return Number(BigInt.asIntN(32, BigInt(this._v))); },\n"
-    "                        replace: function (v) { this._v = (typeof v === 'object' && v !== null && v.__v !== undefined) ? Number(v.__v) : v; }\n"
-    "                    };\n"
-    "                    callbacks.onLeave(retval);\n"
-    "                    return retval._v;\n"
-    "                } : undefined);\n"
-    "    }\n"
-    "};\n"
-    "var Memory = {\n"
-    "    alloc: function (size) { return new NativePointer(__green_mem_alloc(size || 4096)); },\n"
-    "    free: function (p) { __green_mem_free(Number(new NativePointer(p).__v)); },\n"
-    "    protect: function (p, size, prot) {\n"
-    "        return __green_mprotect(Number(new NativePointer(p).__v), size, prot);\n"
-    "    },\n"
-    "    readUtf8String: function (addr, len) { return new NativePointer(addr).readUtf8String(len); },\n"
-    "    readCString: function (addr, len) { return new NativePointer(addr).readUtf8String(len); },\n"
-    "    readByteArray: function (addr, len) { return new NativePointer(addr).readByteArray(len); },\n"
-    "    writeByteArray: function (addr, bytes) { new NativePointer(addr).writeByteArray(bytes); }\n"
-    "};\n"
-    "Process.getCurrentThreadId = __green_gettid;\n"
-    "Process.sleep = function (ms) { __green_sleep(ms); };\n"
-    "Process.isDebuggerAttached = function () { return false; };\n"
-    "var Thread = { sleep: function (ms) { __green_sleep(ms); } };\n"
-    "var File = {\n"
-    "    readAll: function (path) { return __green_read_file(path); },\n"
-    "    writeAll: function (path, data) { return __green_file_write(path, data); }\n"
-    "};\n"
-    "function send(message) {\n"
-    "    __green_send(typeof message === 'string' ? message : JSON.stringify(message));\n"
-    "}\n"
-    "\n"
-    "/* ---- recv() / rpc.exports ------------------------------------------ */\n"
-    "var __green_recv_cbs = {};\n"
-    "var __green_recv_queue = {};\n"
-    "function recv(type, callback) {\n"
-    "    __green_recv_cbs[type] = callback;\n"
-    "    if (__green_recv_queue[type] !== undefined) {\n"
-    "        var p = __green_recv_queue[type];\n"
-    "        delete __green_recv_queue[type];\n"
-    "        callback({ type: type, payload: JSON.parse(p) });\n"
-    "    }\n"
-    "}\n"
-    "function __green_recv_dispatch(type, payload_json) {\n"
-    "    __green_recv_queue[type] = payload_json;\n"
-    "    var cb = __green_recv_cbs[type];\n"
-    "    if (cb) {\n"
-    "        var p = __green_recv_queue[type];\n"
-    "        delete __green_recv_queue[type];\n"
-    "        cb({ type: type, payload: JSON.parse(p) });\n"
-    "    }\n"
-    "}\n"
-    "var rpc = { exports: {} };\n"
-    "\n"
-    "var console = {\n"
-    "    log: function () {\n"
-    "        var msg = Array.prototype.join.call(arguments, ' ');\n"
-    "        __green_broker_log(msg);\n"
-    "    },\n"
-    "    info: function () { this.log.apply(this, arguments); },\n"
-    "    warn: function () { this.log.apply(this, arguments); },\n"
-    "    error: function () { this.log.apply(this, arguments); }\n"
-    "};\n"
-    "function send(message) {\n"
-    "    __green_broker_log(typeof message === 'string' ? message : JSON.stringify(message));\n"
-    "}\n";
+#include "prelude.inc"
 
 /* The shadow redirect lands here.  Runs the registered JS callback with the
  * live register arguments (x0-x7) and returns its result to the caller. */
@@ -450,6 +152,8 @@ static JSValue js_native_new_callback(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
 static JSValue js_native_mem_write(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
+void green_java_register_natives(JSContext *ctx, JSValue global);
+
 static JSValue js_native_mem_alloc(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
 static JSValue js_native_mem_free(JSContext *ctx, JSValueConst this_val,
@@ -684,6 +388,7 @@ static JSValue js_native_mem_read(JSContext *ctx, JSValueConst this_val,
         JS_ToInt64(ctx, &length, argv[1]) != 0 || length <= 0 ||
         length > (int64_t)sizeof(membuf))
         return JS_NULL;
+    address = GREEN_UNTAG(address);
     if (mem_fd < 0)
         mem_fd = open("/proc/self/mem", O_RDONLY);
     if (mem_fd < 0)
@@ -706,6 +411,7 @@ static JSValue js_native_read_utf8(JSContext *ctx, JSValueConst this_val,
     (void)this_val;
     if (argc < 1 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0)
         return JS_NULL;
+    address = GREEN_UNTAG(address);
     if (argc >= 2 &&
         (JS_ToInt64(ctx, &length, argv[1]) != 0 || length <= 0))
         return JS_NULL;
@@ -808,6 +514,7 @@ static int js_ensure_runtime(char *err, size_t errlen)
             JS_SetPropertyStr(g_js_ctx, global, "__green_file_write",
                 JS_NewCFunction(g_js_ctx, js_native_file_write,
                                 "__green_file_write", 2));
+            green_java_register_natives(g_js_ctx, global);
             JS_FreeValue(g_js_ctx, global);
         }
         g_js_fn = JS_UNDEFINED;
@@ -1880,7 +1587,7 @@ static JSValue js_native_mem_alloc(JSContext *ctx, JSValueConst this_val,
     if (!p)
         return JS_NULL;
     memset(p, 0, (size_t)size);
-    return JS_NewInt64(ctx, (int64_t)(uintptr_t)p);
+    return JS_NewInt64(ctx, (int64_t)GREEN_UNTAG((uintptr_t)p));
 }
 
 static JSValue js_native_mem_free(JSContext *ctx, JSValueConst this_val,
@@ -1890,7 +1597,7 @@ static JSValue js_native_mem_free(JSContext *ctx, JSValueConst this_val,
 
     (void)this_val;
     if (argc >= 1 && JS_ToInt64(ctx, (int64_t *)&address, argv[0]) == 0)
-        free((void *)(uintptr_t)address);
+        free((void *)(uintptr_t)GREEN_UNTAG(address));
     return JS_UNDEFINED;
 }
 
@@ -1904,6 +1611,7 @@ static JSValue js_native_mprotect(JSContext *ctx, JSValueConst this_val,
     if (argc < 3 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0 ||
         JS_ToInt64(ctx, &length, argv[1]) != 0 ||
         JS_ToInt64(ctx, &prot, argv[2]) != 0)
+    address = GREEN_UNTAG(address);
         return JS_FALSE;
     return mprotect((void *)(uintptr_t)address, (size_t)length,
                     (int)prot) == 0 ? JS_TRUE : JS_FALSE;
@@ -1925,7 +1633,15 @@ static JSValue js_native_dlopen(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, path);
     if (!handle)
         return JS_NULL;
-    return JS_NewInt64(ctx, (int64_t)(uintptr_t)handle);
+    /* Android 15 returns PAC-signed soinfo handles (>2^53); a JS Number
+     * round-trip would lose precision.  Hand out a small table ID instead. */
+    for (int i = 0; i < GREEN_MAX_DLH; i++) {
+        if (g_dl_handles[i] == NULL) {
+            g_dl_handles[i] = handle;
+            return JS_NewInt32(ctx, i + 1);
+        }
+    }
+    return JS_NULL;
 }
 
 static JSValue js_native_dlsym(JSContext *ctx, JSValueConst this_val,
@@ -1938,6 +1654,15 @@ static JSValue js_native_dlsym(JSContext *ctx, JSValueConst this_val,
     (void)this_val;
     if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&handle, argv[0]) != 0)
         return JS_NULL;
+    if (handle > 0 && handle <= GREEN_MAX_DLH) {
+        /* dlopen() table ID issued by js_native_dlopen() */
+        if (g_dl_handles[handle - 1] == NULL)
+            return JS_NULL;
+        handle = (uint64_t)(uintptr_t)g_dl_handles[handle - 1];
+    } else if (handle > 0) {
+        /* Raw pointer passed from script: mask the PAC tag if present. */
+        handle = GREEN_UNTAG(handle);
+    }
     name = JS_ToCString(ctx, argv[1]);
     if (!name)
         return JS_NULL;

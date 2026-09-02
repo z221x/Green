@@ -187,3 +187,36 @@ frida-gum 的 `gummemory.c.o` 引用以下后端函数（全部由 green_hook �
 - [ ] recv() 双向消息
 - [ ] rpc.exports
 - [ ] Memory.writeByteArray 对代码页的写入（需要 broker 路径）
+
+## Java 层（2026-09-02）
+
+**已工作**：`Java.available/perform/use`、`$new`、静态/实例方法调用、
+重载分派（类型感知）、对象链式调用（`sb.$new('a').append('b')...`）、
+String/float/对象自动包装、`.implementation` hook 安装与回调触发
+（含 APP 内部线程调用捕获）。
+
+**ArtMethod 标定**（参考 frida-java-bridge `_getArtMethodSpec`）：
+`android.os.Process.getElapsedCpuTime()`（public static final native，
+JNI 实现在 libandroid_runtime.so）——第一个指向 libandroid_runtime 的
+指针字段 = jniCode 偏移，quickCode = jniCode + 8；accessFlags 靠标志位
+匹配。Android 15 实测：flags=+4, jni=+16, quick=+24, size=32。
+
+**hook 机制**：YAHFA 式——orig ArtMethod 置 kNative、jni entry 指向
+per-hook thunk（`MOVZ W17,#idx; LDR X17; BR`，W17 经 naked 入口落栈，
+body 从 frame+32 读，线程安全）、quick entry 指向 generic jni
+trampoline（从 String.intern 的 quick 槽取 ClassLinker 重定位副本）。
+
+**限制 / 已知问题**：
+1. **原方法调用（`this.method()`）在 Android 15 上未完全打通**：
+   JNI `Call*MethodA(malloc 备份)` 会重入 hook（运行时对 jmethodID
+   有解码/查表）；quick 直调（x0=backup, x1=receiver）方向已验证
+   （String.hashCode AOT 代码 `+0x10 LDR W0,[X1,#0xc]` 证实 receiver
+   在 x1），但 receiver 是 index-id 间接句柄（`(idx<<2)|kind`，如
+   0x2f8a），quick code 需要解码后的 raw 指针。libart.so 已 strip，
+   无 `DecodeJObject` 符号；全局引用表为分段链式结构，连续数组假设
+   标定失败。**下一步：quick-native 全链路**（quick-entry 层拦截，
+   全 raw 寄存器捕获，String 经 `getBytes()`+raw 数组解析绕开 JNI）。
+2. hook 入口最多捕获 6 个 Java 参数（x2..x7）；float/double 参数
+   入口不 marshal（返回值已处理）。
+3. `implementation = null`（还原）未实现；静态方法 hook 未验证。
+4. 非静态方法在实例 wrapper 上按需绑定（跳过静态防 `valueOf` 污染）。
