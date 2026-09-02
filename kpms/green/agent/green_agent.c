@@ -86,19 +86,7 @@ static const char kGreenPrelude[] =
     "        catch (e) { return null; }\n"
     "    },\n"
     "    findExportByName: function (moduleName, exportName) {\n"
-    "        if (moduleName === null)\n"
-    "            return __green_dlsym(0, exportName) === null ? null\n"
-    "                : new NativePointer(__green_dlsym(0, exportName));\n"
-    "        var handle = __green_dlopen((function (m) {\n"
-    "            var ms = __green_modules();\n"
-    "            for (var i = 0; i < ms.length; i++)\n"
-    "                if (ms[i].name === moduleName || ms[i].path === moduleName)\n"
-    "                    return ms[i].path;\n"
-    "            return moduleName;\n"
-    "          })(moduleName));\n"
-    "        if (handle === null) return null;\n"
-    "        var a = __green_dlsym(handle, exportName);\n"
-    "        return a === null ? null : new NativePointer(a);\n"
+    "        return __green_find_export_safe(exportName);\n"
     "    },\n"
     "    getExportByName: function (moduleName, exportName) {\n"
     "        var a = Module.findExportByName(moduleName, exportName);\n"
@@ -474,6 +462,28 @@ static JSValue js_native_dlopen(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
 static JSValue js_native_dlsym(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
+/* Safe export lookup: uses dlsym(RTLD_DEFAULT) which searches all
+ * loaded modules without needing a dlopen handle. */
+static JSValue js_native_find_export_safe(JSContext *ctx,
+                                          JSValueConst this_val,
+                                          int argc, JSValueConst *argv)
+{
+    const char *name;
+    void *sym;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_NULL;
+    name = JS_ToCString(ctx, argv[0]);
+    if (!name)
+        return JS_NULL;
+    sym = dlsym(RTLD_DEFAULT, name);
+    JS_FreeCString(ctx, name);
+    if (!sym)
+        return JS_NULL;
+    return JS_NewInt64(ctx, (int64_t)(uintptr_t)sym);
+}
+
 static JSValue js_native_gettid(JSContext *ctx, JSValueConst this_val,
     int argc, JSValueConst *argv);
 static JSValue js_native_sleep(JSContext *ctx, JSValueConst this_val,
@@ -786,6 +796,9 @@ static int js_ensure_runtime(char *err, size_t errlen)
             JS_SetPropertyStr(g_js_ctx, global, "__green_dlsym",
                 JS_NewCFunction(g_js_ctx, js_native_dlsym,
                                 "__green_dlsym", 2));
+            JS_SetPropertyStr(g_js_ctx, global, "__green_find_export_safe",
+                JS_NewCFunction(g_js_ctx, js_native_find_export_safe,
+                                "__green_find_export_safe", 1));
             JS_SetPropertyStr(g_js_ctx, global, "__green_gettid",
                 JS_NewCFunction(g_js_ctx, js_native_gettid,
                                 "__green_gettid", 0));
