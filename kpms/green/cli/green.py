@@ -215,10 +215,19 @@ def cmd_eval(args):
     sock = connect(args)
     payload = struct.pack("<iI", args.pid, len(code)) + code.encode()
     send_frame(sock, T_EVAL, payload)
-    ok, _, msg = recv_result(sock)
-    sock.close()
-    print("[%s] %s" % ("+" if ok else "!", msg))
-    return 0 if ok else 1
+    while True:
+        ftype, _, pl = recv_frame(sock)
+        if ftype == T_LOG:
+            (pid, length) = struct.unpack_from("<iI", pl, 0)
+            text = pl[8:8 + length].decode(errors="replace")
+            sys.stdout.write("[%d] %s\n" % (pid, text.rstrip("\n")))
+            sys.stdout.flush()
+        elif ftype == T_RESULT:
+            ok = struct.unpack_from("<i", pl, 0)[0]
+            length = struct.unpack_from("<I", pl, 16)[0]
+            msg = pl[20:20 + length].decode(errors="replace")
+            print("[%s] %s" % ("+" if ok else "!", msg))
+            return 0 if ok else 1
 
 
 def cmd_kill(args):
