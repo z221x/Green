@@ -1601,10 +1601,10 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
     writer.pc = target;
     gum_arm64_relocator_init(&relocator, (const gconstpointer)target,
                              &writer);
-    /* Relocate enough bytes to cover the whole redirect (16), moving past
-     * the function's own end if needed -- exactly what frida's interceptor
-     * does; the extra instructions never execute for early-returning
-     * functions but keep the jump-back target outside the patched area. */
+    /* Relocate instructions until we have enough bytes for the redirect
+     * (16), or until the function body ends (eob from ret/b).  For small
+     * functions the relocated code IS the complete function; for larger
+     * ones we append a jump-back to target+reloc_size. */
     int hit_eob = 0;
 
     while (reloc_size < 16) {
@@ -1615,22 +1615,26 @@ static JSValue js_native_interceptor_attach(JSContext *ctx,
         gum_arm64_relocator_write_one(&relocator);
         reloc_size += n_insn * 4;
         if (gum_arm64_relocator_eob(&relocator)) {
-            /* ret/unconditional flow ended the function body: relocating
-             * past it would pull unrelated code into the trampoline. */
+            /* The function body ended (ret or unconditional branch).
+             * The relocated code is self-contained: it returns to the
+             * caller directly.  No jump-back is needed. */
             hit_eob = 1;
             break;
         }
     }
-    if (reloc_size < 16 || hit_eob) {
+    if (reloc_size < 4) {
         gum_arm64_writer_clear(&writer);
         gum_arm64_relocator_clear(&relocator);
         return JS_ThrowInternalError(ctx,
-            "target function is too small to attach safely "
-            "(ends within the first 16 bytes); use Interceptor.replace");
+            "could not relocate any instructions from target");
     }
-    gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16,
-                                         target + reloc_size);
-    gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
+    if (!hit_eob && reloc_size >= 16) {
+        /* Large function: append a jump-back to the shadow page at
+         * target+reloc_size so the original body continues. */
+        gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16,
+                                             target + reloc_size);
+        gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
+    }
     gum_arm64_writer_flush(&writer);
     gum_arm64_writer_clear(&writer);
     gum_arm64_relocator_clear(&relocator);
