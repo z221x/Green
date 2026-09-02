@@ -275,3 +275,25 @@ var File = {
 function send(message) {
     __green_send(typeof message === 'string' ? message : JSON.stringify(message));
 }
+
+/* ---- recv() / rpc.exports ------------------------------------------ */
+var __green_recv_cbs = {};
+var __green_recv_queue = {};
+function recv(type, callback) {
+    __green_recv_cbs[type] = callback;
+    if (__green_recv_queue[type] !== undefined) {
+        var p = __green_recv_queue[type];
+        delete __green_recv_queue[type];
+        callback({ type: type, payload: JSON.parse(p) });
+    }
+}
+function __green_recv_dispatch(type, payload_json) {
+    __green_recv_queue[type] = payload_json;
+    var cb = __green_recv_cbs[type];
+    if (cb) {
+        var p = __green_recv_queue[type];
+        delete __green_recv_queue[type];
+        cb({ type: type, payload: JSON.parse(p) });
+    }
+}
+var rpc = { exports: {} };
