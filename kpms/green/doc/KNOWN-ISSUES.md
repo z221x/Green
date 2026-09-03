@@ -244,3 +244,42 @@ flavor=art → GetCreatedJavaVMs（PAC 句柄 untag）→ Runtime 字段扫描
 3. hook 入口最多 6 个 Java 参数；float/double 参数不 marshal。
 4. enumerateSymbols 对无 .symtab 的库（libart）只返回 dynsym；
    fjb 需要的内部符号走 findExportByName（dlsym + ELF 扫描）。
+
+## 内核 panic（2026-09-02 深夜，重大）
+
+**现象**：fjb artController 安装（Interceptor.replace 全局
+artQuickGenericJniTrampoline）后，calculator 出现 `exp_funnel_lock` D 状态
+死锁，随后设备因内核错误关机（panic）。
+
+**机制分析**：
+1. artQuickGenericJniTrampoline 是**该进程所有 JNI 调用的必经之路**。
+   替换后每次 JNI 调用都经过 shadow 页 → PTE 翻转 → page fault。
+2. calculator 的 JNI 频率是每秒数千次（对比 hookme 的 1 次/秒），
+   fault 风暴进 KPM wrap 的 do_page_fault handler。
+3. handler 内 green_shadow_map_exec/read 切换 PTE + TLBI + MM 获取；
+   与 MIUI 内核的 exp_funnel 统计锁在 SMP 下竞争，最终内核持锁路径
+   被破坏 → panic。
+4. 注意：shadow 的 fault hook 是**全系统**的（do_page_fault 对所有
+   进程生效），高频 fault 不只来自被 hook 进程。
+
+**结论**：shadow 页的「执行/数据双视图 + fault 切换」设计不适合
+**高频调用路径**。trampoline 是全 JNI 咽喉，每次调用的 fault 开销
+不可接受，且有内核稳定性风险。
+
+**修正方向**（替代全局 trampoline 替换）：
+- **per-method 落点**（YAHFA 式，之前 java_bridge.c 的思路）：
+  只改单个 ArtMethod 的 entry points（jni=thunk，quick=generic
+  jni trampoline 的现有副本地址，**不替换 trampoline 页**）。
+  无 shadow 页参与、零 fault 开销。
+- fjb 层面：仍用 fjb 做类/方法枚举与参数 marshal（成熟），hook 落地
+  换成 per-method（KPM 侧仅需对 LinearAlloc 的 RW 写，无页切换）。
+- 已知代价：fjb 的「this.method() 调原方法」依赖它的 backup 机制；
+  per-method 方案里原方法调用走备份 ArtMethod（Call*MethodA 或
+  quick 直调），语义可等价。
+
+**待办**：
+- [ ] KPM：移除/禁用对 trampoline 页的 shadow patch（或对高频页
+      自动降级为直写）
+- [ ] 重写 hook 落地为 per-method（复用 fjb 反射层 + 之前
+      java_bridge.c 的标定/thunk 经验）
+- [ ] 复现路径回归：确认 panic 消失

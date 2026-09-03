@@ -426,8 +426,12 @@ long green_shadow_patch_task(pid_t pid, unsigned long addr,
     void *mm = green_shadow_mm_from_pid(pid);
     long ret;
 
-    if (!mm)
+    pr_err("green_shadow: patch_task pid=%d addr=%lx len=%lu\n",
+           pid, addr, len);
+    if (!mm) {
+        pr_err("green_shadow: patch_task: no mm for pid=%d\n", pid);
         return -ESRCH;
+    }
     ret = green_shadow_patch_mm(mm, addr, buf, len, true);
     green_k_mmput(mm);
     return ret;

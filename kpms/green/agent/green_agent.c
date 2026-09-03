@@ -209,6 +209,7 @@ static JSValue js_native_mem_write(JSContext *ctx, JSValueConst this_val,
 
 #include <elf.h>
 #include "gumjs/gumcmodule.h"
+#include <glib.h>
 
 static void *green_module_dlsym(const char *mod_name, const char *sym_name)
 {
@@ -585,6 +586,59 @@ static JSValue js_module_list_syms(JSContext *ctx, JSValueConst this_val,
 
 #define GREEN_MAX_CMOD 8
 static GumCModule *g_cmods[GREEN_MAX_CMOD];
+gboolean green_remap_disabled = FALSE;
+
+/* Overrides the weak-ish definition in libfrida-gum: CModule pages are
+ * freshly allocated (no shadow backing), so during compile/link the plain
+ * mprotect path must be used.  Code patching (Interceptor.replace) keeps
+ * the broker remap seam. */
+gboolean gum_memory_can_remap_writable (void)
+{
+    return !green_remap_disabled;
+}
+
+/* gum's TCC resolve callback consults a build-time symbol table that
+ * only knows gum-internal symbols; glib API symbols used by
+ * frida-java-bridge's C sources must be provided explicitly. */
+static void cmodule_add_default_symbols(GumCModule * cm)
+{
+    /* glib (statically linked into this module) */
+    gum_cmodule_add_symbol(cm, "g_mutex_init", g_mutex_init);
+    gum_cmodule_add_symbol(cm, "g_mutex_lock", g_mutex_lock);
+    gum_cmodule_add_symbol(cm, "g_mutex_unlock", g_mutex_unlock);
+    gum_cmodule_add_symbol(cm, "g_mutex_clear", g_mutex_clear);
+    gum_cmodule_add_symbol(cm, "g_hash_table_new_full", g_hash_table_new_full);
+    gum_cmodule_add_symbol(cm, "g_hash_table_new", g_hash_table_new);
+    gum_cmodule_add_symbol(cm, "g_hash_table_unref", g_hash_table_unref);
+    gum_cmodule_add_symbol(cm, "g_hash_table_contains", g_hash_table_contains);
+    gum_cmodule_add_symbol(cm, "g_hash_table_lookup", g_hash_table_lookup);
+    gum_cmodule_add_symbol(cm, "g_hash_table_insert", g_hash_table_insert);
+    gum_cmodule_add_symbol(cm, "g_hash_table_remove", g_hash_table_remove);
+    gum_cmodule_add_symbol(cm, "g_hash_table_size", g_hash_table_size);
+    gum_cmodule_add_symbol(cm, "g_free", g_free);
+    gum_cmodule_add_symbol(cm, "g_malloc", g_malloc);
+    gum_cmodule_add_symbol(cm, "g_malloc0", g_malloc0);
+    gum_cmodule_add_symbol(cm, "g_slist_prepend", g_slist_prepend);
+    gum_cmodule_add_symbol(cm, "g_slist_remove", g_slist_remove);
+    gum_cmodule_add_symbol(cm, "g_print", g_print);
+    /* fjb artController extras */
+    gum_cmodule_add_symbol(cm, "g_array_append_vals", g_array_append_vals);
+    gum_cmodule_add_symbol(cm, "g_array_free", g_array_free);
+    gum_cmodule_add_symbol(cm, "g_array_new", g_array_new);
+    gum_cmodule_add_symbol(cm, "g_array_set_clear_func", g_array_set_clear_func);
+    gum_cmodule_add_symbol(cm, "g_array_sized_new", g_array_sized_new);
+    gum_cmodule_add_symbol(cm, "g_checksum_free", g_checksum_free);
+    gum_cmodule_add_symbol(cm, "g_checksum_get_string", g_checksum_get_string);
+    gum_cmodule_add_symbol(cm, "g_checksum_new", g_checksum_new);
+    gum_cmodule_add_symbol(cm, "g_checksum_update", g_checksum_update);
+    gum_cmodule_add_symbol(cm, "g_hash_table_iter_init", g_hash_table_iter_init);
+    gum_cmodule_add_symbol(cm, "g_hash_table_iter_next", g_hash_table_iter_next);
+    /* g_new/g_array_index are macros -- no symbol needed */
+    gum_cmodule_add_symbol(cm, "g_string_append", g_string_append);
+    gum_cmodule_add_symbol(cm, "g_string_append_c", g_string_append_c);
+    gum_cmodule_add_symbol(cm, "g_string_free", g_string_free);
+    gum_cmodule_add_symbol(cm, "g_string_sized_new", g_string_sized_new);
+}
 
 static JSValue js_cmodule_new(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
@@ -604,6 +658,7 @@ static JSValue js_cmodule_new(JSContext *ctx, JSValueConst this_val,
     source = JS_ToCString(ctx, argv[0]);
     if (source == NULL)
         return JS_EXCEPTION;
+    green_remap_disabled = TRUE;   /* fresh pages: use plain mprotect path */
     {
         /* gum dereferences options unconditionally — pass ANY toolchain */
         GumCModuleOptions opts;
@@ -618,7 +673,9 @@ static JSValue js_cmodule_new(JSContext *ctx, JSValueConst this_val,
             g_error_free(err);
         return e;
     }
+    green_remap_disabled = FALSE;
     g_cmods[slot] = cm;
+    cmodule_add_default_symbols(cm);
     return JS_NewInt32(ctx, slot);
 }
 
@@ -663,13 +720,29 @@ static JSValue js_cmodule_link(JSContext *ctx, JSValueConst this_val,
     cm = cmod_get(h);
     if (cm == NULL)
         return JS_FALSE;
+    green_remap_disabled = TRUE;
     if (!gum_cmodule_link(cm, &err)) {
+        green_remap_disabled = FALSE;
         __android_log_print(ANDROID_LOG_ERROR, "green-agent",
             "CModule link: %s", err && err->message ? err->message : "?");
         if (err)
             g_error_free(err);
         return JS_FALSE;
     }
+    {
+        void *init_fn = gum_cmodule_find_symbol_by_name(cm, "init");
+        void *isrep = gum_cmodule_find_symbol_by_name(cm,
+            "is_replacement_method");
+        const GumMemoryRange *range = gum_cmodule_get_range(cm);
+        guint8 head[16];
+        memcpy(head, (void *)(uintptr_t)range->base_address, 16);
+        __android_log_print(ANDROID_LOG_ERROR, "green-agent",
+            "cmod linked: init=%p isrep=%p base=%llx size=%zx head=%02x%02x%02x%02x",
+            init_fn, isrep,
+            (unsigned long long)range->base_address, range->size,
+            head[0], head[1], head[2], head[3]);
+    }
+    green_remap_disabled = FALSE;
     return JS_TRUE;
 }
 
@@ -1516,6 +1589,11 @@ static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
     }
     pthread_mutex_unlock(&green_agent_broker_lock);
     status = response.status;
+    if (status != 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "green-agent",
+            "broker req: cmd=%u addr=%llx len=%u -> %d",
+            command, (unsigned long long)addr, len, (int)status);
+    }
     if (value)
         *value = response.value;
     return status;
