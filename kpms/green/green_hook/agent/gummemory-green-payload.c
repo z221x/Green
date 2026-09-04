@@ -10,8 +10,8 @@
  *
  *   gum_memory_patch_code()      snapshot original page → apply() writes the
  *                                redirect (emitted by the real
- *                                GumArm64Writer) → commit via
- *                                prctl(PR_GREEN_SHADOW_PATCH).  Execution
+ *                                GumArm64Writer) → commit via an authenticated
+ *                                direct KPM shadow prctl.  Execution
  *                                observes the patch, reads observe the
  *                                original page.
  *   gum_memory_read()            process_vm_readv; the shadow GUP hook
@@ -36,6 +36,7 @@
 #include "gummemory-priv.h"
 #include "gumprocess.h"
 
+#include "green_agent.h"
 #include <green/abi.h>
 
 #include <errno.h>
@@ -244,15 +245,20 @@ green_gum_shadow_patch (gconstpointer address,
                         gconstpointer bytes,
                         gsize len)
 {
-  unsigned long addr = (unsigned long) GPOINTER_TO_SIZE (address);
-
-  if (len == 0 || len > GREEN_SHADOW_MAX_PATCH_LEN)
+  /* The injected process calls KPM directly.  The token is carried in every
+   * prctl by green_agent_shadow_request(); there is no privileged broker
+   * connection in the memory path. */
+  guint8 * page_addr = (guint8 *) (((guintptr) address) & ~4095ULL);
+  gsize page_off = (gsize) ((guintptr) address & 4095ULL);
+  if (len == 0 || page_off + len > 4096)
     return FALSE;
-  if ((addr & 4095UL) + len > 4096UL)
-    return FALSE; /* must stay within one page, like the prctl ABI */
-
-  return prctl ((int) PR_GREEN_SHADOW_PATCH, 0, addr,
-                (unsigned long) GPOINTER_TO_SIZE (bytes), len) == 0;
+  /* KPM overlays the supplied range onto the existing shadow copy. Do not
+   * send a process_vm_readv snapshot here: for execute-only pages that read
+   * intentionally returns the original PFN, and would erase earlier writes
+   * to the agent's own generated code page. */
+  return green_agent_shadow_request (GREEN_SHADOW_OP_PATCH,
+                                     GPOINTER_TO_SIZE (page_addr) + page_off,
+                                     bytes, len, NULL) == 0;
 }
 
 gboolean
@@ -260,12 +266,27 @@ gum_memory_write (gpointer address,
                   const guint8 * bytes,
                   gsize len)
 {
+  guint8 * cursor = address;
+  const guint8 * source = bytes;
+  gsize remaining = len;
+
   if (address == NULL || bytes == NULL)
     return FALSE;
 
-  /* Code pages are never memcpy'd: the write lands on the shadow page so
-   * readers keep observing the original bytes. */
-  return green_gum_shadow_patch (address, bytes, len);
+  /* KPM limits one authenticated request to one page, so split writes at
+   * page boundaries and route every chunk through shadow. */
+  while (remaining != 0)
+  {
+    gsize chunk = 4096 - (GPOINTER_TO_SIZE (cursor) & 4095);
+    if (chunk > remaining)
+      chunk = remaining;
+    if (!green_gum_shadow_patch (cursor, source, chunk))
+      return FALSE;
+    cursor += chunk;
+    source += chunk;
+    remaining -= chunk;
+  }
+  return TRUE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -351,18 +372,30 @@ gum_memory_dispose_writable_pages (gpointer first_page,
     return;
   }
 
-  /* Commit each modified page to its shadow page.  The kernel overlays the
-   * snapshot onto a fresh copy of the original page, so untouched neighbour
-   * bytes keep their original content. */
+  /* Commit only bytes changed by the patch callback. A full snapshot read from
+   * an execute-only page is the original PFN; sending it back wholesale would
+   * clobber an earlier hook on the same page. */
   for (i = 0; i != remap->n_pages && i != n_pages; i++)
   {
     guint8 * target = (guint8 *) remap->target_page + i * 4096;
     const guint8 * source = (const guint8 *) remap->writable + i * 4096;
+    guint8 original[4096];
+    guint j;
 
-    if (!green_gum_shadow_patch (target, source, 4096))
+    if (green_gum_process_vm (FALSE, original, 4096, target) != 4096)
+      continue;
+    j = 0;
+    while (j < 4096)
     {
-      /* Partial failure: keep going so earlier pages stay committed, but
-       * surface the error through the snapshot being dropped below. */
+      guint start;
+      while (j < 4096 && source[j] == original[j])
+        j++;
+      start = j;
+      while (j < 4096 && source[j] != original[j])
+        j++;
+      if (j > start)
+        (void) green_gum_shadow_patch (target + start, source + start,
+                                        j - start);
     }
   }
 
@@ -518,6 +551,8 @@ gum_memory_allocate (gpointer address,
   gsize allocation_size = (size + page_size - 1) & ~(page_size - 1);
   gpointer base;
 
+  (void) alignment;
+
   base = mmap (address, allocation_size, _gum_page_protection_to_posix (prot),
       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (base == MAP_FAILED)
@@ -601,5 +636,6 @@ green_gum_release_page (gconstpointer address)
     return FALSE;
 
   page = ((unsigned long) GPOINTER_TO_SIZE (address)) & ~4095UL;
-  return prctl ((int) PR_GREEN_SHADOW_RELEASE, 0, page, 0, 0) >= 0;
+  return green_agent_shadow_request (GREEN_SHADOW_OP_RELEASE, page, NULL, 0,
+                                     NULL) == 0;
 }

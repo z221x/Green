@@ -30,6 +30,7 @@
 
 #define GREEN_SHADOW_STATE_EXEC 1
 #define GREEN_SHADOW_STATE_READ 2
+#define GREEN_SHADOW_STATE_DATA 3
 
 struct green_shadow_page {
     struct list_head node;
@@ -40,12 +41,19 @@ struct green_shadow_page {
     void *shadow_kva;
     unsigned long shadow_pfn;
     int state;
+    bool executable;
     int refs;
     bool dead;
     atomic_t pte_busy;
 };
 
 extern struct list_head green_shadow_pages;
+struct green_shadow_token_entry {
+    struct list_head node;
+    void *mm;
+    unsigned long token;
+};
+extern struct list_head green_shadow_tokens;
 extern atomic_t green_shadow_pages_busy;
 /* Serializes Green-owned page-table block splits.  This protects only our
  * split operation and is not a substitute for Linux mmap/page-table locks. */
@@ -167,6 +175,7 @@ void green_shadow_flush_tlb(unsigned long addr);
 void green_shadow_sync_code(void *kva, unsigned long len);
 int green_shadow_map_exec(struct green_shadow_page *page);
 int green_shadow_map_read(struct green_shadow_page *page);
+int green_shadow_map_data(struct green_shadow_page *page);
 int green_shadow_restore_original(struct green_shadow_page *page);
 
 struct green_shadow_page *green_shadow_get_page(void *mm, unsigned long addr);
@@ -179,6 +188,12 @@ void *green_shadow_mm_from_pid(pid_t pid);
 int green_shadow_copy_from_user(void *dst, const void __user *src, unsigned long len);
 long green_shadow_patch_mm(void *mm, unsigned long addr, const void *buf,
                            unsigned long len, bool from_user);
+long green_shadow_request(const struct green_shadow_rpc *rpc,
+                          unsigned long token, bool caller_is_root);
+long green_shadow_register_token(pid_t pid, unsigned long token);
+long green_shadow_revoke_token(pid_t pid, unsigned long token);
+bool green_shadow_token_valid(void *mm, unsigned long token);
+void green_shadow_revoke_mm(void *mm);
 
 void green_shadow_prctl_before(hook_fargs5_t *args, void *udata);
 void green_shadow_fault_before(hook_fargs3_t *args, void *udata);

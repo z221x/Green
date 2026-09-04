@@ -11,29 +11,24 @@
  * Green shadow hook ABI.
  *
  * The prctl arguments are:
- *   PATCH:   prctl(PR_GREEN_SHADOW_PATCH,   pid, addr, user_buf, len)
- *   RELEASE: prctl(PR_GREEN_SHADOW_RELEASE, pid, addr, 0, 0)
- *            addr == 0 releases all shadow pages that belong to pid.
- *   COUNT:   prctl(PR_GREEN_SHADOW_COUNT,   pid, 0, 0, 0)
+ *   REQUEST: prctl(PR_GREEN_SHADOW_REQUEST, token, &green_shadow_rpc, 0, 0)
+ *   REGISTER: prctl(PR_GREEN_SHADOW_TOKEN_REGISTER, pid, token, 0, 0)
+ *   REVOKE:   prctl(PR_GREEN_SHADOW_TOKEN_REVOKE, pid, token, 0, 0)
+ *
+ * Every PATCH/RELEASE/COUNT request carries the token.  REGISTER and REVOKE
+ * are root-only operations used to provision an injected agent; all actual
+ * page operations are checked against the token bound to the target mm.
  *
  * Unlike the reference wxshadow module, Green's first implementation is
  * patch-oriented and intentionally has no BRK register-modification feature.
  */
-struct green_shadow_request {
-    pid_t pid;
-    unsigned long addr;
-    const void __user *buf;
-    unsigned long len;
-};
-
 extern const struct green_tool green_shadow_tool;
 
-/* Kernel-side API usable by future Green tools. */
-long green_shadow_patch_task(pid_t pid, unsigned long addr,
-                             const void __user *buf, unsigned long len);
-long green_shadow_patch_kernel(pid_t pid, unsigned long addr,
-                               const void *buf, unsigned long len);
-long green_shadow_release_task(pid_t pid, unsigned long addr);
-long green_shadow_count_task(pid_t pid);
+/* The KPM shadow engine has no unauthenticated public patch API. All page
+ * operations enter through PR_GREEN_SHADOW_REQUEST with a registered token. */
+long green_shadow_request(const struct green_shadow_rpc *rpc,
+                          unsigned long token, bool caller_is_root);
+long green_shadow_register_token(pid_t pid, unsigned long token);
+long green_shadow_revoke_token(pid_t pid, unsigned long token);
 
 #endif /* _KPM_GREEN_SHADOW_HOOK_H_ */

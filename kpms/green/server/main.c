@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * `green` device binary: the frida-server equivalent.  Running it starts
- * the TCP daemon that owns the injector, the broker and every privileged
- * shadow operation on behalf of the host CLI.  There is intentionally no
- * command-line tool surface on the device -- everything (shadow patch,
- * release, count, module enumeration, hook scripts) is driven from the
- * host Python CLI (kpms/green/cli/green.py).
+ * the TCP daemon that owns the injector and token provisioning. The injected
+ * agent calls KPM shadow directly; there is no page-operation broker. There
+ * is intentionally no command-line tool surface on the device -- everything
+ * is driven from the host Python CLI.
  */
 
 #include <green/cli.h>

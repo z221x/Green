@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Shared agent-driving primitives: ptrace injector, protocol client and
- * broker plumbing used by `green hook` and `green server`.
+ * Shared agent-driving primitives: ptrace injector, control protocol client,
+ * and root-side token provisioning used by `green hook` and `green server`.
  */
 
 #include <green/agentops.h>
@@ -17,7 +17,6 @@
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <linux/ptrace.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,12 +26,9 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
-#include <poll.h>
 #include <linux/un.h>
 #include <stddef.h>
 #include <unistd.h>
-
-#include <gum/arch-arm64/gumarm64writer.h>
 
 int green_agentops_read_full(int fd, void *buf, size_t size)
 {
@@ -119,26 +115,74 @@ int green_agentops_ping_ok(pid_t pid)
     return ok;
 }
 
-int green_agentops_broker_attach(pid_t pid, int broker_fd)
+static unsigned long green_agentops_new_token(void)
 {
-    struct green_agent_request request;
+    unsigned long token = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+
+    if (fd >= 0) {
+        ssize_t n = read(fd, &token, sizeof(token));
+        close(fd);
+        if (n == (ssize_t)sizeof(token) && token != 0)
+            return token;
+    }
+    /* Never downgrade to a predictable token: shadow remains unavailable
+     * until the root daemon can read the platform CSPRNG. */
+    return 0;
+}
+
+int green_agentops_revoke(pid_t pid, unsigned long token)
+{
+    long ret = green_cli_prctl(PR_GREEN_SHADOW_TOKEN_REVOKE,
+                               (unsigned long)pid, token, 0, 0);
+    return ret < 0 ? (int)ret : 0;
+}
+
+int green_agentops_authorize(pid_t pid, unsigned long *token,
+                             char *err, size_t errlen)
+{
     struct green_agent_response response;
+    unsigned long candidate;
+    long ret;
+    int fd = -1;
 
-    (void)pid;
-
-    memset(&request, 0, sizeof(request));
-    request.magic = GREEN_AGENT_MAGIC;
-    request.version = GREEN_AGENT_VERSION;
-    request.tool = GREEN_AGENT_TOOL_CORE;
-    request.command = GREEN_AGENT_CMD_BROKER_ATTACH;
-    request.size = sizeof(request);
-    if (green_agentops_write_full(broker_fd, &request, sizeof(request)) != 0)
-        return -1;
-    if (green_agentops_read_full(broker_fd, &response, sizeof(response)) != 0 ||
-        response.status != 0) {
-        fprintf(stderr, "hook: broker attach failed\n");
+    if (!token || pid <= 0)
+        return -EINVAL;
+    candidate = green_agentops_new_token();
+    if (candidate == 0) {
+        snprintf(err, errlen, "cannot obtain a secure shadow token");
+        return -EAGAIN;
+    }
+    ret = green_cli_prctl(PR_GREEN_SHADOW_TOKEN_REGISTER,
+                          (unsigned long)pid, candidate, 0, 0);
+    if (ret < 0) {
+        snprintf(err, errlen,
+                 "KPM shadow token registration failed (%ld); load green.kpm first",
+                 ret);
+        return (int)ret;
+    }
+    if (green_agentops_ensure_injected(pid, err, errlen) != 0) {
+        (void)green_agentops_revoke(pid, candidate);
         return -1;
     }
+    memset(&response, 0, sizeof(response));
+    fd = green_agentops_connect(pid);
+    if (fd < 0 ||
+        green_agentops_send_request(fd, GREEN_AGENT_TOOL_CORE,
+                                    GREEN_AGENT_CMD_SHADOW_TOKEN_SET,
+                                    candidate, 0, 0) != 0 ||
+        green_agentops_read_response(fd, &response) != 0 ||
+        response.status != 0) {
+        if (fd >= 0)
+            close(fd);
+        (void)green_agentops_revoke(pid, candidate);
+        snprintf(err, errlen, "agent rejected shadow token: %s",
+                 response.message[0] ? response.message : "control connection failed");
+        return -EACCES;
+    }
+    close(fd);
+    *token = candidate;
+    fprintf(stderr, "hook: shadow token provisioned for pid %d\n", (int)pid);
     return 0;
 }
 
@@ -162,109 +206,6 @@ int green_agentops_send_request(int fd, uint16_t tool, uint16_t command,
 int green_agentops_read_response(int fd, struct green_agent_response *out)
 {
     return green_agentops_read_full(fd, out, sizeof(*out));
-}
-
-/* Snapshot the target page cross-process, emit the redirect with the real
- * GumArm64Writer, and commit it through the shadow ABI. */
-static int broker_patch(pid_t target, unsigned long target_addr,
-                        unsigned long replacement, long *out_value)
-{
-    unsigned long page = target_addr & ~4095UL;
-    size_t offset = (size_t)(target_addr - page);
-    static guint8 snapshot[4096];
-    struct iovec local = { .iov_base = snapshot, .iov_len = sizeof(snapshot) };
-    struct iovec remote = { .iov_base = (void *)page,
-                            .iov_len = sizeof(snapshot) };
-    GumArm64Writer writer;
-    ssize_t n;
-    long pr;
-
-    if ((target_addr & 3) || (replacement & 3) || offset > 4096 - 16)
-        return -EINVAL;
-
-    do {
-        n = process_vm_readv((pid_t)target, &local, 1, &remote, 1, 0);
-    } while (n < 0 && errno == EINTR);
-    if (n != (ssize_t)sizeof(snapshot)) {
-        fprintf(stderr, "hook: process_vm_readv failed: %s\n",
-                strerror(errno));
-        return -EIO;
-    }
-
-    gum_arm64_writer_init(&writer, snapshot + offset);
-    writer.pc = (GumAddress)target_addr;
-    gum_arm64_writer_put_ldr_reg_address(&writer, ARM64_REG_X16,
-                                         (guint64)replacement);
-    gum_arm64_writer_put_br_reg(&writer, ARM64_REG_X16);
-    gum_arm64_writer_flush(&writer);
-    gum_arm64_writer_clear(&writer);
-
-    pr = green_cli_prctl(PR_GREEN_SHADOW_PATCH, target, page,
-                         (unsigned long)snapshot, sizeof(snapshot));
-    *out_value = pr;
-    return pr < 0 ? (int)pr : 0;
-}
-
-int green_agentops_broker_serve_one(pid_t pid, int broker_fd,
-                                    green_agentops_log_cb logcb, void *ud)
-{
-    struct green_broker_request breq;
-    struct green_broker_response bresp;
-    long pr = 0;
-    int32_t status;
-
-    if (green_agentops_read_full(broker_fd, &breq, sizeof(breq)) != 0)
-        return 1; /* clean EOF: the agent closed or replaced the channel */
-
-    memset(&bresp, 0, sizeof(bresp));
-    status = 0;
-    if (breq.magic != GREEN_AGENT_MAGIC) {
-        status = -EBADMSG;
-    } else if (breq.command == GREEN_BROKER_LOG) {
-        /* one-way script log; not answered */
-        static char text[8192];
-        uint32_t len = breq.len;
-
-        if (len > sizeof(text))
-            len = sizeof(text);
-        if (len > 0 &&
-            green_agentops_read_full(broker_fd, text, len) != 0)
-            return -1;
-        if (logcb)
-            logcb((int32_t)pid, text, len, ud);
-        return 0;
-    } else if (breq.command == GREEN_BROKER_PATCH && breq.len > 0) {
-        /* payload-side gum commit: image follows the header */
-        unsigned char img[4096];
-
-        if (breq.len > 4096 ||
-            green_agentops_read_full(broker_fd, img, breq.len) != 0) {
-            status = -EBADMSG;
-        } else {
-            pr = green_cli_prctl(PR_GREEN_SHADOW_PATCH, pid, breq.addr,
-                                 (unsigned long)img, breq.len);
-            bresp.status = pr < 0 ? (int32_t)pr : 0;
-            bresp.value = pr;
-        }
-    } else if (breq.command == GREEN_BROKER_PATCH) {
-        status = broker_patch(pid, breq.addr, breq.arg, &bresp.value);
-        bresp.status = (int32_t)status;
-    } else if (breq.command == GREEN_BROKER_RELEASE) {
-        pr = green_cli_prctl(PR_GREEN_SHADOW_RELEASE, pid, breq.addr, 0, 0);
-        bresp.status = pr < 0 ? (int32_t)pr : 0;
-        bresp.value = pr;
-    } else if (breq.command == GREEN_BROKER_COUNT) {
-        pr = green_cli_prctl(PR_GREEN_SHADOW_COUNT, pid, 0, 0, 0);
-        bresp.status = pr < 0 ? (int32_t)pr : 0;
-        bresp.value = pr;
-    } else {
-        status = -EOPNOTSUPP;
-    }
-    if (status != 0 && bresp.status == 0)
-        bresp.status = status;
-    if (green_agentops_write_full(broker_fd, &bresp, sizeof(bresp)) != 0)
-        return -1;
-    return 0;
 }
 
 struct map_entry {
@@ -829,80 +770,4 @@ int green_agentops_deploy_script(pid_t pid, const char *script_file,
     }
     close(dfd);
     return 0;
-}
-
-int green_agentops_attach_and_load(pid_t pid, const char *script_file,
-                                   const char *inline_code)
-{
-    char err[192] = {0};
-    char dest[300];
-    struct green_agent_response response;
-    int cmd_fd;
-    int broker_fd;
-    int r;
-
-    if (green_agentops_ensure_injected(pid, err, sizeof(err)) != 0) {
-        fprintf(stderr, "hook: %s\n", err);
-        return 1;
-    }
-    if (green_agentops_deploy_script(pid, script_file, inline_code, dest,
-                                     sizeof(dest), err, sizeof(err)) != 0) {
-        fprintf(stderr, "hook: %s\n", err);
-        return 1;
-    }
-    fprintf(stderr, "hook: script -> %s\n", dest);
-
-    /* conn A: the command; conn B: the broker serving the payload's
-     * privileged page-table requests while the script evaluates. */
-    cmd_fd = green_agentops_connect(pid);
-    if (cmd_fd < 0)
-        return 1;
-    broker_fd = green_agentops_connect(pid);
-    if (broker_fd < 0) {
-        close(cmd_fd);
-        return 1;
-    }
-    if (green_agentops_broker_attach(pid, broker_fd) != 0) {
-        close(cmd_fd);
-        close(broker_fd);
-        return 1;
-    }
-    if (green_agentops_send_request(cmd_fd, GREEN_AGENT_TOOL_JS,
-                                    GREEN_AGENT_CMD_JS_LOAD, 0, 0, 0) != 0) {
-        close(cmd_fd);
-        close(broker_fd);
-        return 1;
-    }
-
-    for (;;) {
-        struct pollfd fds[2] = {
-            { .fd = broker_fd, .events = POLLIN },
-            { .fd = cmd_fd, .events = POLLIN },
-        };
-
-        if (poll(fds, 2, -1) < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        if (fds[0].revents & POLLIN) {
-            if (green_agentops_broker_serve_one(pid, broker_fd, NULL,
-                                                NULL) != 0)
-                break;
-        }
-        if (fds[1].revents & POLLIN) {
-            if (green_agentops_read_response(cmd_fd, &response) != 0)
-                break;
-            printf("status=%d value=0x%" PRIx64 " %s\n", response.status,
-                   response.value, response.message);
-            r = response.status == 0 ? 0 : 1;
-            close(cmd_fd);
-            close(broker_fd);
-            return r;
-        }
-    }
-
-    close(cmd_fd);
-    close(broker_fd);
-    return 1;
 }

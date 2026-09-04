@@ -7,7 +7,8 @@ build
 
 test
 script
-green_hook/
+# The Green Frida integration is source, not a generated directory.
+# Generated artifacts are ignored by kpms/green/.gitignore.
 host/
 
 # Green's checked-in regression tests live under kpms/green/test/.

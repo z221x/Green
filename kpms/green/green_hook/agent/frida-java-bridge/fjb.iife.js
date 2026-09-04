@@ -2415,9 +2415,7 @@ var __fjb = (() => {
   };
   function makeArtClassVisitor(visit) {
     const api2 = getApi();
-    if (api2["art::ClassLinker::VisitClasses"] instanceof NativeFunction ||
-        (api2["art::ClassLinker::VisitClasses"] !== void 0 &&
-         api2["art::ClassLinker::VisitClasses"].__green_native_function === true)) {
+    if (api2["art::ClassLinker::VisitClasses"] instanceof NativeFunction) {
       return new ArtClassVisitor(visit);
     }
     return new NativeCallback((klass) => {

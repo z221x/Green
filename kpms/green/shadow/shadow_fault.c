@@ -449,6 +449,10 @@ void green_shadow_exit_mmap_after(hook_fargs1_t *args, void *udata)
      * any remaining metadata without dereferencing the (possibly freed) mm;
      * release_page(false) never walks its page tables. */
     green_shadow_release_mm(mm, false);
+    /* The token is scoped to the address space and must not survive its
+     * destruction.  Removing it here also prevents a recycled mm pointer
+     * from inheriting the old agent's authorization. */
+    green_shadow_revoke_mm(mm);
     atomic_dec(&green_shadow_hooks_busy);
     args->local.data0 = 0;
 }

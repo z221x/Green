@@ -19,20 +19,16 @@ int green_agentops_write_full(int fd, const void *buf, size_t size);
 int green_agentops_connect(pid_t pid);
 int green_agentops_ping_ok(pid_t pid);
 
-/* BROKER_ATTACH handshake on an already connected socket. */
-int green_agentops_broker_attach(pid_t pid, int broker_fd);
-
 int green_agentops_send_request(int fd, uint16_t tool, uint16_t command,
                                 uint64_t arg0, uint64_t arg1, uint64_t arg2);
 int green_agentops_read_response(int fd, struct green_agent_response *out);
 
-/* Read and service one broker frame (PATCH/RELEASE/COUNT/LOG).  LOG frames
- * are forwarded to logcb instead of being answered.  Returns 0 when a frame
- * was handled, 1 on clean EOF, -1 on error. */
-typedef void (*green_agentops_log_cb)(int32_t pid, const char *text,
-                                      uint32_t len, void *ud);
-int green_agentops_broker_serve_one(pid_t pid, int broker_fd,
-                                    green_agentops_log_cb logcb, void *ud);
+/* Generate, register and deliver a per-mm token.  The KPM registration is
+ * performed by this root-side server; the agent receives the same value over
+ * its authenticated control socket and includes it in every shadow prctl. */
+int green_agentops_authorize(pid_t pid, unsigned long *token,
+                             char *err, size_t errlen);
+int green_agentops_revoke(pid_t pid, unsigned long token);
 
 /* ptrace + remote dlopen of the payload. */
 int green_agentops_inject(pid_t pid, const char *so_path);
@@ -55,11 +51,5 @@ int green_agentops_ensure_injected(pid_t pid, char *err, size_t errlen);
 int green_agentops_deploy_script(pid_t pid, const char *script_file,
                                  const char *inline_code, char *dest,
                                  size_t dest_size, char *err, size_t errlen);
-
-/* One-shot flow used by the on-device `green hook attach` command: ensure
- * injection, deploy the script and evaluate it (serving the broker channel
- * while the request runs). */
-int green_agentops_attach_and_load(pid_t pid, const char *script_file,
-                                   const char *inline_code);
 
 #endif /* GREEN_AGENTOPS_H */

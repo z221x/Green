@@ -25,7 +25,7 @@
                 return;
         }
         // console.log is part of the standard Frida script API.  Green maps
-        // it to logcat and the broker channel as well.
+        // it to logcat and the server's control stream as well.
         console.log("[java-probe] " + s);
     }
 

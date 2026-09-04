@@ -5,9 +5,8 @@
 - `fjb.iife.js`：由官方 `frida-java-bridge` 7.0.13 打包得到的 IIFE，包含
   Android ART/JVM 的 Java API 实现；其中保留了 Green 为 QuickJS、ART 15
   和 KPM shadow 内存模型做的少量补丁。
-- `java_bridge.c`：Green 早期 JNI/ArtMethod 辅助入口。当前标准 FJB
-  `ArtMethodMangler` 路径主要使用 `NativeCallback`，该文件仍作为底层
-  注册和兼容入口保留。
+- Java bridge 只依赖标准 GumJS 的 `NativeFunction`、`NativeCallback` 和
+  `CModule`，不再链接 Green 自定义 JNI/trampoline C 入口。
 
 ## 与官方实现的关系
 
@@ -16,5 +15,5 @@ bundle；`fjb.iife.js` 不是独立 fork 的完整源码，而是针对 Green �
 适配的构建产物。重新同步上游时，应先对比官方 `dist/fjb.iife.js`，再保留
 Green 的补丁，不能直接覆盖。
 
-Java bridge 依赖的 `prelude.js`、Gum writer/relocator 和 CModule 绑定是
-共享 Frida 运行时，仍放在 `agent/` 根目录，供 Java 与 Native API 共用。
+Java bridge 依赖的 Gum writer/relocator 和 CModule 绑定来自 vendored
+Frida GumJS；Green 不再维护一份 prelude 或手写 writer。

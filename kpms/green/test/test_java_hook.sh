@@ -41,7 +41,7 @@ fi
 
 if [ "${REBUILD:-0}" = "1" ]; then
     : "${ANDROID_NDK:?Set ANDROID_NDK when REBUILD=1}"
-    make -C "$GREEN_DIR" agent client
+    make -C "$GREEN_DIR" agent client testhook
 fi
 
 PAYLOAD="$GREEN_DIR/build/libgreen_agent.so"
@@ -74,6 +74,21 @@ if [ -z "$SERVER_PID" ]; then
         echo "green server failed to start; inspect $REMOTE_DIR/green.log" >&2
         exit 1
     fi
+fi
+
+# Fail early with an actionable message when the KPM is not loaded.  This
+# smoke test exercises the exact token-per-prctl ABI used by the agent.
+AUTH_TEST="$GREEN_DIR/build/test_shadow_auth"
+if [ ! -f "$AUTH_TEST" ]; then
+    echo "missing $AUTH_TEST; run REBUILD=1 with ANDROID_NDK set" >&2
+    exit 1
+fi
+"$ADB" push "$AUTH_TEST" "$REMOTE_DIR/green_shadow_auth" >/dev/null
+"$ADB" shell su -c "chmod 755 $REMOTE_DIR/green_shadow_auth"
+if ! "$ADB" shell su -c "$REMOTE_DIR/green_shadow_auth"; then
+    echo "[!] KPM shadow is offline: load $GREEN_DIR/build/green.kpm before attach" >&2
+    echo "    The agent will not fall back to direct memory writes." >&2
+    exit 1
 fi
 
 if ! "$ADB" forward --list 2>/dev/null | awk -v p="tcp:$PORT" '$2 == p { found=1 } END { exit(found ? 0 : 1) }'; then

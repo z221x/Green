@@ -16,8 +16,8 @@ Committed: `cross/` (meson machine files + arm64 pkg-config wrapper),
 - `prefix/` — arm64 static: glib/gobject/gio, capstone 5, libffi, lzma, zstd,
   quickjs (frida fork)
 - `frida-gum/build-gumjs/gum/libfrida-gum-1.0.a` — gum core incl.
-  GumInterceptor (trampoline + relocation) and the memory backend we route
-  through the broker
+  GumInterceptor (trampoline + relocation); Green overrides only the memory
+  seam in `green_hook/agent/gummemory-green-payload.c`
 - `frida-gum/build-gumjs/bindings/gumjs/libfrida-gumjs-1.0.a` — QuickJS
   script backend + the frida JS API runtime (Interceptor, Memory, Module...)
 

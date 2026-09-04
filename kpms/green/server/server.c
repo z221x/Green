@@ -209,14 +209,6 @@ static int handle_list(int fd)
  * u32 script_len | script bytes. */
 #define ATTACH_HDR 137
 
-/* Serve the broker channel: PATCH/RELEASE/COUNT requests from the payload
- * and one-way script log frames; the latter are relayed to the host. */
-static int session_broker_step(struct session *s, int broker_fd)
-{
-    return green_agentops_broker_serve_one(s->pid, broker_fd, session_log_cb,
-                                           s);
-}
-
 /* Evaluate a JS snippet in the target's persistent QuickJS context.  The
  * code travels through a well-known file next to the hook script. */
 static void write_eval_file(pid_t pid, const char *code)
@@ -235,9 +227,10 @@ static void write_eval_file(pid_t pid, const char *code)
     close(r);
 }
 
-/* Evaluate with the given broker channel; sends the RESULT frame. */
-static void eval_with_broker(int fd, struct session *s, int broker_fd,
-                             const char *code)
+/* Evaluate in the persistent standard GumJS context.  The command socket is
+ * separate from the long-lived attach connection; shadow writes never pass
+ * through this path and are issued directly by the agent with its token. */
+static void eval_with_agent(int fd, struct session *s, const char *code)
 {
     struct green_agent_response response;
     int cmd_fd = -1;
@@ -255,29 +248,18 @@ static void eval_with_broker(int fd, struct session *s, int broker_fd,
         return;
     }
     for (;;) {
-        struct pollfd fds[2] = {
-            { .fd = broker_fd, .events = POLLIN },
-            { .fd = cmd_fd, .events = POLLIN },
-        };
-
-        if (poll(fds, 2, -1) < 0) {
-            if (errno == EINTR)
-                continue;
+        if (green_agentops_read_response(cmd_fd, &response) != 0)
             break;
+        if (response.status == GREEN_AGENT_STATUS_EVENT) {
+            session_log_cb((int32_t)s->pid, response.message,
+                           (uint32_t)strlen(response.message), s);
+            continue;
         }
-        if (fds[0].revents & POLLIN) {
-            if (session_broker_step(s, broker_fd) != 0)
-                break;
-        }
-        if (fds[1].revents & POLLIN) {
-            if (green_agentops_read_response(cmd_fd, &response) != 0)
-                break;
-            pthread_mutex_lock(&s->send_lock);
-            send_result(fd, response.status == 0 ? 1 : 0,
-                        (int64_t)response.value, response.message);
-            pthread_mutex_unlock(&s->send_lock);
-            break;
-        }
+        pthread_mutex_lock(&s->send_lock);
+        send_result(fd, response.status == 0 ? 1 : 0,
+                    (int64_t)response.value, response.message);
+        pthread_mutex_unlock(&s->send_lock);
+        break;
     }
     close(cmd_fd);
 }
@@ -295,7 +277,7 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
     int32_t pid = 0;
     uint8_t has_package;
     uint32_t script_len;
-    int broker_fd = -1;
+    unsigned long token = 0;
     int cmd_fd = -1;
     int ok = 0;
 
@@ -330,26 +312,15 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
         s.pid = found;
     }
 
-    if (green_agentops_ensure_injected(s.pid, err, sizeof(err)) != 0) {
+    if (green_agentops_authorize(s.pid, &token, err, sizeof(err)) != 0) {
         send_result(fd, 0, 0, err);
         free(script);
         return;
     }
     if (green_agentops_deploy_script(s.pid, NULL, script, dest, sizeof(dest),
                                      err, sizeof(err)) != 0) {
+        (void)green_agentops_revoke(s.pid, token);
         send_result(fd, 0, 0, err);
-        free(script);
-        return;
-    }
-
-    /* Attach the broker before evaluating: hook() inside the script needs
-     * it, and it stays attached afterwards so logs keep streaming. */
-    broker_fd = green_agentops_connect(s.pid);
-    if (broker_fd < 0 ||
-        green_agentops_broker_attach(s.pid, broker_fd) != 0) {
-        if (broker_fd >= 0)
-            close(broker_fd);
-        send_result(fd, 0, 0, "broker attach failed");
         free(script);
         return;
     }
@@ -359,42 +330,31 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
         green_agentops_send_request(cmd_fd, GREEN_AGENT_TOOL_JS,
                                     GREEN_AGENT_CMD_JS_LOAD, 0, 0, 0) != 0) {
         send_result(fd, 0, 0, "agent request failed");
+        (void)green_agentops_revoke(s.pid, token);
         goto out;
     }
 
-    /* Serve broker traffic while the LOAD request runs. */
     for (;;) {
-        struct pollfd fds[2] = {
-            { .fd = broker_fd, .events = POLLIN },
-            { .fd = cmd_fd, .events = POLLIN },
-        };
-
-        if (poll(fds, 2, -1) < 0) {
-            if (errno == EINTR)
-                continue;
+        if (green_agentops_read_response(cmd_fd, &response) != 0)
             break;
+        if (response.status == GREEN_AGENT_STATUS_EVENT) {
+            session_log_cb((int32_t)s.pid, response.message,
+                           (uint32_t)strlen(response.message), &s);
+            continue;
         }
-        if (fds[0].revents & POLLIN) {
-            if (session_broker_step(&s, broker_fd) != 0)
-                break;
-        }
-        if (fds[1].revents & POLLIN) {
-            if (green_agentops_read_response(cmd_fd, &response) != 0)
-                break;
-            pthread_mutex_lock(&s.send_lock);
-            send_result(fd, response.status == 0 ? 1 : 0,
-                        (int64_t)response.value, response.message);
-            pthread_mutex_unlock(&s.send_lock);
-            ok = response.status == 0;
-            break;
-        }
+        pthread_mutex_lock(&s.send_lock);
+        send_result(fd, response.status == 0 ? 1 : 0,
+                    (int64_t)response.value, response.message);
+        pthread_mutex_unlock(&s.send_lock);
+        ok = response.status == 0;
+        break;
     }
 
     if (ok) {
         /* Steady state: stream logs and serve REPL evals. */
         for (;;) {
             struct pollfd fds[2] = {
-                { .fd = broker_fd, .events = POLLIN },
+                { .fd = cmd_fd, .events = POLLIN },
                 { .fd = fd, .events = POLLIN },
             };
 
@@ -404,8 +364,12 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
                 break;
             }
             if (fds[0].revents & POLLIN) {
-                if (session_broker_step(&s, broker_fd) != 0)
+                struct green_agent_response event;
+                if (green_agentops_read_response(cmd_fd, &event) != 0)
                     break;
+                if (event.status == GREEN_AGENT_STATUS_EVENT)
+                    session_log_cb((int32_t)s.pid, event.message,
+                                   (uint32_t)strlen(event.message), &s);
             }
             if (fds[1].revents & POLLIN) {
                 unsigned char header[12];
@@ -428,21 +392,44 @@ static void handle_attach(int fd, const unsigned char *payload, uint32_t len)
                     break;
                 }
                 if (type == GREEN_WIRE_EVAL)
-                    eval_with_broker(fd, &s, broker_fd, (const char *)pl);
+                    eval_with_agent(fd, &s, (const char *)pl);
                 free(pl);
             }
         }
+    }
+    else {
+        (void)green_agentops_revoke(s.pid, token);
     }
 
 out:
     free(script);
     if (cmd_fd >= 0)
         close(cmd_fd);
-    if (broker_fd >= 0)
-        close(broker_fd);
 }
 
 /* ---- host-driven shadow operations (run here, on the device, as root) */
+
+static long server_shadow_call(pid_t pid, unsigned int op,
+                               unsigned long addr, const void *bytes,
+                               unsigned long len, char *err, size_t errlen)
+{
+    struct green_shadow_rpc rpc;
+    unsigned long token = 0;
+    long ret;
+
+    if (green_agentops_authorize(pid, &token, err, errlen) != 0)
+        return -EACCES;
+    memset(&rpc, 0, sizeof(rpc));
+    rpc.version = GREEN_SHADOW_ABI_VERSION;
+    rpc.op = op;
+    rpc.pid = pid;
+    rpc.addr = addr;
+    rpc.buf = (unsigned long)bytes;
+    rpc.len = len;
+    ret = green_cli_prctl(PR_GREEN_SHADOW_REQUEST, token,
+                          (unsigned long)&rpc, 0, 0);
+    return ret;
+}
 
 static void handle_shadow_patch(int fd, const unsigned char *payload,
                                 uint32_t len)
@@ -451,6 +438,7 @@ static void handle_shadow_patch(int fd, const unsigned char *payload,
     uint32_t plen;
     uint64_t addr;
     unsigned char bytes[4096];
+    char err[192] = {0};
     long ret;
 
     if (len < 16)
@@ -463,10 +451,11 @@ static void handle_shadow_patch(int fd, const unsigned char *payload,
         return;
     }
     memcpy(bytes, payload + 16, plen);
-    ret = green_cli_prctl(PR_GREEN_SHADOW_PATCH, (unsigned long)pid,
-                          (unsigned long)addr, (unsigned long)bytes, plen);
+    ret = server_shadow_call((pid_t)pid, GREEN_SHADOW_OP_PATCH,
+                             (unsigned long)addr, bytes, plen,
+                             err, sizeof(err));
     if (ret < 0)
-        send_result(fd, 0, ret, strerror((int)-ret));
+        send_result(fd, 0, ret, err[0] ? err : strerror((int)-ret));
     else
         send_result(fd, 1, ret, "patched");
 }
@@ -478,15 +467,17 @@ static void handle_shadow_release(int fd, const unsigned char *payload,
     uint64_t addr;
     long ret;
     char msg[96];
+    char err[192] = {0};
 
     if (len < 16)
         return;
     pid = (int32_t)get_u32(payload + 0);
     addr = get_u32(payload + 8) | ((uint64_t)get_u32(payload + 12) << 32);
-    ret = green_cli_prctl(PR_GREEN_SHADOW_RELEASE, (unsigned long)pid,
-                          (unsigned long)addr, 0, 0);
+    ret = server_shadow_call((pid_t)pid, GREEN_SHADOW_OP_RELEASE,
+                             (unsigned long)addr, NULL, 0,
+                             err, sizeof(err));
     if (ret < 0) {
-        send_result(fd, 0, ret, strerror((int)-ret));
+        send_result(fd, 0, ret, err[0] ? err : strerror((int)-ret));
         return;
     }
     snprintf(msg, sizeof(msg), "released %ld shadow page(s) for pid %d", ret,
@@ -499,13 +490,15 @@ static void handle_shadow_count(int fd, const unsigned char *payload,
 {
     int32_t pid;
     long ret;
+    char err[192] = {0};
 
     if (len < 4)
         return;
     pid = (int32_t)get_u32(payload + 0);
-    ret = green_cli_prctl(PR_GREEN_SHADOW_COUNT, (unsigned long)pid, 0, 0, 0);
+    ret = server_shadow_call((pid_t)pid, GREEN_SHADOW_OP_COUNT,
+                             0, NULL, 0, err, sizeof(err));
     if (ret < 0)
-        send_result(fd, 0, ret, strerror((int)-ret));
+        send_result(fd, 0, ret, err[0] ? err : strerror((int)-ret));
     else
         send_result(fd, 1, ret, "ok");
 }
@@ -577,9 +570,6 @@ static void handle_standalone_eval(int fd, const unsigned char *payload,
     int32_t pid;
     uint32_t code_len;
     char *code;
-    struct green_agent_response response;
-    int broker_fd = -1;
-    int cmd_fd = -1;
     struct session s;
 
     if (len < 8)
@@ -595,7 +585,7 @@ static void handle_standalone_eval(int fd, const unsigned char *payload,
     code[code_len] = '\0';
 
     if (!green_agentops_ping_ok((pid_t)pid)) {
-        send_result(fd, 0, 0, "target is not attached (use `attach` first)");
+        send_result(fd, 0, 0, "target is not attached (use attach first)");
         free(code);
         return;
     }
@@ -605,23 +595,9 @@ static void handle_standalone_eval(int fd, const unsigned char *payload,
     s.pid = (pid_t)pid;
     pthread_mutex_init(&s.send_lock, NULL);
 
-    broker_fd = green_agentops_connect((pid_t)pid);
-    if (broker_fd < 0 ||
-        green_agentops_broker_attach((pid_t)pid, broker_fd) != 0) {
-        if (broker_fd >= 0)
-            close(broker_fd);
-        send_result(fd, 0, 0, "broker attach failed");
-        free(code);
-        return;
-    }
-
-    eval_with_broker(fd, &s, broker_fd, code);
+    eval_with_agent(fd, &s, code);
 
     free(code);
-    if (cmd_fd >= 0)
-        close(cmd_fd);
-    if (broker_fd >= 0)
-        close(broker_fd);
 }
 
 static void handle_kill(int fd, const unsigned char *payload, uint32_t len)

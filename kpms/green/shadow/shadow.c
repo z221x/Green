@@ -7,6 +7,7 @@
 #endif
 
 struct list_head green_shadow_pages = LIST_HEAD_INIT(green_shadow_pages);
+struct list_head green_shadow_tokens = LIST_HEAD_INIT(green_shadow_tokens);
 atomic_t green_shadow_pages_busy = ATOMIC_INIT(0);
 atomic_t green_shadow_pgtable_busy = ATOMIC_INIT(0);
 atomic_t green_shadow_hooks_busy = ATOMIC_INIT(0);
@@ -16,6 +17,127 @@ int green_shadow_levels;
 int green_shadow_root_shift;
 s64 green_shadow_linear_offset;
 int16_t green_shadow_vma_mm_offset = -1;
+
+static bool green_shadow_token_valid_locked(void *mm, unsigned long token)
+{
+    struct list_head *pos;
+
+    if (!mm || token == 0)
+        return false;
+    list_for_each(pos, &green_shadow_tokens) {
+        struct green_shadow_token_entry *entry =
+            container_of(pos, struct green_shadow_token_entry, node);
+        if (entry->mm == mm && entry->token == token)
+            return true;
+    }
+    return false;
+}
+
+bool green_shadow_token_valid(void *mm, unsigned long token)
+{
+    bool valid;
+
+    if (!green_lock(&green_shadow_pages_busy))
+        return false;
+    valid = green_shadow_token_valid_locked(mm, token);
+    green_unlock(&green_shadow_pages_busy);
+    return valid;
+}
+
+static struct green_shadow_token_entry *
+green_shadow_find_token_locked(void *mm)
+{
+    struct list_head *pos;
+
+    list_for_each(pos, &green_shadow_tokens) {
+        struct green_shadow_token_entry *entry =
+            container_of(pos, struct green_shadow_token_entry, node);
+        if (entry->mm == mm)
+            return entry;
+    }
+    return 0;
+}
+
+long green_shadow_register_token(pid_t pid, unsigned long token)
+{
+    struct green_shadow_token_entry *entry;
+    void *mm;
+
+    if (!token)
+        return -EINVAL;
+    mm = green_shadow_mm_from_pid(pid);
+    if (!mm)
+        return -ESRCH;
+
+    if (!green_lock(&green_shadow_pages_busy)) {
+        green_k_mmput(mm);
+        return -EBUSY;
+    }
+    entry = green_shadow_find_token_locked(mm);
+    if (!entry) {
+        unsigned long mem = green_k_get_free_pages(GREEN_GFP_KERNEL, 0);
+        if (!mem) {
+            green_unlock(&green_shadow_pages_busy);
+            green_k_mmput(mm);
+            return -ENOMEM;
+        }
+        entry = (struct green_shadow_token_entry *)mem;
+        memset(entry, 0, GREEN_PAGE_SIZE);
+        INIT_LIST_HEAD(&entry->node);
+        entry->mm = mm;
+        list_add_tail(&entry->node, &green_shadow_tokens);
+    }
+    entry->token = token;
+    green_unlock(&green_shadow_pages_busy);
+    green_k_mmput(mm);
+    pr_info("green_shadow: token registered pid=%d mm=%px\n", pid, mm);
+    return 0;
+}
+
+long green_shadow_revoke_token(pid_t pid, unsigned long token)
+{
+    struct green_shadow_token_entry *entry;
+    void *mm;
+    unsigned long mem = 0;
+
+    mm = green_shadow_mm_from_pid(pid);
+    if (!mm)
+        return -ESRCH;
+    if (!green_lock(&green_shadow_pages_busy)) {
+        green_k_mmput(mm);
+        return -EBUSY;
+    }
+    entry = green_shadow_find_token_locked(mm);
+    if (!entry || (token && entry->token != token)) {
+        green_unlock(&green_shadow_pages_busy);
+        green_k_mmput(mm);
+        return -ENOENT;
+    }
+    list_del_init(&entry->node);
+    mem = (unsigned long)entry;
+    green_unlock(&green_shadow_pages_busy);
+    green_k_free_pages(mem, 0);
+    green_k_mmput(mm);
+    pr_info("green_shadow: token revoked pid=%d\n", pid);
+    return 0;
+}
+
+void green_shadow_revoke_mm(void *mm)
+{
+    struct green_shadow_token_entry *entry;
+    unsigned long mem = 0;
+
+    if (!mm || !green_lock(&green_shadow_pages_busy))
+        return;
+    entry = green_shadow_find_token_locked(mm);
+    if (entry) {
+        list_del_init(&entry->node);
+        mem = (unsigned long)entry;
+    }
+    green_unlock(&green_shadow_pages_busy);
+    if (mem)
+        green_k_free_pages(mem, 0);
+}
 
 static int green_shadow_hooked_prctl;
 static int green_shadow_hooked_fault;
@@ -120,17 +242,11 @@ static struct green_shadow_page *green_shadow_new_page(void *mm,
     }
 
     pte = *ptep;
-    if (!(pte & PTE_USER) || !(pte & PTE_RDONLY) || (pte & PTE_UXN)) {
-        pr_warn("green_shadow: target is not a user read-only executable page va=%lx pte=%llx\n",
+    if (!(pte & PTE_USER)) {
+        pr_warn("green_shadow: target is not a user page va=%lx pte=%llx\n",
                 va, pte);
         return 0;
     }
-#ifdef PTE_CONT
-    if (pte & PTE_CONT) {
-        pr_warn("green_shadow: contiguous PTE is not supported va=%lx\n", va);
-        return 0;
-    }
-#endif
 
     meta = green_k_get_free_pages(GREEN_GFP_KERNEL, 0);
     if (!meta)
@@ -151,6 +267,7 @@ static struct green_shadow_page *green_shadow_new_page(void *mm,
     page->shadow_kva = (void *)shadow;
     page->shadow_pfn = green_kva_to_phys(shadow) >> GREEN_PAGE_SHIFT;
     page->state = 0;
+    page->executable = (pte & PTE_UXN) == 0;
     page->refs = 2; /* list + caller */
     page->dead = false;
     atomic_set(&page->pte_busy, 0);
@@ -443,7 +560,8 @@ long green_shadow_patch_mm(void *mm, unsigned long addr, const void *buf,
     green_shadow_page_unlock(page);
 
     if (ret == 0) {
-        ret = green_shadow_map_exec(page);
+        ret = page->executable ? green_shadow_map_exec(page)
+                               : green_shadow_map_data(page);
         if (ret) {
             /* A stale mapping must not leave a modified shadow page tracked. */
             green_shadow_release_page(page, true);
@@ -459,70 +577,70 @@ long green_shadow_patch_mm(void *mm, unsigned long addr, const void *buf,
     return ret;
 }
 
-long green_shadow_patch_task(pid_t pid, unsigned long addr,
-                             const void __user *buf, unsigned long len)
+long green_shadow_request(const struct green_shadow_rpc *rpc,
+                          unsigned long token, bool caller_is_root)
 {
-    void *mm = green_shadow_mm_from_pid(pid);
+    unsigned char bytes[GREEN_SHADOW_MAX_PATCH_LEN];
+    void *mm;
     long ret;
 
-    pr_err("green_shadow: patch_task pid=%d addr=%lx len=%lu\n",
-           pid, addr, len);
-    if (!mm) {
-        pr_err("green_shadow: patch_task: no mm for pid=%d\n", pid);
-        return -ESRCH;
-    }
-    ret = green_shadow_patch_mm(mm, addr, buf, len, true);
-    green_k_mmput(mm);
-    return ret;
-}
+    if (!rpc || rpc->version != GREEN_SHADOW_ABI_VERSION ||
+        rpc->op < GREEN_SHADOW_OP_PATCH ||
+        rpc->op > GREEN_SHADOW_OP_COUNT || token == 0 || rpc->pid < 0)
+        return -EINVAL;
 
-long green_shadow_patch_kernel(pid_t pid, unsigned long addr, const void *buf,
-                               unsigned long len)
-{
-    void *mm = green_shadow_mm_from_pid(pid);
-    long ret;
+    /* Non-root agents may only address their own mm (pid must be 0).  The
+     * root server is the sole caller allowed to name another pid. */
+    if (!caller_is_root && rpc->pid != 0)
+        return -EPERM;
 
+    mm = green_shadow_mm_from_pid((pid_t)rpc->pid);
     if (!mm)
         return -ESRCH;
-    ret = green_shadow_patch_mm(mm, addr, buf, len, false);
-    green_k_mmput(mm);
-    return ret;
-}
-
-long green_shadow_release_task(pid_t pid, unsigned long addr)
-{
-    void *mm = green_shadow_mm_from_pid(pid);
-    struct green_shadow_page *page;
-    long ret;
-
-    if (!mm)
-        return -ESRCH;
-
-    if (addr == 0) {
-        ret = green_shadow_release_mm(mm, true);
+    if (!green_shadow_token_valid(mm, token)) {
         green_k_mmput(mm);
-        return ret;
+        return -EACCES;
     }
 
-    page = green_shadow_get_page(mm, addr);
-    if (!page) {
-        green_k_mmput(mm);
-        return -ENOENT;
+    switch (rpc->op) {
+    case GREEN_SHADOW_OP_PATCH:
+        if (!rpc->buf || rpc->len == 0 ||
+            rpc->len > GREEN_SHADOW_MAX_PATCH_LEN) {
+            ret = -EINVAL;
+            break;
+        }
+        /* The source buffer belongs to the caller (root or the injected
+         * process), so copy it before operating on a different target mm. */
+        ret = green_shadow_copy_from_user(bytes,
+                                          (const void __user *)rpc->buf,
+                                          rpc->len);
+        if (ret == 0)
+            ret = green_shadow_patch_mm(mm, rpc->addr, bytes, rpc->len,
+                                        false);
+        break;
+    case GREEN_SHADOW_OP_RELEASE:
+        if (rpc->addr == 0) {
+            ret = green_shadow_release_mm(mm, true);
+        } else {
+            struct green_shadow_page *page =
+                green_shadow_get_page(mm, rpc->addr);
+            if (!page) {
+                ret = -ENOENT;
+            } else {
+                ret = green_shadow_release_page(page, true);
+                if (ret == 0)
+                    ret = 1;
+            }
+        }
+        break;
+    case GREEN_SHADOW_OP_COUNT:
+        ret = green_shadow_count_mm(mm);
+        break;
+    default:
+        ret = -EOPNOTSUPP;
+        break;
     }
 
-    ret = green_shadow_release_page(page, true);
-    green_k_mmput(mm);
-    return ret ? ret : 1;
-}
-
-long green_shadow_count_task(pid_t pid)
-{
-    void *mm = green_shadow_mm_from_pid(pid);
-    long ret;
-
-    if (!mm)
-        return -ESRCH;
-    ret = green_shadow_count_mm(mm);
     green_k_mmput(mm);
     return ret;
 }
@@ -530,36 +648,36 @@ long green_shadow_count_task(pid_t pid)
 void green_shadow_prctl_before(hook_fargs5_t *args, void *udata)
 {
     unsigned long option = syscall_argn(args, 0);
-    pid_t pid = (pid_t)syscall_argn(args, 1);
-    unsigned long addr = syscall_argn(args, 2);
+    unsigned long arg2 = syscall_argn(args, 1);
+    unsigned long arg3 = syscall_argn(args, 2);
     unsigned long arg4 = syscall_argn(args, 3);
     unsigned long arg5 = syscall_argn(args, 4);
     long ret = -EINVAL;
+    bool caller_is_root = current_uid() == 0;
 
     (void)udata;
 
-    if (option < PR_GREEN_SHADOW_PATCH || option > PR_GREEN_SHADOW_COUNT)
+    if (option < PR_GREEN_SHADOW_REQUEST ||
+        option > PR_GREEN_SHADOW_TOKEN_REVOKE)
         return;
 
     atomic_inc(&green_shadow_hooks_busy);
 
-    if (current_uid() != 0) {
-        ret = -EPERM;
-        goto out;
-    }
+    if (option == PR_GREEN_SHADOW_TOKEN_REGISTER) {
+        if (caller_is_root)
+            ret = green_shadow_register_token((pid_t)arg2, arg3);
+    } else if (option == PR_GREEN_SHADOW_TOKEN_REVOKE) {
+        if (caller_is_root)
+            ret = green_shadow_revoke_token((pid_t)arg2, arg3);
+    } else if (option == PR_GREEN_SHADOW_REQUEST) {
+        struct green_shadow_rpc rpc;
 
-    switch (option) {
-    case PR_GREEN_SHADOW_PATCH:
-        ret = green_shadow_patch_task(pid, addr, (const void __user *)arg4, arg5);
-        break;
-    case PR_GREEN_SHADOW_RELEASE:
-        ret = green_shadow_release_task(pid, addr);
-        break;
-    case PR_GREEN_SHADOW_COUNT:
-        ret = green_shadow_count_task(pid);
-        break;
-    default:
-        break;
+        memset(&rpc, 0, sizeof(rpc));
+        ret = green_shadow_copy_from_user(&rpc,
+                                          (const void __user *)arg3,
+                                          sizeof(rpc));
+        if (ret == 0)
+            ret = green_shadow_request(&rpc, arg2, caller_is_root);
     }
 
 out:
@@ -648,9 +766,9 @@ static long green_shadow_init(const char *args, const char *event,
     }
 
     green_shadow_online = 1;
-    pr_info("green_shadow: online patch=%lx release=%lx count=%lx\n",
-            PR_GREEN_SHADOW_PATCH, PR_GREEN_SHADOW_RELEASE,
-            PR_GREEN_SHADOW_COUNT);
+    pr_info("green_shadow: online request=%lx token_register=%lx token_revoke=%lx\n",
+            PR_GREEN_SHADOW_REQUEST, PR_GREEN_SHADOW_TOKEN_REGISTER,
+            PR_GREEN_SHADOW_TOKEN_REVOKE);
     return 0;
 }
 
@@ -712,6 +830,28 @@ static long green_shadow_exit(void __user *reserved)
         hook_unwrap(green_sym_exit_mmap, green_shadow_exit_mmap_before,
                     green_shadow_exit_mmap_after);
         green_shadow_hooked_exit = 0;
+    }
+
+    /* Drop any token entries whose target mm outlived the normal exit_mmap
+     * callback (for example when unloading the KPM while a process is being
+     * torn down). */
+    for (;;) {
+        struct green_shadow_token_entry *entry = 0;
+        unsigned long mem = 0;
+        struct list_head *pos;
+
+        if (!green_lock(&green_shadow_pages_busy))
+            break;
+        list_for_each(pos, &green_shadow_tokens) {
+            entry = container_of(pos, struct green_shadow_token_entry, node);
+            list_del_init(&entry->node);
+            mem = (unsigned long)entry;
+            break;
+        }
+        green_unlock(&green_shadow_pages_busy);
+        if (!mem)
+            break;
+        green_k_free_pages(mem, 0);
     }
 
     pr_info("green_shadow: offline released=%d\n", count);

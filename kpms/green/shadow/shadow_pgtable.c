@@ -97,7 +97,9 @@ static u64 *green_shadow_split_block(u64 *table, unsigned long addr,
 
     for (i = 0; i < 512; i++) {
         next_table[i] = (block_pa + ((unsigned long)i << (shift - 9))) |
-                        page_attr | PTE_TYPE_PAGE;
+                        page_attr |
+                        (shift == (int)(GREEN_PAGE_SHIFT + 9)
+                             ? PTE_TYPE_PAGE : PTE_VALID);
     }
 
     /* Publish the new table, then swap the descriptor atomically. */
@@ -182,7 +184,29 @@ u64 *green_shadow_get_pte(void *mm, unsigned long addr)
         table = (u64 *)next_va;
     }
 
-    return &table[(addr >> GREEN_PAGE_SHIFT) & GREEN_PTE_INDEX_MASK];
+    {
+        u64 *ptep = &table[(addr >> GREEN_PAGE_SHIFT) & GREEN_PTE_INDEX_MASK];
+#ifdef PTE_CONT
+        /* AArch64 contiguous hints cover sixteen adjacent 4-KB entries.
+         * Editing only one member is architecturally invalid, so remove the
+         * hint from the whole group before publishing a shadow PFN. */
+        if (*ptep & PTE_CONT) {
+            unsigned long index = ((unsigned long)ptep & (GREEN_PAGE_SIZE - 1)) /
+                                   sizeof(u64);
+            u64 *first = ptep - (index & 15UL);
+            unsigned int i;
+            unsigned long group_start = addr & ~((16UL * GREEN_PAGE_SIZE) - 1);
+
+            if (!green_lock(&green_shadow_pgtable_busy))
+                return 0;
+            for (i = 0; i < 16; i++)
+                first[i] &= ~(u64)PTE_CONT;
+            green_unlock(&green_shadow_pgtable_busy);
+            green_shadow_flush_tlb_range(group_start, 16UL * GREEN_PAGE_SIZE);
+        }
+#endif
+        return ptep;
+    }
 }
 
 void green_shadow_write_pte(u64 *ptep, u64 value)
@@ -203,9 +227,17 @@ static void green_shadow_flush_tlb_range(unsigned long start,
     unsigned long va;
 
     asm volatile("dsb ishst" ::: "memory");
-    for (va = start & GREEN_PAGE_MASK; va < end; va += GREEN_PAGE_SIZE) {
-        unsigned long operand = (va >> GREEN_PAGE_SHIFT) & ((1UL << 44) - 1);
-        asm volatile("tlbi vaale1is, %0" : : "r"(operand) : "memory");
+    /* Block splitting can cover 2 MB or 1 GB. Walking every 4-KB entry for a
+     * 1-GB split is needlessly slow and can starve the fault path. For large
+     * ranges use the architecturally defined VMALL fallback; small patches
+     * retain precise per-VA invalidation. */
+    if (len > (16UL << 20)) {
+        asm volatile("tlbi vmalle1is" ::: "memory");
+    } else {
+        for (va = start & GREEN_PAGE_MASK; va < end; va += GREEN_PAGE_SIZE) {
+            unsigned long operand = (va >> GREEN_PAGE_SHIFT) & ((1UL << 44) - 1);
+            asm volatile("tlbi vaale1is, %0" : : "r"(operand) : "memory");
+        }
     }
     asm volatile("dsb ish" ::: "memory");
     asm volatile("isb" ::: "memory");
@@ -331,6 +363,44 @@ int green_shadow_map_read(struct green_shadow_page *page)
     pte = green_shadow_read_pte(page);
     green_shadow_write_pte(ptep, pte);
     page->state = GREEN_SHADOW_STATE_READ;
+    green_shadow_page_unlock(page);
+    green_shadow_flush_tlb(page->va);
+    return 0;
+}
+
+int green_shadow_map_data(struct green_shadow_page *page)
+{
+    u64 *ptep;
+    u64 pte;
+
+    if (!green_shadow_page_lock(page))
+        return -EBUSY;
+    if (!green_lock(&green_shadow_pages_busy)) {
+        green_shadow_page_unlock(page);
+        return -EBUSY;
+    }
+    if (page->dead) {
+        green_unlock(&green_shadow_pages_busy);
+        green_shadow_page_unlock(page);
+        return -ENOENT;
+    }
+    green_unlock(&green_shadow_pages_busy);
+    ptep = green_shadow_get_pte(page->mm, page->va);
+    if (!ptep) {
+        green_shadow_page_unlock(page);
+        return -EFAULT;
+    }
+    if (green_pte_pfn(*ptep) != page->original_pfn &&
+        green_pte_pfn(*ptep) != page->shadow_pfn) {
+        green_shadow_page_unlock(page);
+        return -ESTALE;
+    }
+    /* Data mappings retain the original user permissions and memory type;
+     * only the PFN is redirected to the private shadow copy. */
+    pte = green_pte_replace_pfn(page->original_pte, page->shadow_pfn);
+    pte |= PTE_VALID | PTE_TYPE_PAGE | PTE_AF | PTE_USER;
+    green_shadow_write_pte(ptep, pte);
+    page->state = GREEN_SHADOW_STATE_DATA;
     green_shadow_page_unlock(page);
     green_shadow_flush_tlb(page->va);
     return 0;

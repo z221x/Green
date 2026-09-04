@@ -59,62 +59,44 @@ $(BUILD_DIR)/%.o: %.c $(KPM_HEADERS)
 .PHONY: client
 client: $(CLIENT)
 
-CLI_GUM_VENDOR_DIR := green_hook/vendor/gum
-CLI_GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
-# gummemory-green.c doubles as the gum platform layer (page size, ptrauth,
-# internal allocator, memory access) required to link the writer.
-CLI_GUM_SRCS := green_hook/gummemory-green.c \
-                $(CLI_GUM_VENDOR_DIR)/gumlibc.c \
-                $(CLI_GUM_VENDOR_DIR)/gummetalarray.c \
-                $(CLI_GUM_VENDOR_DIR)/gummetalhash.c \
-                $(CLI_GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
-SERVER_SRCS := server/main.c common/common.c common/agentops.c server/server.c \
-               $(CLI_GUM_SRCS)
+SERVER_SRCS := server/main.c common/common.c common/agentops.c server/server.c
 CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
 
 $(CLIENT): $(SERVER_SRCS) $(CLI_HEADERS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
-	$(ANDROID_CC) -D_GNU_SOURCE -O2 -Wall -Wextra -Iinclude -Iagent \
-		$(CLI_GUM_SHIM_FLAGS) -o $@ $(SERVER_SRCS) -ldl
+	$(ANDROID_CC) -D_GNU_SOURCE -O2 -Wall -Wextra -Iinclude \
+		-Igreen_hook/agent -o $@ $(SERVER_SRCS) -ldl
 
 .PHONY: testhook
-TESTHOOK := $(BUILD_DIR)/test_hook
+TESTHOOK := $(BUILD_DIR)/test_shadow_auth
 TEST_DIR := test
-
-# green_hook 用例：验证 patch 执行 / 读原始 / 恢复 三条 gum 语义。
-GUM_VENDOR_DIR := green_hook/vendor/gum
-GUM_SHIM_FLAGS := -Igreen_hook/vendor -Igreen_hook/vendor/gum -Igreen_hook/shim
-GUM_SRCS := green_hook/gummemory-green.c \
-            $(GUM_VENDOR_DIR)/gumlibc.c \
-            $(GUM_VENDOR_DIR)/gummetalarray.c \
-            $(GUM_VENDOR_DIR)/gummetalhash.c \
-            $(GUM_VENDOR_DIR)/arch-arm64/gumarm64writer.c
 
 testhook: $(TESTHOOK)
 
-$(TESTHOOK): $(TEST_DIR)/test_hook.c green_hook/green_gum.h $(GUM_SRCS) include/green/abi.h
+$(TESTHOOK): $(TEST_DIR)/test_shadow_auth.c include/green/abi.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
-	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -mbranch-protection=none \
-		-Iinclude $(GUM_SHIM_FLAGS) -Igreen_hook -o $@ $(TEST_DIR)/test_hook.c $(GUM_SRCS)
+	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra \
+		-Iinclude -o $@ $(TEST_DIR)/test_shadow_auth.c
 
 .PHONY: agent
 AGENT_PAYLOAD := $(BUILD_DIR)/libgreen_agent.so
-# Payload: transport + embedded QuickJS (no gum).  Privileged page-table
-# operations are performed by the root-side broker inside the green CLI.
-GUM_PREFIX := vendor/prefix
+# Payload: stock Frida GumJS + patched frida-java-bridge.  The payload talks
+# to KPM shadow directly using the token provisioned by the root server; no
+# broker, prelude or handwritten interceptor is linked.
 agent: $(AGENT_PAYLOAD)
 
 
-$(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h \
-		agent/gumwriter.c agent/gummemory-green-payload.c \
-		agent/frida-java-bridge/java_bridge.c agent/insn.c \
-		agent/relocator.c agent/prelude.js \
-		agent/frida-java-bridge/fjb.iife.js agent/link-payload.sh
+$(AGENT_PAYLOAD): green_hook/agent/green_agent_standard.c \
+		green_hook/agent/green_shadow_client.c \
+		green_hook/agent/gummemory-green-payload.c \
+		green_hook/agent/green_agent.h \
+		green_hook/agent/frida-java-bridge/fjb.iife.js \
+		green_hook/agent/link-payload.sh
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	@mkdir -p $(dir $@)
-	ANDROID_NDK="$(ANDROID_NDK)" $(SHELL) agent/link-payload.sh
+	ANDROID_NDK="$(ANDROID_NDK)" $(SHELL) green_hook/agent/link-payload.sh
 
 
 .PHONY: clean
