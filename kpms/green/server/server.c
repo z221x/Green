@@ -211,21 +211,25 @@ static int handle_list(int fd)
 
 /* Evaluate a JS snippet in the target's persistent QuickJS context.  The
  * code travels through a well-known file next to the hook script. */
-static void write_eval_file(pid_t pid, const char *code)
+static int write_eval_file(pid_t pid, const char *code)
 {
     char cmdline[128];
     char path[300];
     int r;
 
     if (green_agentops_read_cmdline(pid, cmdline, sizeof(cmdline)) != 0)
-        return;
+        return -1;
     green_agentops_target_path(cmdline, "green_eval.js", path, sizeof(path));
     r = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
              0644);
     if (r < 0)
-        return;
-    write_full_fd(r, code, strlen(code));
+        return -1;
+    if (write_full_fd(r, code, strlen(code)) != 0) {
+        close(r);
+        return -1;
+    }
     close(r);
+    return 0;
 }
 
 /* Evaluate in the persistent standard GumJS context.  The command socket is
@@ -236,7 +240,10 @@ static void eval_with_agent(int fd, struct session *s, const char *code)
     struct green_agent_response response;
     int cmd_fd = -1;
 
-    write_eval_file(s->pid, code);
+    if (write_eval_file(s->pid, code) != 0) {
+        send_result(fd, 0, 0, "cannot write evaluation script");
+        return;
+    }
     cmd_fd = green_agentops_connect(s->pid);
     if (cmd_fd < 0) {
         send_result(fd, 0, 0, "cannot connect to agent");
