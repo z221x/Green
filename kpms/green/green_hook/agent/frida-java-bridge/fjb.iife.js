@@ -2616,6 +2616,7 @@ var __fjb = (() => {
 extern GMutex lock;
 extern GHashTable * methods;
 extern GHashTable * replacements;
+extern GHashTable * bypassed_threads;
 extern gpointer last_seen_art_method;
 
 extern gpointer get_oat_quick_method_header_impl (gpointer method, gpointer pc);
@@ -2626,6 +2627,7 @@ init (void)
   g_mutex_init (&lock);
   methods = g_hash_table_new_full (NULL, NULL, NULL, NULL);
   replacements = g_hash_table_new_full (NULL, NULL, NULL, NULL);
+  bypassed_threads = g_hash_table_new_full (NULL, NULL, NULL, NULL);
 }
 
 void
@@ -2633,7 +2635,23 @@ finalize (void)
 {
   g_hash_table_unref (replacements);
   g_hash_table_unref (methods);
+  g_hash_table_unref (bypassed_threads);
   g_mutex_clear (&lock);
+}
+
+void
+set_replacement_bypass (gpointer thread,
+                        gboolean enabled)
+{
+  if (thread == NULL)
+    return;
+
+  g_mutex_lock (&lock);
+  if (enabled)
+    g_hash_table_insert (bypassed_threads, thread, thread);
+  else
+    g_hash_table_remove (bypassed_threads, thread);
+  g_mutex_unlock (&lock);
 }
 
 gboolean
@@ -2742,6 +2760,19 @@ find_replacement_method_from_quick_code (gpointer method,
   gpointer link_managed_stack;
   gpointer * link_top_quick_frame;
 
+  /* A Java Method#call() made from inside its replacement must execute the
+   * original quick body once.  The normal replacement lookup cannot infer
+   * this reliably on all Android 15 ART builds, so the bridge marks only the
+   * current ART thread around the JNI nonvirtual call.  This avoids the old
+   * global libart trampoline hooks while preventing recursive re-entry. */
+  g_mutex_lock (&lock);
+  if (g_hash_table_contains (bypassed_threads, thread))
+  {
+    g_mutex_unlock (&lock);
+    return NULL;
+  }
+  g_mutex_unlock (&lock);
+
   replacement_method = get_replacement_method (method);
   if (replacement_method == NULL)
     return NULL;
@@ -2830,16 +2861,19 @@ on_leave_gc_concurrent_copying_copying_phase (GumInvocationContext * ic)
     const methodsSize = pointerSize5;
     const replacementsSize = pointerSize5;
     const lastSeenArtMethodSize = pointerSize5;
-    const data = Memory.alloc(lockSize + methodsSize + replacementsSize + lastSeenArtMethodSize);
+    const bypassedThreadsSize = pointerSize5;
+    const data = Memory.alloc(lockSize + methodsSize + replacementsSize + lastSeenArtMethodSize + bypassedThreadsSize);
     const lock = data;
     const methods = lock.add(lockSize);
     const replacements = methods.add(methodsSize);
     const lastSeenArtMethod = replacements.add(replacementsSize);
+    const bypassedThreads = lastSeenArtMethod.add(lastSeenArtMethodSize);
     const getOatQuickMethodHeaderImpl = api2.find(pointerSize5 === 4 ? "_ZN3art9ArtMethod23GetOatQuickMethodHeaderEj" : "_ZN3art9ArtMethod23GetOatQuickMethodHeaderEm");
     const cm2 = new CModule(code2, {
       lock,
       methods,
       replacements,
+      bypassed_threads: bypassedThreads,
       last_seen_art_method: lastSeenArtMethod,
       get_oat_quick_method_header_impl: getOatQuickMethodHeaderImpl ?? ptr("0xdeadbeef")
     });
@@ -2853,6 +2887,7 @@ on_leave_gc_concurrent_copying_copying_phase (GumInvocationContext * ic)
         synchronize: new NativeFunction(cm2.synchronize_replacement_methods, "void", ["uint", "pointer", "pointer"], fastOptions),
         delete: new NativeFunction(cm2.delete_replacement_method, "void", ["pointer"], fastOptions),
         translate: new NativeFunction(cm2.translate_method, "pointer", ["pointer"], fastOptions),
+        setBypass: new NativeFunction(cm2.set_replacement_bypass, "void", ["pointer", "bool"], fastOptions),
         findReplacementFromQuickCode: cm2.find_replacement_method_from_quick_code
       },
       getOatQuickMethodHeaderImpl,
@@ -10484,6 +10519,7 @@ std_string_c_str (StdString * self)
         const frameCapacity = 2 + numArgs;
         env.pushLocalFrame(frameCapacity);
         let borrowedHandle = null;
+        let bypassThread = null;
         try {
           let jniThis;
           if (isInstanceMethod) {
@@ -10503,6 +10539,12 @@ std_string_c_str (StdString * self)
               const pendingCalls = replacement._c;
               if (pendingCalls.has(getCurrentThreadId())) {
                 strategy = STRATEGY_DIRECT;
+                /* The JNI nonvirtual call below still reaches the original
+                 * quick entrypoint.  Tell the quick replacement lookup to
+                 * leave this ART thread alone for the duration of that call;
+                 * otherwise Android 15 can dispatch back into the JS
+                 * replacement and the recursion guard returns a bogus zero. */
+                bypassThread = getArtThreadFromEnv(env);
               }
             }
           }
@@ -10523,7 +10565,15 @@ std_string_c_str (StdString * self)
               jniArgs.splice(2, 0, receiver.$copyClassHandle(env));
             }
           }
-          const jniRetval = jniCall.apply(null, jniArgs);
+          let jniRetval;
+          if (bypassThread !== null)
+            artController.replacedMethods.setBypass(bypassThread, true);
+          try {
+            jniRetval = jniCall.apply(null, jniArgs);
+          } finally {
+            if (bypassThread !== null)
+              artController.replacedMethods.setBypass(bypassThread, false);
+          }
           env.throwIfExceptionPending();
           return retType.fromJni(jniRetval, env, true);
         } finally {
