@@ -48,6 +48,13 @@
         slot.writePointer(text);
         return eq("pointer", slot.readPointer().readUtf8String(), "pointer-ok");
     });
+    run("memory.protection", function () {
+        var p = Memory.alloc(16);
+        var protection = Memory.queryProtection(p);
+        if (typeof protection !== "string" || protection.indexOf("w") < 0)
+            throw new Error("unexpected protection " + protection);
+        return protection;
+    });
     run("memory.copy.scan", function () {
         var src = Memory.allocUtf8String("scan-ok");
         var dst = Memory.alloc(16);

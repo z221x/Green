@@ -41,6 +41,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -622,10 +623,46 @@ gboolean
 gum_memory_query_protection (gconstpointer address,
                              GumPageProtection * prot)
 {
-  (void) address;
-  if (prot != NULL)
-    *prot = GUM_PAGE_RWX;
-  return TRUE;
+  FILE * maps;
+  gchar line[512];
+  guintptr query;
+
+  if (address == NULL || prot == NULL)
+    return FALSE;
+
+  /* Keep the public Memory.queryProtection() contract instead of returning
+   * a blanket RWX value.  The VMA permissions remain stable while a target
+   * page is shadowed; KPM changes the PFN, not the VMA flags. */
+  query = GPOINTER_TO_SIZE (address);
+  if ((query >> 56) != 0)
+    query &= G_GUINT64_CONSTANT (0x00ffffffffffffff);
+  maps = fopen ("/proc/self/maps", "re");
+  if (maps == NULL)
+    return FALSE;
+
+  while (fgets (line, sizeof (line), maps) != NULL)
+  {
+    unsigned long long start, end;
+    gchar permissions[5] = { 0 };
+
+    if (sscanf (line, "%llx-%llx %4s", &start, &end, permissions) != 3)
+      continue;
+    if (query < (guintptr) start || query >= (guintptr) end)
+      continue;
+
+    *prot = GUM_PAGE_NO_ACCESS;
+    if (permissions[0] == 'r')
+      *prot = (GumPageProtection) (*prot | GUM_PAGE_READ);
+    if (permissions[1] == 'w')
+      *prot = (GumPageProtection) (*prot | GUM_PAGE_WRITE);
+    if (permissions[2] == 'x')
+      *prot = (GumPageProtection) (*prot | GUM_PAGE_EXECUTE);
+    fclose (maps);
+    return TRUE;
+  }
+
+  fclose (maps);
+  return FALSE;
 }
 
 guint
