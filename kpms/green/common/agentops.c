@@ -521,7 +521,7 @@ static int remote_dlopen(pid_t pid, const char *payload,
     call.regs[30] = 0; /* return to address 0; ptrace catches SIGSEGV */
     call.pc = remote_dlopen;
     if (set_regs(pid, &call) != 0)
-        return -1;
+        goto restore;
 
     if (ptrace(PTRACE_CONT, pid, NULL, NULL) != 0) {
         perror("PTRACE_CONT");
