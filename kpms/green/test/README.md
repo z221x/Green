@@ -28,4 +28,6 @@ kpms/green/test/test_java_hook.sh com.example.app
 - `java_api_probe.js`：Java 对象、重载、静态方法/字段、数组、集合和枚举；
 - `java_hook_probe.js`：标准 Frida 写法的 `String.hashCode` 原始调用与 hook 回归；
 - `native_api_probe.js`：NativePointer、Memory、NativeFunction 和 attach。
+- `shadow_memory_probe.js`：私有匿名页上的 `Memory.patchCode` 执行回归，验证
+  可执行页写入走 KPM shadow；
 - `example_hook.js`、`demo_app_hook.js`：通用 Native/应用 hook 示例。

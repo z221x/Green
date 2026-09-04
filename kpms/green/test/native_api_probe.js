@@ -84,5 +84,19 @@
             throw new Error("n=" + n + " enters=" + enters + " leaves=" + leaves);
         return "ok";
     });
+    run("interceptor.replace-revert", function () {
+        var target = Module.getExportByName(null, "getpid");
+        var original = new NativeFunction(target, "int", []);
+        var replacement = new NativeCallback(function () {
+            return Process.id + 1;
+        }, "int", []);
+        Interceptor.replace(target, replacement);
+        var hooked = original();
+        Interceptor.revert(target);
+        var restored = original();
+        if (hooked !== Process.id + 1 || restored !== Process.id)
+            throw new Error("hooked=" + hooked + " restored=" + restored);
+        return "ok";
+    });
     out("SUMMARY passed=" + passed + " failed=" + failed);
 })();
