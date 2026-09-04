@@ -24,7 +24,9 @@
             if (hookHits > 8 && (hookHits % 100) !== 0)
                 return;
         }
-        log("[java-probe] " + s);
+        // console.log is part of the standard Frida script API.  Green maps
+        // it to logcat and the broker channel as well.
+        console.log("[java-probe] " + s);
     }
 
     out("START");
@@ -54,7 +56,9 @@
                     return 0;
                 }
                 depth++;
-                var original = this.hashCode();
+                // Function#call is the portable Frida spelling for invoking
+                // the selected overload without dispatching by name.
+                var original = hashCode.call(this);
                 depth--;
                 out("PROBE_ORIGINAL=" + original, true);
                 return original;

@@ -13,7 +13,8 @@ adb shell su -c /data/local/tmp/test_hook
 ## Android API 探针
 
 `test_java_hook.sh` 会推送 `build/` 中的 server/payload，启动目标包并 attach
-探针。通过 `PROBE_SCRIPT` 选择测试内容：
+探针。探针使用 Frida 风格的 Java/Native API；传输和启动仍由 Green CLI
+负责，因此不能直接用 stock `frida` CLI 连接。通过 `PROBE_SCRIPT` 选择测试内容：
 
 ```sh
 ADB=/path/to/adb \
@@ -24,6 +25,6 @@ kpms/green/test/test_java_hook.sh com.example.app
 可用探针：
 
 - `java_api_probe.js`：Java 对象、重载、静态方法/字段、数组、集合和枚举；
-- `java_hook_probe.js`：`String.hashCode` 原始调用与 hook 回归；
+- `java_hook_probe.js`：标准 Frida 写法的 `String.hashCode` 原始调用与 hook 回归；
 - `native_api_probe.js`：NativePointer、Memory、NativeFunction 和 attach。
 - `example_hook.js`、`demo_app_hook.js`：通用 Native/应用 hook 示例。
