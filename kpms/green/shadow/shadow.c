@@ -513,7 +513,8 @@ int green_shadow_copy_from_user(void *dst, const void __user *src,
          * prevents a forged prctl from reading kernel memory. */
         vma = green_k_find_vma(mm, cur);
         if (!vma || green_vma_start(vma) > cur ||
-            green_vma_end(vma) < cur + chunk) {
+            green_vma_end(vma) <= cur ||
+            chunk > green_vma_end(vma) - cur) {
             green_k_mmput(mm);
             return -EFAULT;
         }
