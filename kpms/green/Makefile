@@ -60,7 +60,7 @@ $(BUILD_DIR)/%.o: %.c $(KPM_HEADERS)
 client: $(CLIENT)
 
 SERVER_SRCS := server/main.c common/common.c common/agentops.c server/server.c
-CLI_HEADERS := include/green/abi.h include/green/cli.h include/green/shadow.h
+CLI_HEADERS := include/green/abi.h include/green/cli.h
 
 $(CLIENT): $(SERVER_SRCS) $(CLI_HEADERS)
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)

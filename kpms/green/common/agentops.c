@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <linux/ptrace.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -431,6 +432,28 @@ static int shadow_write_target(pid_t pid, unsigned long token,
     return 0;
 }
 
+static int shadow_release_target(pid_t pid, unsigned long token,
+                                 uintptr_t address)
+{
+    struct green_shadow_rpc rpc;
+    long ret;
+
+    if (token == 0 || address == 0)
+        return -1;
+    memset(&rpc, 0, sizeof(rpc));
+    rpc.version = GREEN_SHADOW_ABI_VERSION;
+    rpc.op = GREEN_SHADOW_OP_RELEASE;
+    rpc.pid = (int)pid;
+    rpc.addr = (unsigned long)address;
+    ret = green_cli_prctl(PR_GREEN_SHADOW_REQUEST, token,
+                          (unsigned long)&rpc, 0, 0);
+    if (ret < 0) {
+        errno = (int)(-ret);
+        return -1;
+    }
+    return 0;
+}
+
 static int wait_initial_stop(pid_t pid)
 {
     int status;
@@ -453,6 +476,7 @@ static int remote_dlopen(pid_t pid, const char *payload,
     size_t payload_len = strlen(payload) + 1;
     int status;
     int result = -1;
+    bool path_shadowed = false;
 
     local_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
     if (!local_dlopen)
@@ -487,8 +511,9 @@ static int remote_dlopen(pid_t pid, const char *payload,
         perror("shadow-write remote payload path");
         return -1;
     }
+    path_shadowed = true;
     if (get_regs(pid, &saved) != 0)
-        return -1;
+        goto restore;
     call = saved;
     call.regs[0] = remote_path;
     call.regs[1] = RTLD_NOW | RTLD_GLOBAL;
@@ -572,6 +597,11 @@ static int remote_dlopen(pid_t pid, const char *payload,
 restore:
     if (set_regs(pid, &saved) != 0)
         result = -1;
+    if (path_shadowed &&
+        shadow_release_target(pid, shadow_token, remote_path) != 0) {
+        perror("shadow-release remote payload path");
+        result = -1;
+    }
     return result;
 }
 

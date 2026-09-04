@@ -90,6 +90,7 @@ if ! "$ADB" shell su -c "$REMOTE_DIR/green_shadow_auth"; then
     echo "    The agent will not fall back to direct memory writes." >&2
     exit 1
 fi
+echo "[+] KPM shadow module is loaded; token authentication verified"
 
 if ! "$ADB" forward --list 2>/dev/null | awk -v p="tcp:$PORT" '$2 == p { found=1 } END { exit(found ? 0 : 1) }'; then
     "$ADB" forward "tcp:$PORT" "tcp:$PORT"
