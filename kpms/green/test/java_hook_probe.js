@@ -13,7 +13,19 @@
  * result deterministic if calling this.hashCode() re-enters the hook.
  */
 (function () {
-    function out(s) { log("[java-probe] " + s); }
+    // String.hashCode is a very hot path in real applications.  Unbounded
+    // logcat/socket output from the replacement itself can starve the target
+    // process and hide the actual hook result, so keep the first few samples
+    // and then emit a sparse heartbeat.
+    var hookHits = 0;
+    function out(s, hot) {
+        if (hot) {
+            hookHits++;
+            if (hookHits > 8 && (hookHits % 100) !== 0)
+                return;
+        }
+        log("[java-probe] " + s);
+    }
 
     out("START");
     try {
@@ -36,7 +48,7 @@
 
             var depth = 0;
             hashCode.implementation = function () {
-                out("PROBE_BODY");
+                out("PROBE_BODY", true);
                 if (depth !== 0) {
                     out("PROBE_RECURSION");
                     return 0;
@@ -44,7 +56,7 @@
                 depth++;
                 var original = this.hashCode();
                 depth--;
-                out("PROBE_ORIGINAL=" + original);
+                out("PROBE_ORIGINAL=" + original, true);
                 return original;
             };
             out("PROBE_HOOK_SET");

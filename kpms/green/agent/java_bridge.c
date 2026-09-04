@@ -504,12 +504,19 @@ void green_java_hook_entry(void)
 {
     /* Preserve the JNI argument registers while a small C helper records
      * the per-thunk index in TLS. The body then receives the original
-     * x0..x7 values with no dependency on compiler-generated stack layout. */
+     * x0..x7 values with no dependency on compiler-generated stack layout.
+     *
+     * This entrypoint is reached through a tail branch from ART's generic
+     * JNI trampoline, so x30 still contains ART's return address.  Both BL
+     * calls below overwrite x30; preserve it explicitly or the final RET
+     * loops back into this epilogue (and eventually corrupts the stack).
+     */
     __asm__ volatile(
-        "stp x0, x1, [sp, #-64]!\n"
+        "stp x0, x1, [sp, #-80]!\n"
         "stp x2, x3, [sp, #16]\n"
         "stp x4, x5, [sp, #32]\n"
         "stp x6, x7, [sp, #48]\n"
+        "str x30, [sp, #64]\n"
         "mov w0, w17\n"
         "bl green_java_set_entry_idx\n"
         "ldp x0, x1, [sp, #0]\n"
@@ -517,7 +524,8 @@ void green_java_hook_entry(void)
         "ldp x4, x5, [sp, #32]\n"
         "ldp x6, x7, [sp, #48]\n"
         "bl green_java_hook_body\n"
-        "add sp, sp, #64\n"
+        "ldr x30, [sp, #64]\n"
+        "add sp, sp, #80\n"
         "ret\n");
 }
 

@@ -5,7 +5,8 @@
 #   PROBE_SCRIPT=/path/to/probe.js ./test_java_hook.sh [package]
 # Environment:
 #   ADB=/path/to/adb, REBUILD=1, PID=<existing pid>, PORT=27042,
-#   PROBE_SCRIPT=/path/to/probe.js, LAUNCH_WAIT=5
+#   PROBE_SCRIPT=/path/to/probe.js, LAUNCH_WAIT=5, CAPTURE_LOGS=1,
+#   LOG_PREFIX=/tmp/green-java-hook
 
 set -eu
 
@@ -18,6 +19,20 @@ PORT=${PORT:-27042}
 REMOTE_DIR=${REMOTE_DIR:-/data/local/tmp}
 PROBE_SCRIPT=${PROBE_SCRIPT:-$SELF_DIR/java_hook_probe.js}
 LAUNCH_WAIT=${LAUNCH_WAIT:-5}
+CAPTURE_LOGS=${CAPTURE_LOGS:-1}
+LOG_PREFIX=${LOG_PREFIX:-/tmp/green-java-hook-$$}
+
+collect_logs() {
+    [ "$CAPTURE_LOGS" = "1" ] || return 0
+    "$ADB" logcat -b crash -d -v threadtime -t 300 \
+        >"${LOG_PREFIX}.crash.log" 2>/dev/null || true
+    "$ADB" logcat -d -v threadtime -t 300 \
+        >"${LOG_PREFIX}.logcat.log" 2>/dev/null || true
+    echo "[*] crash log: ${LOG_PREFIX}.crash.log" >&2
+    echo "[*] logcat tail: ${LOG_PREFIX}.logcat.log" >&2
+}
+
+trap collect_logs EXIT
 
 if [ ! -f "$PROBE_SCRIPT" ]; then
     echo "missing probe script: $PROBE_SCRIPT" >&2
@@ -86,4 +101,4 @@ fi
 
 echo "[*] attaching to $PACKAGE (pid $TARGET_PID)"
 echo "[*] Ctrl-C detaches; target crash/abort output is in logcat"
-exec python3 "$CLI" attach -p "$TARGET_PID" -l "$PROBE_SCRIPT"
+python3 "$CLI" attach -p "$TARGET_PID" -l "$PROBE_SCRIPT"
