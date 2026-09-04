@@ -14,7 +14,7 @@
 #define GREEN_AGENT_SOCKET_PREFIX "green.agent."
 #define GREEN_AGENT_SCRIPT_NAME "green_hook.js"
 
-#define GREEN_AGENT_MAX_MESSAGE 128U
+#define GREEN_AGENT_MAX_MESSAGE (4U * 1024U)
 #define GREEN_AGENT_STATUS_EVENT 0x7ffffffe
 
 /* The transport is script-focused; legacy broker tool identifiers were
