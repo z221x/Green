@@ -6,7 +6,8 @@
 # Environment:
 #   ADB=/path/to/adb, REBUILD=1, PID=<existing pid>, PORT=27042,
 #   PROBE_SCRIPT=/path/to/probe.js, LAUNCH_WAIT=5, CAPTURE_LOGS=1,
-#   LOG_PREFIX=/tmp/green-java-hook
+#   LOG_PREFIX=/tmp/green-java-hook, RESTART_SERVER=0 to keep an existing
+#   server process (the default is 1 so a freshly pushed binary is used).
 
 set -eu
 
@@ -21,6 +22,7 @@ PROBE_SCRIPT=${PROBE_SCRIPT:-$SELF_DIR/java_hook_probe.js}
 LAUNCH_WAIT=${LAUNCH_WAIT:-5}
 CAPTURE_LOGS=${CAPTURE_LOGS:-1}
 LOG_PREFIX=${LOG_PREFIX:-/tmp/green-java-hook-$$}
+RESTART_SERVER=${RESTART_SERVER:-1}
 
 collect_logs() {
     [ "$CAPTURE_LOGS" = "1" ] || return 0
@@ -59,7 +61,18 @@ if [ -f "$SERVER" ]; then
     "$ADB" shell su -c "chmod 755 $REMOTE_DIR/green $REMOTE_DIR/libgreen_agent.so"
 fi
 
-SERVER_PID=$("$ADB" shell pidof green 2>/dev/null | tr -d '\r' || true)
+SERVER_PID=$("$ADB" shell pidof green 2>/dev/null | awk '{print $1}' | tr -d '\r' || true)
+if [ -n "$SERVER_PID" ] && [ "$RESTART_SERVER" = "1" ]; then
+    echo "[*] restarting existing green server (pid $SERVER_PID)"
+    "$ADB" shell su -c "kill $SERVER_PID" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if [ -z "$($ADB shell pidof green 2>/dev/null | tr -d '\r' || true)" ]; then
+            break
+        fi
+        sleep 0.2
+    done
+    SERVER_PID=""
+fi
 if [ -z "$SERVER_PID" ]; then
     if [ ! -f "$SERVER" ]; then
         echo "green server is not running and $SERVER is unavailable; build client or start it manually" >&2
@@ -69,7 +82,7 @@ if [ -z "$SERVER_PID" ]; then
     # The device binary is already the server; it has no `server` subcommand.
     "$ADB" shell su -c "nohup $REMOTE_DIR/green >/data/local/tmp/green.log 2>&1 &"
     sleep 1
-    SERVER_PID=$("$ADB" shell pidof green 2>/dev/null | tr -d '\r' || true)
+    SERVER_PID=$("$ADB" shell pidof green 2>/dev/null | awk '{print $1}' | tr -d '\r' || true)
     if [ -z "$SERVER_PID" ]; then
         echo "green server failed to start; inspect $REMOTE_DIR/green.log" >&2
         exit 1

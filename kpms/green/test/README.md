@@ -15,7 +15,9 @@ adb shell su -c /data/local/tmp/test_shadow_auth
 `test_java_hook.sh` 会先运行 token ABI smoke test；若 KPM 未加载会立即停止
 并提示加载 `build/green.kpm`。随后它推送 server/payload，启动目标包并
 attach 探针。探针使用 stock GumJS 暴露的 Frida 风格 Java/Native API，控制
-传输由 Green CLI 负责。通过 `PROBE_SCRIPT` 选择测试内容：
+传输由 Green CLI 负责。脚本默认重启设备上已有的 `green` 进程，避免复用
+旧 server；如需保留现有进程可设置 `RESTART_SERVER=0`。通过 `PROBE_SCRIPT`
+选择测试内容：
 
 ```sh
 ADB=/path/to/adb \
