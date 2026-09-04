@@ -220,7 +220,8 @@ static void write_eval_file(pid_t pid, const char *code)
     if (green_agentops_read_cmdline(pid, cmdline, sizeof(cmdline)) != 0)
         return;
     green_agentops_target_path(cmdline, "green_eval.js", path, sizeof(path));
-    r = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    r = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+             0644);
     if (r < 0)
         return;
     write_full_fd(r, code, strlen(code));

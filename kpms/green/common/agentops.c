@@ -728,7 +728,8 @@ int green_agentops_copy_file(const char *src, const char *dest, pid_t pid,
     sfd = open(src, O_RDONLY);
     if (sfd < 0)
         return -1;
-    dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+               mode);
     if (dfd < 0) {
         close(sfd);
         return -1;
@@ -815,7 +816,8 @@ int green_agentops_deploy_script(pid_t pid, const char *script_file,
                                dest_size);
 
     if (inline_code) {
-        dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                   0644);
         if (dfd < 0) {
             snprintf(err, errlen, "open %s: %s", dest, strerror(errno));
             return -1;
@@ -857,7 +859,8 @@ int green_agentops_deploy_script(pid_t pid, const char *script_file,
         close(sfd);
         return 0;
     }
-    dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+               0644);
     if (dfd < 0) {
         snprintf(err, errlen, "open %s: %s", dest, strerror(errno));
         close(sfd);
