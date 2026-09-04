@@ -66,6 +66,9 @@ int green_shadow_detect_paging(void)
     return 0;
 }
 
+static void green_shadow_flush_tlb_range(unsigned long start,
+                                         unsigned long len);
+
 /* Splits a block descriptor (2MB/1GB) at `table[idx]` into a next-level
  * page table so the shadow engine can operate on 4K entries.  Returns the
  * next-level table, or 0 on failure. */
@@ -74,7 +77,7 @@ static u64 *green_shadow_split_block(u64 *table, unsigned long addr,
 {
     u64 *next_table;
     unsigned long next_pa, next_va;
-    u64 block_pa, block_attr, page_attr;
+    u64 block_pa, page_attr;
     int i;
 
     next_table = (u64 *)green_k_get_free_pages(GREEN_GFP_KERNEL, 0);
@@ -99,23 +102,22 @@ static u64 *green_shadow_split_block(u64 *table, unsigned long addr,
 
     /* Publish the new table, then swap the descriptor atomically. */
     next_pa = green_kva_to_phys((unsigned long)next_table);
+    next_va = green_phys_to_kva(next_pa);
+    if (!green_is_kva(next_va)) {
+        green_k_free_pages((unsigned long)next_table, 0);
+        return 0;
+    }
     asm volatile("dsb ish" ::: "memory");
     table[(addr >> shift) & GREEN_PTE_INDEX_MASK] =
         (next_pa & GREEN_PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE_BIT;
     /* Invalidate the whole block region: other CPUs may hold stale
      * block-level translations after the split. */
     {
-        unsigned long blk_start = addr & ~((1UL << (shift + 9)) - 1);
-        unsigned long va;
-        for (va = blk_start; va < blk_start + (1UL << (shift + 9));
-             va += GREEN_PAGE_SIZE)
-            green_shadow_flush_tlb(va);
+        unsigned long block_size = 1UL << shift;
+        unsigned long blk_start = addr & ~(block_size - 1);
+        green_shadow_flush_tlb_range(blk_start, block_size);
     }
 
-    next_va = green_phys_to_kva(next_pa);
-    if (!green_is_kva(next_va)) {
-        return 0;
-    }
     return next_table;
 }
 
@@ -143,14 +145,31 @@ u64 *green_shadow_get_pte(void *mm, unsigned long addr)
         if (!(desc & PTE_TABLE_BIT)) {
             /* Block mapping (e.g. shared file-backed exec pages of
              * system libs): split into a next-level table in place. */
-            next_table = green_shadow_split_block(table, addr, shift, desc);
-            if (!next_table) {
-                pr_err("green_shadow: get_pte: split failed at shift=%d va=%lx\n",
+            if (!green_lock(&green_shadow_pgtable_busy)) {
+                pr_err("green_shadow: get_pte: split lock timeout shift=%d va=%lx\n",
                        shift, addr);
                 return 0;
             }
-            table = next_table;
-            continue;
+            /* Re-read after taking the split lock: another CPU may have
+             * published the next-level table while we were waiting. */
+            desc = table[(addr >> shift) & GREEN_PTE_INDEX_MASK];
+            if (!(desc & PTE_VALID)) {
+                green_unlock(&green_shadow_pgtable_busy);
+                return 0;
+            }
+            if (!(desc & PTE_TABLE_BIT)) {
+                next_table = green_shadow_split_block(table, addr, shift, desc);
+                if (!next_table) {
+                    green_unlock(&green_shadow_pgtable_busy);
+                    pr_err("green_shadow: get_pte: split failed at shift=%d va=%lx\n",
+                           shift, addr);
+                    return 0;
+                }
+                table = next_table;
+                green_unlock(&green_shadow_pgtable_busy);
+                continue;
+            }
+            green_unlock(&green_shadow_pgtable_busy);
         }
 
         next_pa = desc & GREEN_PTE_ADDR_MASK;
@@ -174,10 +193,20 @@ void green_shadow_write_pte(u64 *ptep, u64 value)
 
 void green_shadow_flush_tlb(unsigned long addr)
 {
-    unsigned long operand = (addr >> GREEN_PAGE_SHIFT) & ((1UL << 44) - 1);
+    green_shadow_flush_tlb_range(addr & GREEN_PAGE_MASK, GREEN_PAGE_SIZE);
+}
+
+static void green_shadow_flush_tlb_range(unsigned long start,
+                                         unsigned long len)
+{
+    unsigned long end = start + len;
+    unsigned long va;
 
     asm volatile("dsb ishst" ::: "memory");
-    asm volatile("tlbi vaale1is, %0" : : "r"(operand) : "memory");
+    for (va = start & GREEN_PAGE_MASK; va < end; va += GREEN_PAGE_SIZE) {
+        unsigned long operand = (va >> GREEN_PAGE_SHIFT) & ((1UL << 44) - 1);
+        asm volatile("tlbi vaale1is, %0" : : "r"(operand) : "memory");
+    }
     asm volatile("dsb ish" ::: "memory");
     asm volatile("isb" ::: "memory");
 }
@@ -310,19 +339,44 @@ int green_shadow_map_read(struct green_shadow_page *page)
 int green_shadow_restore_original(struct green_shadow_page *page)
 {
     u64 *ptep;
+    int ret = -EFAULT;
 
     if (!green_shadow_page_lock(page))
         return -EBUSY;
     ptep = green_shadow_get_pte(page->mm, page->va);
     if (ptep) {
-        unsigned long cur_pfn = green_pte_pfn(*ptep);
-        if (cur_pfn == page->shadow_pfn || cur_pfn == page->original_pfn)
+        u64 cur_pte = *ptep;
+        unsigned long cur_pfn = green_pte_pfn(cur_pte);
+
+        if (!(cur_pte & PTE_VALID)) {
+            /* An invalid leaf cannot reference a user-visible shadow page;
+             * do not resurrect it with the stale original descriptor. */
+            ret = 0;
+        } else if (cur_pfn == page->shadow_pfn) {
             green_shadow_write_pte(ptep, page->original_pte);
-        else
-            ptep = 0;
+            ret = green_pte_pfn(*ptep) == page->original_pfn ? 0 : -EAGAIN;
+        } else {
+            /* The kernel has already replaced/unmapped this PTE.  Do not
+             * overwrite a newer mapping with stale original_pte, but it is
+             * safe to reclaim our shadow page because the PTE no longer
+             * names shadow_pfn. */
+            if (cur_pfn != page->original_pfn)
+                pr_warn("green_shadow: PTE changed under release va=%lx cur_pfn=%lx\n",
+                        page->va, cur_pfn);
+            ret = 0;
+        }
+    } else if (green_k_find_vma) {
+        void *vma = green_k_find_vma(page->mm, page->va);
+
+        /* No page-table entry is reclaimable only when the VMA itself has
+         * gone away.  If the VMA still exists, retain the page and retry. */
+        if (!vma || green_vma_start(vma) > page->va ||
+            green_vma_end(vma) <= page->va)
+            ret = 0;
     }
-    page->state = 0;
+    if (ret == 0)
+        page->state = 0;
     green_shadow_page_unlock(page);
     green_shadow_flush_tlb(page->va);
-    return ptep ? 0 : -EFAULT;
+    return ret;
 }

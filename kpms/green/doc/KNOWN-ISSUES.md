@@ -283,3 +283,38 @@ artQuickGenericJniTrampoline）后，calculator 出现 `exp_funnel_lock` D 状�
 - [ ] 重写 hook 落地为 per-method（复用 fjb 反射层 + 之前
       java_bridge.c 的标定/thunk 经验）
 - [ ] 复现路径回归：确认 panic 消失
+
+## Shadow 页静态审计（2026-09-04）
+
+本轮审计确认并已处理以下生命周期/并发问题：
+
+1. `green_shadow_release_page()` 现在要求恢复结果明确成功，失败时保留
+   page/list 引用并允许后续重试；不会再释放仍可能被用户 PTE 引用的
+   `shadow_kva`。当 PTE 已被内核改成其他 PFN，代码只回收 Green 自己的
+   shadow，不会用过期的 `original_pte` 覆盖新映射。
+2. block descriptor 拆分使用独立的 Green 锁，并在加锁后重新读取父项，
+   避免两个 CPU 同时分配并发布下级页表。拆分的失效范围修正为当前
+   block 的 `1 << shift` 字节；TLBI 的 DSB/ISB 改为整段一次，避免每页
+   重复栅栏。
+3. shadow 退出路径不再在固定次数后继续释放。KPM 会在卸载前等待所有
+   hook 回调（包含原始 fault/exit_mmap 调用）完成，先恢复/摘除所有
+   shadow 页，再解除 fault/GUP/exit_mmap hook；恢复失败会重试，避免模块
+   代码或 shadow 页发生 UAF。
+   `exit_mmap` 还注册了 after 回调：若 before 阶段遇到 MM 并发导致恢复
+   失败，原始 `exit_mmap` 完成后会在不再访问页表的前提下清理剩余元数据。
+
+以下风险仍是目标内核相关限制，不能通过猜测私有结构偏移安全修复：
+
+* `green_shadow_get_pte()` 直接遍历/写用户页表。当前符号层没有稳定可用
+  的 `mmap_lock`、页表锁或 `pte_offset_map_lock` 接口，而且 fault hook
+  可能已经运行在 MM 锁上下文；Green 仅保证自身 split/lifecycle 并发，
+  不等价于 Linux MM 同步。需要针对具体 Android kernel 提供锁封装后才
+  能进一步收紧。
+* PTE 属性（含 `PTE_SPECIAL`、execute-only 的 AP/UXN 组合）依赖 ARM64
+  及目标 Android kernel 的编码，当前保留原始 PTE 其余位并只覆盖 shadow
+  所需属性；跨内核版本必须设备回归验证。
+* same-page emulator 仍只支持已实现的一条指令模型，写内存、未支持指令
+  和 `TIF_FOREIGN_FPSTATE` 场景继续按既有设计限制处理。
+* `green_shadow_sync_code()` 保留全局 `ic ialluis`，因为 shadow 写入使用
+  kernel 线性别名而执行使用用户别名；改成按地址 `ic ivau` 前需要确认
+  目标 CPU 的 VIPT/PIPT cache alias 语义，否则可能执行旧指令。

@@ -47,6 +47,9 @@ struct green_shadow_page {
 
 extern struct list_head green_shadow_pages;
 extern atomic_t green_shadow_pages_busy;
+/* Serializes Green-owned page-table block splits.  This protects only our
+ * split operation and is not a substitute for Linux mmap/page-table locks. */
+extern atomic_t green_shadow_pgtable_busy;
 extern atomic_t green_shadow_hooks_busy;
 extern int green_shadow_online;
 extern int green_shadow_va_bits;
@@ -179,8 +182,10 @@ long green_shadow_patch_mm(void *mm, unsigned long addr, const void *buf,
 
 void green_shadow_prctl_before(hook_fargs5_t *args, void *udata);
 void green_shadow_fault_before(hook_fargs3_t *args, void *udata);
+void green_shadow_fault_after(hook_fargs3_t *args, void *udata);
 void green_shadow_gup_before(hook_fargs5_t *args, void *udata);
 void green_shadow_gup_after(hook_fargs5_t *args, void *udata);
 void green_shadow_exit_mmap_before(hook_fargs1_t *args, void *udata);
+void green_shadow_exit_mmap_after(hook_fargs1_t *args, void *udata);
 
 #endif /* _KPM_GREEN_SHADOW_INTERNAL_H_ */

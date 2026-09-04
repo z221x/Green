@@ -252,6 +252,7 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
     int same_page;
 
     (void)udata;
+    args->local.data0 = 0;
     if (!green_shadow_online)
         return;
 
@@ -260,6 +261,9 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
         return;
 
     atomic_inc(&green_shadow_hooks_busy);
+    /* Keep busy asserted until the paired after callback, including when the
+     * original do_page_fault is allowed to run. */
+    args->local.data0 = 1;
 
     mm = green_k_get_task_mm(current);
     if (!mm)
@@ -292,7 +296,6 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
                        regs->pc, far, ret, page->va);
                 green_shadow_release_page(page, true);
                 green_k_mmput(mm);
-                atomic_dec(&green_shadow_hooks_busy);
                 return;
             }
         } else {
@@ -313,6 +316,15 @@ void green_shadow_fault_before(hook_fargs3_t *args, void *udata)
     green_k_mmput(mm);
 
 out:
+    return;
+}
+
+void green_shadow_fault_after(hook_fargs3_t *args, void *udata)
+{
+    (void)udata;
+    if (args->local.data0 != 1)
+        return;
+    args->local.data0 = 0;
     atomic_dec(&green_shadow_hooks_busy);
 }
 
@@ -411,12 +423,32 @@ void green_shadow_exit_mmap_before(hook_fargs1_t *args, void *udata)
     void *mm = (void *)args->arg0;
 
     (void)udata;
-    if (!mm)
+    args->local.data0 = 0;
+    if (!green_shadow_online || !mm)
         return;
 
     atomic_inc(&green_shadow_hooks_busy);
+    /* Keep the in-flight count across the wrapped exit_mmap origin.  The
+     * hook ABI's local scratch is per invocation and survives into `after`. */
+    args->local.data0 = 1;
     /* Restore before exit_mmap drops the PTE; do not leave a freed shadow
      * page for the normal unmap path to inspect. */
     green_shadow_release_mm(mm, true);
+}
+
+void green_shadow_exit_mmap_after(hook_fargs1_t *args, void *udata)
+{
+    void *mm = (void *)args->arg0;
+
+    (void)udata;
+    if (!mm || args->local.data0 != 1)
+        return;
+
+    /* If a concurrent MM update prevented restoration in the before hook,
+     * exit_mmap has now detached the address space.  It is safe to discard
+     * any remaining metadata without dereferencing the (possibly freed) mm;
+     * release_page(false) never walks its page tables. */
+    green_shadow_release_mm(mm, false);
     atomic_dec(&green_shadow_hooks_busy);
+    args->local.data0 = 0;
 }

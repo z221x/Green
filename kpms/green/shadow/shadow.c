@@ -8,6 +8,7 @@
 
 struct list_head green_shadow_pages = LIST_HEAD_INIT(green_shadow_pages);
 atomic_t green_shadow_pages_busy = ATOMIC_INIT(0);
+atomic_t green_shadow_pgtable_busy = ATOMIC_INIT(0);
 atomic_t green_shadow_hooks_busy = ATOMIC_INIT(0);
 int green_shadow_online;
 int green_shadow_va_bits;
@@ -205,7 +206,8 @@ static struct green_shadow_page *green_shadow_new_page(void *mm,
 
 int green_shadow_release_page(struct green_shadow_page *page, bool restore)
 {
-    int linked = 0;
+    bool claimed = false;
+    int ret = 0;
 
     if (!page)
         return -EINVAL;
@@ -214,20 +216,44 @@ int green_shadow_release_page(struct green_shadow_page *page, bool restore)
         return -EBUSY;
     if (!page->dead) {
         page->dead = true;
-        linked = 1;
+        claimed = true;
     }
     green_unlock(&green_shadow_pages_busy);
 
-    if (restore)
-        green_shadow_restore_original(page);
+    if (restore) {
+        ret = green_shadow_restore_original(page);
+        if (ret) {
+            /* Never free a shadow page when restoration was not confirmed.
+             * Re-open a release we claimed so a later fault/release can retry;
+             * a concurrent releaser keeps ownership of an already-dead page. */
+            if (claimed) {
+                if (green_lock(&green_shadow_pages_busy)) {
+                    page->dead = false;
+                    green_unlock(&green_shadow_pages_busy);
+                } else {
+                    pr_err("green_shadow: restore failed and lifecycle lock timed out va=%lx\n",
+                           page->va);
+                }
+            }
+            pr_warn("green_shadow: keeping shadow page after restore failure va=%lx ret=%d\n",
+                    page->va, ret);
+            green_shadow_put_page(page); /* drop caller reference only */
+            return ret;
+        }
+    }
 
-    if (linked) {
-        if (!green_lock(&green_shadow_pages_busy))
-            return -EBUSY;
+    if (!green_lock(&green_shadow_pages_busy)) {
+        /* The PTE is already restored (or restore was not requested), so a
+         * lock timeout here can at worst leak metadata; do not risk freeing
+         * it without removing the list reference. */
+        pr_err("green_shadow: release lifecycle lock timeout va=%lx\n", page->va);
+        return -EBUSY;
+    }
+    if (!list_empty(&page->node)) {
         list_del_init(&page->node);
         page->refs--; /* drop list reference */
-        green_unlock(&green_shadow_pages_busy);
     }
+    green_unlock(&green_shadow_pages_busy);
 
     green_shadow_put_page(page); /* drop caller reference */
     return 0;
@@ -245,7 +271,7 @@ int green_shadow_release_mm(void *mm, bool restore)
             break;
         list_for_each(pos, &green_shadow_pages) {
             struct green_shadow_page *cur = container_of(pos, struct green_shadow_page, node);
-            if (!cur->dead && cur->mm == mm) {
+            if (cur->mm == mm) {
                 cur->refs++;
                 page = cur;
                 break;
@@ -255,7 +281,8 @@ int green_shadow_release_mm(void *mm, bool restore)
 
         if (!page)
             break;
-        green_shadow_release_page(page, restore);
+        if (green_shadow_release_page(page, restore))
+            break;
         count++;
     }
 
@@ -274,20 +301,32 @@ int green_shadow_release_all(bool restore)
             break;
         list_for_each(pos, &green_shadow_pages) {
             struct green_shadow_page *cur = container_of(pos, struct green_shadow_page, node);
-            if (!cur->dead) {
-                cur->refs++;
-                page = cur;
-                break;
-            }
+            cur->refs++;
+            page = cur;
+            break;
         }
         green_unlock(&green_shadow_pages_busy);
 
         if (!page)
             break;
-        green_shadow_release_page(page, restore);
+        if (green_shadow_release_page(page, restore))
+            break;
         count++;
     }
 
+    return count;
+}
+
+static int green_shadow_count_pages(void)
+{
+    struct list_head *pos;
+    int count = 0;
+
+    if (!green_lock(&green_shadow_pages_busy))
+        return -EBUSY;
+    list_for_each(pos, &green_shadow_pages)
+        count++;
+    green_unlock(&green_shadow_pages_busy);
     return count;
 }
 
@@ -577,7 +616,8 @@ static long green_shadow_init(const char *args, const char *event,
     }
     green_shadow_hooked_prctl = 1;
 
-    ret = hook_wrap3(green_sym_do_page_fault, green_shadow_fault_before, 0, 0);
+    ret = hook_wrap3(green_sym_do_page_fault, green_shadow_fault_before,
+                     green_shadow_fault_after, 0);
     if (ret != HOOK_NO_ERR) {
         pr_err("green_shadow: failed to hook do_page_fault: %ld\n", ret);
         unhook_syscalln(__NR_prctl, green_shadow_prctl_before, 0);
@@ -586,9 +626,11 @@ static long green_shadow_init(const char *args, const char *event,
     }
     green_shadow_hooked_fault = 1;
 
-    ret = hook_wrap1(green_sym_exit_mmap, green_shadow_exit_mmap_before, 0, 0);
+    ret = hook_wrap1(green_sym_exit_mmap, green_shadow_exit_mmap_before,
+                     green_shadow_exit_mmap_after, 0);
     if (ret != HOOK_NO_ERR) {
-        hook_unwrap(green_sym_do_page_fault, green_shadow_fault_before, 0);
+        hook_unwrap(green_sym_do_page_fault, green_shadow_fault_before,
+                    green_shadow_fault_after);
         unhook_syscalln(__NR_prctl, green_shadow_prctl_before, 0);
         green_shadow_hooked_fault = 0;
         green_shadow_hooked_prctl = 0;
@@ -614,7 +656,7 @@ static long green_shadow_init(const char *args, const char *event,
 
 static long green_shadow_exit(void __user *reserved)
 {
-    int loops = 0;
+    unsigned int loops = 0;
     int count;
 
     (void)reserved;
@@ -624,24 +666,54 @@ static long green_shadow_exit(void __user *reserved)
         unhook_syscalln(__NR_prctl, green_shadow_prctl_before, 0);
         green_shadow_hooked_prctl = 0;
     }
+    /* KPM unload frees this module immediately after this callback returns.
+     * A bounded wait would therefore turn a slow callback into UAF in the
+     * hook trampolines or shadow pages.  Wait until all in-flight callbacks
+     * drain; emit a heartbeat instead of silently proceeding after timeout. */
+    while (atomic_read(&green_shadow_hooks_busy) > 0) {
+        if (++loops == 10000000u) {
+            pr_warn("green_shadow: waiting for %d in-flight hooks\n",
+                    atomic_read(&green_shadow_hooks_busy));
+            loops = 0;
+        }
+        green_cpu_relax();
+    }
+
+    /* Restore and unlink every page before removing the fault/GUP hooks.  A
+     * failed restore leaves the page on the list and is retried here; this
+     * prevents unloading code while a user PTE can still name shadow_kva. */
+    count = 0;
+    for (;;) {
+        int pending = green_shadow_count_pages();
+
+        if (pending == 0)
+            break;
+        if (pending < 0) {
+            green_cpu_relax();
+            continue;
+        }
+        count += green_shadow_release_all(true);
+        pending = green_shadow_count_pages();
+        if (pending != 0)
+            green_cpu_relax();
+    }
+
     if (green_shadow_hooked_gup) {
         hook_unwrap(green_sym_follow_page_pte, green_shadow_gup_before,
                     green_shadow_gup_after);
         green_shadow_hooked_gup = 0;
     }
     if (green_shadow_hooked_fault) {
-        hook_unwrap(green_sym_do_page_fault, green_shadow_fault_before, 0);
+        hook_unwrap(green_sym_do_page_fault, green_shadow_fault_before,
+                    green_shadow_fault_after);
         green_shadow_hooked_fault = 0;
     }
     if (green_shadow_hooked_exit) {
-        hook_unwrap(green_sym_exit_mmap, green_shadow_exit_mmap_before, 0);
+        hook_unwrap(green_sym_exit_mmap, green_shadow_exit_mmap_before,
+                    green_shadow_exit_mmap_after);
         green_shadow_hooked_exit = 0;
     }
 
-    while (atomic_read(&green_shadow_hooks_busy) > 0 && loops++ < 10000000)
-        green_cpu_relax();
-
-    count = green_shadow_release_all(true);
     pr_info("green_shadow: offline released=%d\n", count);
     return 0;
 }
