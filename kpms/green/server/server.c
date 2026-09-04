@@ -701,7 +701,10 @@ int green_server_run(int port)
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    /* The daemon performs root-only ptrace and KPM token provisioning.  Keep
+     * the control plane private to the device; callers use `adb forward` (or
+     * another explicit local tunnel) instead of exposing it on Wi-Fi. */
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons((uint16_t)port);
     if (bind(listen_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
         perror("bind");
@@ -713,7 +716,7 @@ int green_server_run(int port)
         close(listen_fd);
         return 1;
     }
-    fprintf(stderr, "green server listening on 0.0.0.0:%d\n", port);
+    fprintf(stderr, "green server listening on 127.0.0.1:%d\n", port);
 
     for (;;) {
         int client = accept(listen_fd, NULL, NULL);

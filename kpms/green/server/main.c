@@ -21,7 +21,7 @@ static void usage(const char *prog)
     fprintf(stderr,
             "green device server (frida-server equivalent)\n\n"
             "Usage:\n"
-            "  %s [--port PORT]              (default %d, all interfaces)\n\n"
+            "  %s [--port PORT]              (default %d, loopback only)\n\n"
             "All functionality is driven from the host CLI (cli/green.py):\n"
             "  adb forward tcp:%d tcp:%d\n",
             prog, GREEN_WIRE_DEFAULT_PORT, GREEN_WIRE_DEFAULT_PORT,
