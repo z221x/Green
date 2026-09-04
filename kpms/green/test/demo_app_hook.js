@@ -45,10 +45,11 @@ tryAttach("opendir", {
 });
 
 // ---- 4. Interceptor.replace：反反调试（ptrace 自检失效）----
-Interceptor.replace(Module.getExportByName("libc.so", "ptrace"), function (args) {
-    console.log("ptrace blocked, request=" + args[0].toInt32());
-    return 0;
-});
+Interceptor.replace(Module.getExportByName("libc.so", "ptrace"),
+    new NativeCallback(function (request, pid, address, data) {
+        console.log("ptrace blocked, request=" + request);
+        return 0;
+    }, "long", ["int", "int", "pointer", "pointer"]));
 console.log("hooked: ptrace (anti-anti-debug)");
 
 console.log("=== demo ready, streaming activity ===");

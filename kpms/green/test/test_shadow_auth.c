@@ -9,6 +9,7 @@ int main(void)
 {
     struct green_shadow_rpc rpc = {0};
     unsigned long token = 0x475245454e544553UL ^ (unsigned long)getpid();
+    unsigned long wrong = token ^ 0x9e3779b97f4a7c15UL;
     long ret;
 
     ret = prctl((int)PR_GREEN_SHADOW_TOKEN_REGISTER, (unsigned long)getpid(),
@@ -20,6 +21,13 @@ int main(void)
     rpc.version = GREEN_SHADOW_ABI_VERSION;
     rpc.op = GREEN_SHADOW_OP_COUNT;
     rpc.pid = 0;
+    ret = prctl((int)PR_GREEN_SHADOW_REQUEST, wrong,
+                (unsigned long)&rpc, 0, 0);
+    if (ret >= 0) {
+        fprintf(stderr, "invalid token was accepted\n");
+        return 1;
+    }
+    printf("invalid token rejected: %ld\n", ret);
     ret = prctl((int)PR_GREEN_SHADOW_REQUEST, token,
                 (unsigned long)&rpc, 0, 0);
     printf("authenticated count: %ld\n", ret);
@@ -34,5 +42,12 @@ int main(void)
         perror("token revoke");
         return 1;
     }
+    ret = prctl((int)PR_GREEN_SHADOW_REQUEST, token,
+                (unsigned long)&rpc, 0, 0);
+    if (ret >= 0) {
+        fprintf(stderr, "revoked token was accepted\n");
+        return 1;
+    }
+    printf("revoked token rejected: %ld\n", ret);
     return 0;
 }

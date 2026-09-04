@@ -6,7 +6,7 @@
  * continues, making partial API regressions visible in one attach session.
  */
 (function () {
-    function out(s) { log("[java-api] " + s); }
+    function out(s) { console.log("[java-api] " + s); }
     function pass(name, value) {
         out("PASS " + name + (value === undefined ? "" : "=" + value));
     }

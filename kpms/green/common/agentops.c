@@ -28,6 +28,7 @@
 #include <sys/wait.h>
 #include <linux/un.h>
 #include <stddef.h>
+#include <pthread.h>
 #include <unistd.h>
 
 int green_agentops_read_full(int fd, void *buf, size_t size)
@@ -131,10 +132,64 @@ static unsigned long green_agentops_new_token(void)
     return 0;
 }
 
+#define GREEN_AGENT_TOKEN_SLOTS 64
+
+struct green_agent_token_slot {
+    pid_t pid;
+    unsigned long token;
+};
+
+static struct green_agent_token_slot green_agent_token_slots[
+    GREEN_AGENT_TOKEN_SLOTS];
+static pthread_mutex_t green_agent_token_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct green_agent_token_slot *
+green_agentops_find_token_locked(pid_t pid)
+{
+    size_t i;
+
+    for (i = 0; i < GREEN_AGENT_TOKEN_SLOTS; i++) {
+        if (green_agent_token_slots[i].pid == pid)
+            return &green_agent_token_slots[i];
+    }
+    return NULL;
+}
+
+static struct green_agent_token_slot *
+green_agentops_reserve_token_locked(pid_t pid, unsigned long candidate)
+{
+    size_t i;
+    struct green_agent_token_slot *free_slot = NULL;
+
+    for (i = 0; i < GREEN_AGENT_TOKEN_SLOTS; i++) {
+        if (green_agent_token_slots[i].pid == pid)
+            return &green_agent_token_slots[i];
+        if (free_slot == NULL && green_agent_token_slots[i].pid == 0)
+            free_slot = &green_agent_token_slots[i];
+    }
+    if (free_slot != NULL) {
+        free_slot->pid = pid;
+        free_slot->token = candidate;
+    }
+    return free_slot;
+}
+
+static void green_agentops_drop_token(pid_t pid, unsigned long token)
+{
+    struct green_agent_token_slot *slot;
+
+    pthread_mutex_lock(&green_agent_token_lock);
+    slot = green_agentops_find_token_locked(pid);
+    if (slot != NULL && (token == 0 || slot->token == token))
+        memset(slot, 0, sizeof(*slot));
+    pthread_mutex_unlock(&green_agent_token_lock);
+}
+
 int green_agentops_revoke(pid_t pid, unsigned long token)
 {
     long ret = green_cli_prctl(PR_GREEN_SHADOW_TOKEN_REVOKE,
                                (unsigned long)pid, token, 0, 0);
+    green_agentops_drop_token(pid, token);
     return ret < 0 ? (int)ret : 0;
 }
 
@@ -148,20 +203,35 @@ int green_agentops_authorize(pid_t pid, unsigned long *token,
 
     if (!token || pid <= 0)
         return -EINVAL;
-    candidate = green_agentops_new_token();
+    pthread_mutex_lock(&green_agent_token_lock);
+    {
+        struct green_agent_token_slot *slot =
+            green_agentops_find_token_locked(pid);
+        if (slot != NULL)
+            candidate = slot->token;
+        else {
+            candidate = green_agentops_new_token();
+            if (candidate != 0 &&
+                green_agentops_reserve_token_locked(pid, candidate) == NULL)
+                candidate = 0;
+        }
+    }
     if (candidate == 0) {
+        pthread_mutex_unlock(&green_agent_token_lock);
         snprintf(err, errlen, "cannot obtain a secure shadow token");
         return -EAGAIN;
     }
     ret = green_cli_prctl(PR_GREEN_SHADOW_TOKEN_REGISTER,
                           (unsigned long)pid, candidate, 0, 0);
+    pthread_mutex_unlock(&green_agent_token_lock);
     if (ret < 0) {
+        green_agentops_drop_token(pid, candidate);
         snprintf(err, errlen,
                  "KPM shadow token registration failed (%ld); load green.kpm first",
                  ret);
         return (int)ret;
     }
-    if (green_agentops_ensure_injected(pid, err, errlen) != 0) {
+    if (green_agentops_ensure_injected(pid, candidate, err, errlen) != 0) {
         (void)green_agentops_revoke(pid, candidate);
         return -1;
     }
@@ -323,37 +393,37 @@ static int set_regs(pid_t pid, const struct user_pt_regs *regs)
     return 0;
 }
 
-static int remote_write(pid_t pid, uintptr_t address, const void *data,
-                        size_t size)
+static int shadow_write_target(pid_t pid, unsigned long token,
+                               uintptr_t address, const void *data,
+                               size_t size)
 {
-    struct iovec local = { .iov_base = (void *)data, .iov_len = size };
-    struct iovec remote = { .iov_base = (void *)address, .iov_len = size };
-    ssize_t n;
+    if (token == 0 || data == NULL || size == 0 ||
+        address > UINTPTR_MAX - size)
+        return -1;
 
-    n = process_vm_writev(pid, &local, 1, &remote, 1, 0);
-    if (n == (ssize_t)size)
-        return 0;
-
-    /* Fallback for kernels that restrict process_vm_writev even after attach. */
+    /* The KPM ABI is page-bounded.  Do not retain a direct-write fallback:
+     * even the temporary dlopen pathname used by the injector must obey the
+     * same authenticated shadow policy as agent code patches. */
     while (size != 0) {
-        uintptr_t aligned = address & ~(sizeof(long) - 1);
-        unsigned long word = 0;
-        size_t offset = address - aligned;
-        size_t chunk = sizeof(word) - offset;
+        struct green_shadow_rpc rpc;
+        size_t chunk = 4096 - (address & 4095U);
+        long ret;
 
         if (chunk > size)
             chunk = size;
-        errno = 0;
-        if (offset != 0 || chunk != sizeof(word)) {
-            long old = ptrace(PTRACE_PEEKDATA, pid, (void *)aligned, NULL);
-            if (old == -1 && errno != 0)
-                return -1;
-            word = (unsigned long)old;
-        }
-        memcpy((char *)&word + offset, data, chunk);
-        if (ptrace(PTRACE_POKEDATA, pid, (void *)aligned,
-                   (void *)word) != 0)
+        memset(&rpc, 0, sizeof(rpc));
+        rpc.version = GREEN_SHADOW_ABI_VERSION;
+        rpc.op = GREEN_SHADOW_OP_PATCH;
+        rpc.pid = (int)pid;
+        rpc.addr = (unsigned long)address;
+        rpc.buf = (unsigned long)data;
+        rpc.len = (unsigned long)chunk;
+        ret = green_cli_prctl(PR_GREEN_SHADOW_REQUEST, token,
+                              (unsigned long)&rpc, 0, 0);
+        if (ret < 0) {
+            errno = (int)(-ret);
             return -1;
+        }
         address += chunk;
         data = (const char *)data + chunk;
         size -= chunk;
@@ -370,7 +440,8 @@ static int wait_initial_stop(pid_t pid)
     return 0;
 }
 
-static int remote_dlopen(pid_t pid, const char *payload)
+static int remote_dlopen(pid_t pid, const char *payload,
+                         unsigned long shadow_token)
 {
     struct user_pt_regs saved;
     struct user_pt_regs call;
@@ -400,13 +471,20 @@ static int remote_dlopen(pid_t pid, const char *payload)
     remote_dlopen = target_map.start +
         ((uintptr_t)local_dlopen - local_map.start);
 
-    /* Park sp well BELOW the thread's live frames: the hijacked call grows
-     * its stack downward through unused territory only. */
+    /* Keep the temporary pathname in the already-populated page containing
+     * the stopped thread's stack pointer.  A far-below-SP address can be a
+     * valid VMA address but have no present PTE yet; KPM shadow intentionally
+     * refuses to fabricate such pages.  The call frame grows below SP, so a
+     * small slot immediately below the saved SP remains out of the live
+     * frame while still being mapped. */
     if (get_regs(pid, &saved) != 0)
         return -1;
-    remote_path = (saved.sp - 0x8000) & ~(uintptr_t)0xf;
-    if (remote_write(pid, remote_path, payload, payload_len) != 0) {
-        perror("write remote payload path");
+    if (saved.sp < 0x200)
+        return -1;
+    remote_path = (saved.sp - 0x100) & ~(uintptr_t)0xf;
+    if (shadow_write_target(pid, shadow_token, remote_path, payload,
+                            payload_len) != 0) {
+        perror("shadow-write remote payload path");
         return -1;
     }
     if (get_regs(pid, &saved) != 0)
@@ -497,7 +575,8 @@ restore:
     return result;
 }
 
-int green_agentops_inject(pid_t pid, const char *so_path)
+int green_agentops_inject(pid_t pid, const char *so_path,
+                          unsigned long shadow_token)
 {
     fprintf(stderr, "hook: attaching to %d\n", (int)pid);
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) != 0) {
@@ -509,7 +588,7 @@ int green_agentops_inject(pid_t pid, const char *so_path)
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return -1;
     }
-    if (remote_dlopen(pid, so_path) == 0) {
+    if (remote_dlopen(pid, so_path, shadow_token) == 0) {
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return 0;
     }
@@ -584,6 +663,7 @@ void green_agentops_target_path(const char *cmdline, const char *file,
 {
     const char *slash = strrchr(cmdline, '/');
     char package[128];
+    const char *app_dir;
 
     if (slash) {
         /* Non-app target: deploy next to its executable. */
@@ -591,7 +671,13 @@ void green_agentops_target_path(const char *cmdline, const char *file,
         snprintf(out, out_size, "%.*s%s", (int)dir_len, cmdline, file);
     } else {
         base_package(cmdline, package, sizeof(package));
-        snprintf(out, out_size, "/data/user/0/%s/cache/%s", package, file);
+        /* Android may mount the ordinary cache directory noexec.  Keep
+         * scripts/eval data in cache, but put the ELF payload in code_cache,
+         * which is the app-private executable cache used by ART. */
+        app_dir = (file && strcmp(file, "libgreen_agent.so") == 0)
+            ? "code_cache" : "cache";
+        snprintf(out, out_size, "/data/user/0/%s/%s/%s", package,
+                 app_dir, file ? file : "");
     }
 }
 
@@ -634,7 +720,8 @@ int green_agentops_copy_file(const char *src, const char *dest, pid_t pid,
     return 0;
 }
 
-int green_agentops_ensure_injected(pid_t pid, char *err, size_t errlen)
+int green_agentops_ensure_injected(pid_t pid, unsigned long shadow_token,
+                                   char *err, size_t errlen)
 {
     char cmdline[128];
     char so_path[300];
@@ -665,7 +752,7 @@ int green_agentops_ensure_injected(pid_t pid, char *err, size_t errlen)
         snprintf(so_path, sizeof(so_path), "%s", GREEN_AGENT_SO_SOURCE);
     }
 
-    if (green_agentops_inject(pid, so_path) != 0) {
+    if (green_agentops_inject(pid, so_path, shadow_token) != 0) {
         snprintf(err, errlen, "injection failed");
         return -1;
     }

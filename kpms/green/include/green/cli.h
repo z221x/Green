@@ -14,8 +14,6 @@ long green_cli_prctl(unsigned long option, unsigned long a2, unsigned long a3,
                      unsigned long a4, unsigned long a5);
 ssize_t green_cli_process_vm_read(pid_t pid, void *local, size_t length,
                                   unsigned long remote);
-ssize_t green_cli_process_vm_write(pid_t pid, const void *local, size_t length,
-                                   unsigned long remote);
 /* The linker64 map is used only to locate the linker image; library enumeration
  * is performed from its in-process solist chain. */
 unsigned long green_cli_show_exec_solist(pid_t pid, const char *lib_name);

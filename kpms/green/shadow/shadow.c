@@ -489,6 +489,10 @@ int green_shadow_copy_from_user(void *dst, const void __user *src,
     unsigned long done = 0;
     unsigned long uaddr = (unsigned long)src;
 
+    if (!dst || !src || len == 0 ||
+        uaddr > (~0UL) - (len - 1))
+        return -EFAULT;
+
     mm = green_k_get_task_mm(current);
     if (!mm)
         return -ESRCH;
@@ -497,14 +501,24 @@ int green_shadow_copy_from_user(void *dst, const void __user *src,
         unsigned long cur = uaddr + done;
         unsigned long off = green_page_off(cur);
         unsigned long chunk = GREEN_PAGE_SIZE - off;
+        void *vma;
         u64 *ptep;
         unsigned long kva;
 
         if (chunk > len - done)
             chunk = len - done;
 
+        /* Only copy from a user VMA/PTE.  This helper is also used for
+         * user-supplied rpc buffers, so rejecting privileged mappings here
+         * prevents a forged prctl from reading kernel memory. */
+        vma = green_k_find_vma(mm, cur);
+        if (!vma || green_vma_start(vma) > cur ||
+            green_vma_end(vma) < cur + chunk) {
+            green_k_mmput(mm);
+            return -EFAULT;
+        }
         ptep = green_shadow_get_pte(mm, cur);
-        if (!ptep || !(*ptep & PTE_VALID)) {
+        if (!ptep || !(*ptep & PTE_VALID) || !(*ptep & PTE_USER)) {
             green_k_mmput(mm);
             return -EFAULT;
         }

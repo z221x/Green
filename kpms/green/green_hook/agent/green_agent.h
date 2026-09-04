@@ -15,21 +15,18 @@
 #define GREEN_AGENT_SCRIPT_NAME "green_hook.js"
 
 #define GREEN_AGENT_MAX_MESSAGE 128U
-#define GREEN_AGENT_MAX_TOOLS 16U
 #define GREEN_AGENT_STATUS_EVENT 0x7ffffffe
 
-/* Tool and command identifiers are deliberately separate.  Future Green
- * tools can register another tool id without changing the transport. */
+/* The transport is script-focused; legacy broker tool identifiers were
+ * intentionally removed with the old green_hook implementation. */
 enum green_agent_tool_id {
     GREEN_AGENT_TOOL_CORE = 0,
-    GREEN_AGENT_TOOL_GREEN_HOOK = 1,
-    GREEN_AGENT_TOOL_JS = 2,
+    GREEN_AGENT_TOOL_JS = 1,
 };
 
 enum green_agent_js_command {
     GREEN_AGENT_CMD_JS_LOAD = 1, /* eval the script at the well-known path */
-    GREEN_AGENT_CMD_JS_CALL = 2, /* call the probe; returns the hooked value */
-    GREEN_AGENT_CMD_JS_EVAL = 3, /* evaluate response.arg0 as global JS code;
+    GREEN_AGENT_CMD_JS_EVAL = 2, /* evaluate response.arg0 as global JS code;
                                   * message carries the JSON result (truncated) */
 };
 
@@ -38,12 +35,6 @@ enum green_agent_core_command {
     /* Root server provisions the KPM token over the authenticated control
      * socket.  The token is then attached to every direct shadow prctl. */
     GREEN_AGENT_CMD_SHADOW_TOKEN_SET = 3,
-};
-
-enum green_agent_hook_command {
-    GREEN_AGENT_HOOK_REDIRECT = 1,
-    GREEN_AGENT_HOOK_RELEASE = 2,
-    GREEN_AGENT_HOOK_SELF_TEST = 3,
 };
 
 struct green_agent_request {
@@ -67,20 +58,6 @@ struct green_agent_response {
     uint32_t size;
     uint64_t value;
     char message[GREEN_AGENT_MAX_MESSAGE];
-};
-
-struct green_agent_tool;
-typedef int (*green_agent_tool_handler)(const struct green_agent_request *request,
-                                        struct green_agent_response *response,
-                                        void *userdata);
-
-typedef int (*green_agent_tool_register)(const struct green_agent_tool *tool);
-
-struct green_agent_tool {
-    uint16_t id;
-    const char *name;
-    green_agent_tool_handler handler;
-    void *userdata;
 };
 
 /* The name excludes the leading NUL required by an abstract AF_UNIX address. */

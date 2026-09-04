@@ -234,31 +234,6 @@ ssize_t green_cli_process_vm_read(pid_t pid, void *local, size_t length,
     return count;
 }
 
-ssize_t green_cli_process_vm_write(pid_t pid, const void *local, size_t length,
-                                   unsigned long remote)
-{
-    struct iovec local_iov;
-    struct iovec remote_iov;
-    ssize_t count;
-
-    if (!length)
-        return 0;
-    if (!local || !green_cli_valid_remote_ptr(remote)) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    local_iov.iov_base = (void *)local;
-    local_iov.iov_len = length;
-    remote_iov.iov_base = (void *)remote;
-    remote_iov.iov_len = length;
-    do {
-        count = process_vm_writev(green_cli_effective_pid(pid), &local_iov, 1,
-                                  &remote_iov, 1, 0);
-    } while (count < 0 && errno == EINTR);
-    return count;
-}
-
 static int green_cli_read_remote(pid_t pid, unsigned long address,
                                  void *buffer, size_t length)
 {

@@ -31,12 +31,13 @@ int green_agentops_authorize(pid_t pid, unsigned long *token,
 int green_agentops_revoke(pid_t pid, unsigned long token);
 
 /* ptrace + remote dlopen of the payload. */
-int green_agentops_inject(pid_t pid, const char *so_path);
+int green_agentops_inject(pid_t pid, const char *so_path,
+                          unsigned long shadow_token);
 
 int green_agentops_read_cmdline(pid_t pid, char *out, size_t out_size);
 pid_t green_agentops_find_package(const char *package);
-/* Where `file` must live for the target to read it (app cache or next to
- * the target binary). */
+/* Where `file` must live for the target to read it (app cache, app code_cache
+ * for libgreen_agent.so, or next to a non-app target binary). */
 void green_agentops_target_path(const char *cmdline, const char *file,
                                 char *out, size_t out_size);
 /* Copy src to dest, 0644/0755, chowned to the target uid. */
@@ -44,7 +45,8 @@ int green_agentops_copy_file(const char *src, const char *dest, pid_t pid,
                              int executable);
 
 /* Inject the payload unless the agent socket already answers. */
-int green_agentops_ensure_injected(pid_t pid, char *err, size_t errlen);
+int green_agentops_ensure_injected(pid_t pid, unsigned long shadow_token,
+                                   char *err, size_t errlen);
 
 /* Deploy the hook script (-l file or -c inline) to the target-readable
  * path; the destination is copied out to dest. */

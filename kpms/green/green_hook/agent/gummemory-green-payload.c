@@ -179,8 +179,7 @@ gum_internal_free (gpointer mem)
 /* ------------------------------------------------------------------ */
 
 static gssize
-green_gum_process_vm (gboolean writing, gpointer local, gsize len,
-                      gconstpointer remote)
+green_gum_process_vm_read (gpointer local, gsize len, gconstpointer remote)
 {
   struct iovec local_iov = { .iov_base = local, .iov_len = len };
   struct iovec remote_iov = { .iov_base = (void *) remote, .iov_len = len };
@@ -188,10 +187,7 @@ green_gum_process_vm (gboolean writing, gpointer local, gsize len,
 
   do
   {
-    if (writing)
-      n = process_vm_writev (getpid (), &local_iov, 1, &remote_iov, 1, 0);
-    else
-      n = process_vm_readv (getpid (), &local_iov, 1, &remote_iov, 1, 0);
+    n = process_vm_readv (getpid (), &local_iov, 1, &remote_iov, 1, 0);
   }
   while (n < 0 && errno == EINTR);
 
@@ -202,7 +198,7 @@ gboolean
 gum_memory_is_readable (gconstpointer address,
                         gsize len)
 {
-  return green_gum_process_vm (FALSE, (gpointer) &len, 1, address) == 1;
+  return green_gum_process_vm_read ((gpointer) &len, 1, address) == 1;
 }
 
 guint8 *
@@ -217,7 +213,7 @@ gum_memory_read (gconstpointer address,
     return NULL;
 
   buffer = g_malloc (len);
-  n = green_gum_process_vm (FALSE, buffer, len, address);
+  n = green_gum_process_vm_read (buffer, len, address);
   if (n <= 0)
   {
     g_free (buffer);
@@ -345,7 +341,7 @@ gum_memory_try_remap_writable_pages (gpointer first_page,
   /* The "writable alias" is a snapshot of the ORIGINAL pages, taken through
    * the GUP path so an already-shadowed target snapshots its original
    * bytes, not the patched ones. */
-  if (green_gum_process_vm (FALSE, snapshot, size, first_page) !=
+  if (green_gum_process_vm_read (snapshot, size, first_page) !=
       (gssize) size)
   {
     g_free (snapshot);
@@ -382,7 +378,7 @@ gum_memory_dispose_writable_pages (gpointer first_page,
     guint8 original[4096];
     guint j;
 
-    if (green_gum_process_vm (FALSE, original, 4096, target) != 4096)
+    if (green_gum_process_vm_read (original, 4096, target) != 4096)
       continue;
     j = 0;
     while (j < 4096)

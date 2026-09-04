@@ -2,7 +2,7 @@
  * private allocations and getpid/strlen, so the probe does not alter app
  * behavior beyond one short-lived libc hook. */
 (function () {
-    function out(s) { log("[native-api] " + s); }
+    function out(s) { console.log("[native-api] " + s); }
     function pass(name, value) { out("PASS " + name + (value === undefined ? "" : "=" + value)); }
     function fail(name, e) { out("FAIL " + name + "=" + (e && e.message ? e.message : String(e))); }
     function check(name, fn) {
@@ -66,16 +66,21 @@
         return eq("strlen", f(s).toNumber(), 7);
     });
     run("interceptor.attach", function () {
-        var target = new NativePointer(selfTestTarget());
-        var f = new NativeFunction(target, "int", ["int"]);
-        eq("baseline", f(5), 6);
+        /* getpid has no arguments; use libc's strlen for the one-argument
+         * callback shape exercised below. */
+        var target = Module.getExportByName(null, "strlen");
+        var f = new NativeFunction(target, "ulong", ["pointer"]);
+        var input = Memory.allocUtf8String("green");
+        eq("baseline", f(input).toNumber(), 5);
         var enters = 0, leaves = 0;
         Interceptor.attach(target, {
-            onEnter: function (args) { if (args[0].toInt32() === 5) enters++; },
-            onLeave: function (retval) { if (retval.toInt32() === 6) leaves++; }
+            onEnter: function (args) {
+                if (args[0].readUtf8String() === "green") enters++;
+            },
+            onLeave: function (retval) { if (retval.toInt32() === 5) leaves++; }
         });
-        var n = f(5);
-        if (n !== 6 || enters !== 1 || leaves !== 1)
+        var n = f(input);
+        if (n.toNumber() !== 5 || enters !== 1 || leaves !== 1)
             throw new Error("n=" + n + " enters=" + enters + " leaves=" + leaves);
         return "ok";
     });
