@@ -120,6 +120,16 @@ class NativePointer {
     constructor(v) {
         if (v instanceof NativePointer) { this.__v = v.__v; return; }
         if (v === null || v === undefined) { this.__v = 0n; return; }
+        /* NativeFunction/NativeCallback values carry their pointer in an
+         * .address property, as in Frida's NativePointer coercions. */
+        if (v && v.address !== undefined) v = v.address;
+        /* C++ ABI wrapper thunks (e.g. std::string-returning methods) expose
+         * their callable entry as .handle rather than .address. */
+        if (v && v.handle !== undefined) v = v.handle;
+        if (v && v.__v !== undefined) {
+            this.__v = BigInt.asUintN(64, __green_to_big(v));
+            return;
+        }
         if (typeof v === 'bigint') { this.__v = BigInt.asUintN(64, v); return; }
         if (typeof v === 'number') { this.__v = BigInt.asUintN(64, BigInt(Math.trunc(v))); return; }
         if (typeof v === 'string') {
@@ -156,27 +166,43 @@ class NativePointer {
     }
     toJSON() { return this.toString(); }
     readByteArray(len) {
-        var b = __green_mem_read(Number(this.__v), len);
+        var b = __green_mem_read(this.__v, len);
         if (b === null) throw new Error('access violation reading ' + len + ' bytes');
         return b;
     }
     writeByteArray(buf) {
         if (Array.isArray(buf)) {
             var ab = new Uint8Array(buf).buffer;
-            if (!__green_mem_write(Number(this.__v), ab))
+            if (!__green_mem_write(this.__v, ab))
                 throw new Error('access violation writing ' + buf.length + ' bytes');
             return this;
         }
-        if (!__green_mem_write(Number(this.__v), buf))
+        if (!__green_mem_write(this.__v, buf))
             throw new Error('access violation writing ' +
                 (buf && buf.byteLength) + ' bytes');
         return this;
     }
     readUtf8String(len) {
-        var s = __green_read_utf8(Number(this.__v), len || 512);
+        var s = __green_read_utf8(this.__v, len || 512);
         if (s === null) throw new Error('access violation reading string');
         var z = s.indexOf('\u0000');
         return z >= 0 ? s.slice(0, z) : s;
+    }
+    readUtf16String(len) {
+        var hasLength = len !== undefined && len !== null;
+        var n = hasLength ? Number(len) : 512;
+        if (!Number.isFinite(n) || n < 0)
+            throw new Error('invalid UTF-16 string length');
+        n = Math.floor(n);
+        var b = __green_mem_read(this.__v, n * 2);
+        if (b === null) throw new Error('access violation reading UTF-16 string');
+        var dv = new DataView(b), out = '';
+        for (var i = 0; i < n; i++) {
+            var c = dv.getUint16(i * 2, true);
+            if (!hasLength && c === 0) break;
+            out += String.fromCharCode(c);
+        }
+        return out;
     }
     readCString(len) { return this.readUtf8String(len); }
 }
@@ -191,22 +217,25 @@ class NativePointer {
     for (var name in rw) {
         (function (name, size, getter) {
             NativePointer.prototype[name] = function (offset) {
-                var a = Number(this.__v) + (offset || 0);
+                var a = this.__v + BigInt(offset || 0);
                 var b = __green_mem_read(a, size);
                 if (b === null) throw new Error('access violation reading ' + size + ' byte(s) at 0x' + a.toString(16));
                 var dv = new DataView(b);
-                return dv[getter](0, true);
+                var raw = dv[getter](0, true);
+                if (name === 'readS64') return new Int64(raw);
+                if (name === 'readU64') return new UInt64(raw);
+                return raw;
             };
             var wname = 'write' + name.slice(4);
             NativePointer.prototype[wname] = function (value, offset) {
-                var a = Number(this.__v) + (offset || 0);
+                var a = this.__v + BigInt(offset || 0);
                 var b = new ArrayBuffer(size);
                 var dv = new DataView(b);
                 var setter = getter.replace('get', 'set');
                 if (getter === 'getFloat32' || getter === 'getFloat64')
                     dv[setter](0, Number(value), true);
                 else if (size === 8)
-                    dv[setter](0, typeof value === 'bigint' ? value : BigInt(value), true);
+                    dv[setter](0, __green_to_big(value), true);
                 else
                     dv[setter](0, value, true);
                 if (!__green_mem_write(a, b))
@@ -226,8 +255,10 @@ NativePointer.prototype.writeUInt = function (v, o) { return this.writeU32(v, o)
 NativePointer.prototype.writeLong = function (v, o) { return this.writeS64(v, o); };
 NativePointer.prototype.writeULong = function (v, o) { return this.writeU64(v, o); };
 NativePointer.prototype.readPointer = function () {
-    return new NativePointer(BigInt.asUintN(64, this.readU64()) &
-        0x00ffffffffffffffn);
+    /* Preserve MTE/PAC bits in the pointer value.  The C memory primitives
+     * strip tags only when dereferencing; stripping here turns a tagged
+     * JNIEnv* into a different pointer that CheckJNI rejects. */
+    return new NativePointer(__green_to_big(this.readU64()));
 };
 NativePointer.prototype.writePointer = function (v) {
     this.writeU64(new NativePointer(v).__v);
@@ -235,6 +266,22 @@ NativePointer.prototype.writePointer = function (v) {
 };
 function ptr(v) { return new NativePointer(v); }
 var NULL = ptr(0);
+/* The native instruction parser returns integer-valued address fields.
+ * frida-java-bridge expects NativePointer methods on both fields. */
+if (typeof Instruction !== 'undefined' &&
+    typeof Instruction.parse === 'function') {
+    var __green_instruction_parse = Instruction.parse;
+    Instruction.parse = function (address) {
+        var insn = __green_instruction_parse(address);
+        if (insn && typeof insn === 'object') {
+            if (insn.address !== undefined)
+                insn.address = new NativePointer(insn.address);
+            if (insn.next !== undefined)
+                insn.next = new NativePointer(insn.next);
+        }
+        return insn;
+    };
+}
 NativePointer.prototype.toMatchPattern = function () {
     var v = BigInt.asUintN(64, BigInt(this.__v));
     var s = [];
@@ -344,17 +391,31 @@ function __green_wrap_args(raw, type) {
     }
 }
 function NativeFunction(addr, retType, argTypes) {
-    var target = Number(new NativePointer(addr).__v);
+    /* Keep function and argument pointers as BigInt all the way into the C
+     * dispatcher.  Converting tagged (MTE/PAC) pointers to Number loses the
+     * low bits before the native call is made. */
+    var target = new NativePointer(addr).__v;
     var f = function () {
         var args = [];
         for (var i = 0; i < argTypes.length; i++) {
             var a = arguments[i];
-            args.push(a instanceof NativePointer ? Number(a.__v)
-                : (a === undefined || a === null ? 0 : a));
+            /* Frida accepts any NativePointer-like object for pointer
+             * parameters.  frida-java-bridge passes temporary C++ wrappers
+             * (e.g. ArtClassVisitor) whose address is exposed as `.handle`,
+             * so checking only instanceof NativePointer turns those calls
+             * into arbitrary JS-number coercions. */
+            if (argTypes[i] === 'pointer')
+                args.push(new NativePointer(a).__v);
+            else
+                args.push(a === undefined || a === null ? 0 : a);
         }
         return __green_wrap_ret(__green_native_call(target, args), retType);
     };
     f.address = new NativePointer(addr);
+    /* Keep enough identity for frida-java-bridge's ABI-sensitive checks
+     * (notably deciding whether ClassLinker::VisitClasses takes a
+     * ClassVisitor object or a legacy callback). */
+    f.__green_native_function = true;
     f.retType = retType;
     f.argTypes = argTypes;
     return f;
@@ -391,9 +452,9 @@ var Interceptor = {
 };
 var Memory = {
     alloc: function (size) { return new NativePointer(__green_mem_alloc(size || 4096)); },
-    free: function (p) { __green_mem_free(Number(new NativePointer(p).__v)); },
+    free: function (p) { __green_mem_free(new NativePointer(p).__v); },
     protect: function (p, size, prot) {
-        return __green_mprotect(Number(new NativePointer(p).__v), size, prot);
+        return __green_mprotect(new NativePointer(p).__v, size, prot);
     },
     readUtf8String: function (addr, len) { return new NativePointer(addr).readUtf8String(len); },
     readCString: function (addr, len) { return new NativePointer(addr).readUtf8String(len); },
@@ -506,8 +567,8 @@ Memory.copy = function (dst, src, size) {
     var d = new NativePointer(dst), s = new NativePointer(src);
     for (var off = 0; off < size; off += 4096) {
         var n = Math.min(4096, size - off);
-        var chunk = new NativePointer(Number(s.__v) + off).readByteArray(n);
-        new NativePointer(Number(d.__v) + off).writeByteArray(chunk);
+        var chunk = new NativePointer(s.__v + BigInt(off)).readByteArray(n);
+        new NativePointer(d.__v + BigInt(off)).writeByteArray(chunk);
     }
 };
 
@@ -532,14 +593,14 @@ Memory.scanSync = function (base, size, pattern) {
         var n = Math.min(CHUNK, size - off);
         var bytes;
         try {
-            bytes = new NativePointer(Number(p.__v) + off).readByteArray(n);
+            bytes = new Uint8Array(new NativePointer(p.__v + BigInt(off)).readByteArray(n));
         } catch (e) { continue; }
         outer:
         for (var i = 0; i + pat.length <= n; i++) {
             for (var j = 0; j < pat.length; j++) {
                 if (pat[j] >= 0 && bytes[i + j] !== pat[j]) continue outer;
             }
-            matches.push({ address: new NativePointer(Number(p.__v) + off + i),
+            matches.push({ address: new NativePointer(p.__v + BigInt(off + i)),
                            size: pat.length });
             if (matches.length > 4096) return matches;
         }
@@ -624,7 +685,12 @@ function CModule(source, symbols) {
 var ARM64_REGS = {};
 (function () {
     /* capstone v6 aarch64 enums */
-    for (var i = 0; i <= 30; i++) ARM64_REGS['x' + i] = 218 + i;
+    /* Capstone's x29/x30 are aliases (FP=2, LR=3), not contiguous values
+     * after x28. Keep x0-x28 on the contiguous range and spell out the
+     * aliases explicitly; passing 247/248 makes Gum abort in describe_reg. */
+    for (var i = 0; i <= 28; i++) ARM64_REGS['x' + i] = 218 + i;
+    ARM64_REGS.x29 = 2;
+    ARM64_REGS.x30 = 3;
     ARM64_REGS.sp = 5;
     ARM64_REGS.xzr = 9;
     ARM64_REGS.fp = ARM64_REGS.x29;
@@ -658,7 +724,11 @@ function Arm64Writer(code, options) {
     this.putPushRegReg = function (a, b) { __green_a64w(this.__h, 1, __a64r(a), __a64r(b)); };
     this.putPopRegReg = function (a, b) { __green_a64w(this.__h, 2, __a64r(a), __a64r(b)); };
     this.putLabel = function (name) {
-        var id = this.__nextLabel++;
+        /* A forward reference allocates its id in __label().  Reuse that
+         * id here; allocating a fresh id would leave the reference
+         * unresolved and make GumArm64Writer.flush() fail. */
+        var id = this.__labels[name];
+        if (id === undefined) id = this.__nextLabel++;
         this.__labels[name] = id;
         __green_a64w(this.__h, 3, id);
     };
@@ -747,3 +817,44 @@ function Arm64Writer(code, options) {
     this.flush = function () { __green_a64w(this.__h, 28); };
     this.dispose = this.clear = function () { __green_a64w(this.__h, 99); };
 }
+
+/* ARM64 relocator used by frida-java-bridge's ART recompiler. */
+function Arm64Relocator(input, writer) {
+    this.__h = __green_a64r_new(input, writer && writer.__h);
+}
+Object.defineProperty(Arm64Relocator.prototype, 'input', {
+    get: function () {
+        var insn = __green_a64r_input(this.__h);
+        if (insn && typeof insn === 'object') {
+            if (insn.address !== undefined)
+                insn.address = new NativePointer(insn.address);
+            if (insn.next !== undefined)
+                insn.next = new NativePointer(insn.next);
+        }
+        return insn;
+    }
+});
+Object.defineProperty(Arm64Relocator.prototype, 'eoi', {
+    get: function () { return __green_a64r(this.__h, 6); }
+});
+Object.defineProperty(Arm64Relocator.prototype, 'eob', {
+    get: function () { return __green_a64r(this.__h, 7); }
+});
+Arm64Relocator.prototype.readOne = function () {
+    return __green_a64r(this.__h, 1);
+};
+Arm64Relocator.prototype.writeAll = function () {
+    return __green_a64r(this.__h, 2);
+};
+Arm64Relocator.prototype.skipOne = function () {
+    return __green_a64r(this.__h, 3);
+};
+Arm64Relocator.prototype.writeOne = function () {
+    return __green_a64r(this.__h, 4);
+};
+Arm64Relocator.prototype.dispose = function () {
+    return __green_a64r(this.__h, 5);
+};
+Arm64Relocator.prototype.reset = function () {
+    throw new Error('Arm64Relocator.reset is not supported');
+};

@@ -104,6 +104,9 @@ adb shell su -c /data/local/tmp/test_hook
 
 验证 shadow 语义：patch 执行生效 / 读取见原始字节 / release 恢复。
 
+测试源码位于 `test/test_hook.c`；Java/Native 设备探针位于 `test/`，所有构建
+中间文件和最终产物统一写入 `build/`。
+
 ## 扩展
 
 通过 `green_agent_register_tool()` 注册新的 tool id 与 handler，可复用同一套注入、

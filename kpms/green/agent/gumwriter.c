@@ -5,6 +5,8 @@
 #include <glib.h>
 #include "arch-arm64/gumarm64writer.h"
 #include <quickjs.h>
+#include <stdio.h>
+#include <android/log.h>
 
 #define GREEN_MAX_W 16
 static GumArm64Writer g_writers[GREEN_MAX_W];
@@ -40,8 +42,40 @@ static arm64_reg parse_reg(JSContext *ctx, JSValueConst v)
 {
     const char *s = JS_ToCString(ctx, v);
     const struct { const char *name; arm64_reg reg; } *p;
+    int n;
     if (s == NULL)
         return ARM64_REG_INVALID;
+    /* Capstone's register enums are contiguous for each register family.
+     * The Java bridge uses d2-d7 and may use any x/w/s/q register, so do
+     * not rely on the deliberately small fast-path table below. */
+    if (strcmp(s, "x29") == 0) {
+        JS_FreeCString(ctx, s);
+        return ARM64_REG_X29;
+    }
+    if (strcmp(s, "x30") == 0) {
+        JS_FreeCString(ctx, s);
+        return ARM64_REG_X30;
+    }
+    if (sscanf(s, "x%d", &n) == 1 && n >= 0 && n <= 28) {
+        JS_FreeCString(ctx, s);
+        return (arm64_reg)(ARM64_REG_X0 + n);
+    }
+    if (sscanf(s, "w%d", &n) == 1 && n >= 0 && n <= 30) {
+        JS_FreeCString(ctx, s);
+        return (arm64_reg)(ARM64_REG_W0 + n);
+    }
+    if (sscanf(s, "s%d", &n) == 1 && n >= 0 && n <= 31) {
+        JS_FreeCString(ctx, s);
+        return (arm64_reg)(ARM64_REG_S0 + n);
+    }
+    if (sscanf(s, "d%d", &n) == 1 && n >= 0 && n <= 31) {
+        JS_FreeCString(ctx, s);
+        return (arm64_reg)(ARM64_REG_D0 + n);
+    }
+    if (sscanf(s, "q%d", &n) == 1 && n >= 0 && n <= 31) {
+        JS_FreeCString(ctx, s);
+        return (arm64_reg)(ARM64_REG_Q0 + n);
+    }
     for (p = kRegs; p->name != NULL; p++) {
         if (strcmp(p->name, s) == 0) {
             JS_FreeCString(ctx, s);
@@ -55,6 +89,14 @@ static arm64_reg parse_reg(JSContext *ctx, JSValueConst v)
 static GumArm64Writer *w_get(int h)
 {
     return (h >= 0 && h < GREEN_MAX_W && g_writer_used[h]) ? &g_writers[h] : NULL;
+}
+
+/* The Java bridge has to feed the same native writer to Gum's relocator.
+ * Keep the handle validation in one place and expose only the opaque writer
+ * pointer, not the writer table itself. */
+GumArm64Writer *green_a64w_get(int h)
+{
+    return w_get(h);
 }
 
 /* __green_a64w_new(codePtr) -> handle */
@@ -100,8 +142,12 @@ static JSValue js_a64w(JSContext *ctx, JSValueConst this_val, int argc,
     if (argc > 5) JS_ToInt64(ctx, &a3, argv[5]);
 
     switch (op) {
-    case 1: gum_arm64_writer_put_push_reg_reg(w, (arm64_reg)a0, (arm64_reg)a1); break;
-    case 2: gum_arm64_writer_put_pop_reg_reg(w, (arm64_reg)a0, (arm64_reg)a1); break;
+    case 1:
+        gum_arm64_writer_put_push_reg_reg(w, (arm64_reg)a0, (arm64_reg)a1);
+        break;
+    case 2:
+        gum_arm64_writer_put_pop_reg_reg(w, (arm64_reg)a0, (arm64_reg)a1);
+        break;
     case 3: gum_arm64_writer_put_label(w, (gconstpointer)(uintptr_t)a0); break;
     case 4: gum_arm64_writer_put_b_cond_label(w, (arm64_cc)a0, (gconstpointer)(uintptr_t)a1); break;
     case 5: gum_arm64_writer_put_ldr_reg_address(w, (arm64_reg)a0, (guint64)a1); break;

@@ -5,6 +5,8 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+BUILD_DIR="$ROOT/build"
+mkdir -p "$BUILD_DIR"
 
 NDK="${ANDROID_NDK:-$(ls -d "$HOME/Library/Android/sdk/ndk/"* 2>/dev/null | sort -V | tail -1)}"
 CC="$NDK/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android35-clang"
@@ -24,7 +26,7 @@ for line in src.split('\n'):
     esc = line.replace('\\','\\\\').replace('"','\\"')
     out.append('    "' + esc + '\\n"')
 out[-1] += ';'
-open('agent/prelude.inc','w').write('\n'.join(out) + '\n')
+open('build/prelude.inc','w').write('\n'.join(out) + '\n')
 PYGEN
 
 # Generate fjb.inc from the bundled frida-java-bridge IIFE
@@ -36,11 +38,11 @@ for line in src.split('\n'):
     esc = line.replace('\\','\\\\').replace('"','\\"')
     out.append('    "' + esc + '\\n"')
 out[-1] += ';'
-open('agent/fjb.inc','w').write('\n'.join(out) + '\n')
+open('build/fjb.inc','w').write('\n'.join(out) + '\n')
 PYGEN2
 
 # Compile the profiler stub
-$CC -c -O2 -w -o agent/gumprofiler-stub.o agent/gumprofiler-stub.c \
+$CC -c -O2 -w -o build/gumprofiler-stub.o agent/gumprofiler-stub.c \
   -Iagent/stub-include \
   -I$ROOT/tmp/prefix/include/glib-2.0 -I$ROOT/tmp/prefix/lib/glib-2.0/include \
   -Ivendor/frida-gum/libs/gum/prof -Ivendor/frida-gum/gum
@@ -50,13 +52,14 @@ $CC -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
   -Iinclude \
   -Ivendor/frida-gum -Ivendor/frida-gum/bindings -Ivendor/frida-gum/build-gumjs -Ivendor/frida-gum/gum \
   -Ivendor/frida-gum/subprojects/capstone/include/capstone \
+  -Ibuild \
   -I$ROOT/tmp/prefix/include/glib-2.0 -I$ROOT/tmp/prefix/lib/glib-2.0/include \
   -Ivendor/prefix/include/quickjs \
   -o build/libgreen_agent.so \
-  agent/green_agent.c agent/gummemory-green-payload.c agent/gumwriter.c agent/insn.c \
+  agent/green_agent.c agent/gummemory-green-payload.c agent/gumwriter.c agent/insn.c agent/relocator.c agent/java_bridge.c \
   -Wl,--allow-multiple-definition \
   -Wl,--start-group \
-  agent/gumprofiler-stub.o \
+  build/gumprofiler-stub.o \
   vendor/prefix/lib/libquickjs.a \
   $FGJ/libfrida-gumjs-1.0.a \
   $FG/libfrida-gum-1.0.a \

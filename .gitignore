@@ -9,3 +9,7 @@ test
 script
 green_hook/
 host/
+
+# Green's checked-in regression tests live under kpms/green/test/.
+!kpms/green/test/
+!kpms/green/test/**

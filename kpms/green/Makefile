@@ -80,6 +80,7 @@ $(CLIENT): $(SERVER_SRCS) $(CLI_HEADERS)
 
 .PHONY: testhook
 TESTHOOK := $(BUILD_DIR)/test_hook
+TEST_DIR := test
 
 # green_hook 用例：验证 patch 执行 / 读原始 / 恢复 三条 gum 语义。
 GUM_VENDOR_DIR := green_hook/vendor/gum
@@ -92,11 +93,11 @@ GUM_SRCS := green_hook/gummemory-green.c \
 
 testhook: $(TESTHOOK)
 
-$(TESTHOOK): tests/test_hook.c green_hook/green_gum.h $(GUM_SRCS) include/green/abi.h
+$(TESTHOOK): $(TEST_DIR)/test_hook.c green_hook/green_gum.h $(GUM_SRCS) include/green/abi.h
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	mkdir -p $(dir $@)
 	$(ANDROID_CC) -D_GNU_SOURCE -static -s -O2 -Wall -Wextra -mbranch-protection=none \
-		-Iinclude $(GUM_SHIM_FLAGS) -Igreen_hook -o $@ tests/test_hook.c $(GUM_SRCS)
+		-Iinclude $(GUM_SHIM_FLAGS) -Igreen_hook -o $@ $(TEST_DIR)/test_hook.c $(GUM_SRCS)
 
 .PHONY: agent
 AGENT_PAYLOAD := $(BUILD_DIR)/libgreen_agent.so
@@ -105,7 +106,11 @@ AGENT_PAYLOAD := $(BUILD_DIR)/libgreen_agent.so
 GUM_PREFIX := vendor/prefix
 agent: $(AGENT_PAYLOAD)
 
-$(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h agent/link-payload.sh
+
+$(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h \
+		agent/gumwriter.c agent/gummemory-green-payload.c \
+		agent/java_bridge.c agent/insn.c agent/relocator.c agent/prelude.js \
+		agent/fjb.iife.js agent/link-payload.sh
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	@mkdir -p $(dir $@)
 	ANDROID_NDK="$(ANDROID_NDK)" $(SHELL) agent/link-payload.sh

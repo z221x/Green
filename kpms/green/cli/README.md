@@ -36,6 +36,9 @@ python3 cli/green.py --host <device-ip> --port 27042 ps   # 免 adb forward
 `attach` 会保持连接并实时回流脚本 `console.log()/log()/send()` 输出，
 Ctrl-C 断开（hook 与 shadow 页保留，重复 attach 会重载脚本）。
 
+设备回归探针统一位于 `test/`，由 `test/test_java_hook.sh` 完成部署、启动和
+attach；通过 `PROBE_SCRIPT` 选择 Java 或 Native 探针。
+
 ## shadow 命令（全部在主机端执行）
 
 ```sh

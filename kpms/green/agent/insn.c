@@ -6,6 +6,10 @@
 #include <android/log.h>
 #include <arm64.h>
 #include <quickjs.h>
+#include <linux/errno.h>
+extern void green_maps_refresh(void);
+extern int green_maps_addr_readable(uint64_t addr, size_t len);
+extern int green_addr_ok(uint64_t addr, size_t len, int need);
 
 static csh g_cs;
 static int g_cs_ready;
@@ -68,6 +72,27 @@ static JSValue js_insn_parse(JSContext *ctx, JSValueConst this_val,
         }
     }
     pc = address;
+    {
+        static int oklog = 0;
+        if (oklog < 5) {
+            __android_log_print(ANDROID_LOG_ERROR, "green-agent",
+                "insn_parse: addr=%llx", (unsigned long long)address);
+            oklog++;
+        }
+    }
+    if (!green_maps_addr_readable(address, 4)) {
+        /* Unreadable: neutral pseudo-instruction */
+        JSValue o = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, o, "mnemonic", JS_NewString(ctx, "bad"));
+        JS_SetPropertyStr(ctx, o, "op_str", JS_NewString(ctx, ""));
+        JS_SetPropertyStr(ctx, o, "operands", JS_NewArray(ctx));
+        JS_SetPropertyStr(ctx, o, "address",
+            JS_NewInt64(ctx, (int64_t)address));
+        JS_SetPropertyStr(ctx, o, "next",
+            JS_NewInt64(ctx, (int64_t)(address + 4)));
+        JS_SetPropertyStr(ctx, o, "size", JS_NewInt32(ctx, 4));
+        return o;
+    }
     {
         static int logged = 0;
         if (logged < 20) {

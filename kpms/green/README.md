@@ -36,7 +36,7 @@ kpms/green/
 ├── server/                  # ★ 手机端守护进程（≈ frida-server）
 │   ├── main.c               #   入口：直接运行（--port）
 │   └── server.c             #   TCP 守护进程 + shadow 远程操作
-├── cli/                     # ★ 主机端 CLI（Python）
+├── cli/                     # ★ 主机端 CLI（Python，仅运行时代码）
 │   ├── green.py             #   ps/attach/shadow 全部功能
 │   └── README.md            #   使用说明 + wire 协议
 ├── agent/                   # ★ 注入目标进程的 payload
@@ -48,7 +48,13 @@ kpms/green/
 │   ├── link-payload.sh      #   payload 链接脚本
 │   ├── example_hook.js      #   hook 脚本示例
 │   └── README.md
-├── tests/test_hook.c        # KPM 回归测试
+├── test/                    # 回归测试与设备探针
+│   ├── test_hook.c          #   KPM 回归测试
+│   ├── test_java_hook.sh    #   设备部署/attach 驱动脚本
+│   ├── java_api_probe.js    #   Java API 回归探针
+│   ├── java_hook_probe.js   #   Java hashCode hook 探针
+│   └── native_api_probe.js  #   Native/Memory API 探针
+├── build/                   # 构建产物（gitignored）
 ├── doc/KNOWN-ISSUES.md      # 已知问题与解决方案
 ├── vendor/                  # frida-gum 源码 + 构建产物（gitignore）
 ├── Makefile
@@ -106,8 +112,8 @@ Interceptor.attach(openPtr, {
 ```
 
 ```sh
-python3 cli/green.py attach -p <pid> -l example_hook.js
-python3 cli/green.py attach -f com.example.app -l example_hook.js
+python3 cli/green.py attach -p <pid> -l agent/example_hook.js
+python3 cli/green.py attach -f com.example.app -l agent/example_hook.js
 ```
 
 ## JS API

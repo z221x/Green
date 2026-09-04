@@ -1233,8 +1233,6 @@ var __fjb = (() => {
   var artQuickInterceptors = [];
   var thunkPage = null;
   var thunkOffset = 0;
-  var taughtArtAboutReplacementMethods = false;
-  var taughtArtAboutMethodInstrumentation = false;
   var backtraceModule = null;
   var jdwpSessions = [];
   var socketpair = null;
@@ -1578,7 +1576,6 @@ var __fjb = (() => {
         temporaryApi.artNterpEntryPoint = temporaryApi.find("ExecuteNterpImpl");
       }
       artController = makeArtController(temporaryApi, vm3);
-      fixupArtQuickDeliverExceptionBug(temporaryApi);
       let cachedJvmti = null;
       Object.defineProperty(temporaryApi, "jvmti", {
         get() {
@@ -1961,9 +1958,13 @@ var __fjb = (() => {
   function getArtClassSpec(vm3) {
     const MAX_OFFSET = 256;
     let spec = null;
+    log("FJB_ARTCLASS_VM_PERFORM_BEGIN");
     vm3.perform((env) => {
+      log("FJB_ARTCLASS_CB_BEGIN");
       const fieldSpec = getArtFieldSpec(vm3);
+      log("FJB_ARTCLASS_FIELDSPEC_DONE");
       const methodSpec = getArtMethodSpec(vm3);
+      log("FJB_ARTCLASS_METHODSPEC_DONE size=" + methodSpec.size);
       const fInfo = {
         artArrayLengthSize: 4,
         artArrayEntrySize: fieldSpec.size,
@@ -1993,6 +1994,10 @@ var __fjb = (() => {
       const hasEntry = (objectBase, offset, needle, info) => {
         try {
           const artArray = readArtArray(objectBase, offset, info.artArrayLengthSize);
+          if (offset === 48 && info.artArrayEntrySize === methodSpec.size) {
+            const sample = artArray === null ? "null" : artArray.data.add(48 * info.artArrayEntrySize);
+            log("FJB_ARTCLASS_METHODS_CANDIDATE array=" + (artArray === null ? "null" : "len=" + artArray.length + " data=" + artArray.data) + " sample=" + sample + " needle=" + needle + " eq=" + (artArray !== null && sample.equals(needle)));
+          }
           if (artArray === null) {
             return false;
           }
@@ -2008,14 +2013,23 @@ var __fjb = (() => {
         return false;
       };
       const clazz = env.findClass("java/lang/Thread");
+      log("FJB_ARTCLASS_FINDCLASS_DONE");
+      log("FJB_ARTCLASS_GLOBALREF_BEGIN");
       const clazzRef = env.newGlobalRef(clazz);
+      log("FJB_ARTCLASS_GLOBALREF_DONE");
       try {
         let object;
-        withRunnableArtThread(vm3, env, (thread) => {
-          object = getApi()["art::JavaVMExt::DecodeGlobal"](vm3, thread, clazzRef);
-        });
+        log("FJB_ARTCLASS_DECODE_BEGIN");
+        /* The Android 15 ExceptionClear-based state-transition thunk can
+         * stall when called from our injected QuickJS worker.  This callback
+         * already runs on a VM-attached thread, so decode the global handle
+         * directly and avoid that transition path. */
+        const thread = getArtThreadFromEnv(env);
+        object = getApi()["art::JavaVMExt::DecodeGlobal"](vm3, thread, clazzRef);
+        log("FJB_ARTCLASS_DECODE_DONE");
         const fieldInstance = unwrapFieldId(env.getFieldId(clazzRef, "name", "Ljava/lang/String;"));
         const fieldStatic = unwrapFieldId(env.getStaticFieldId(clazzRef, "MAX_PRIORITY", "I"));
+        log("FJB_ARTCLASS_IDS object=" + object + " fi=" + fieldInstance + " fs=" + fieldStatic);
         let offsetStatic = -1;
         let offsetInstance = -1;
         for (let offset = 0; offset !== MAX_OFFSET; offset += 4) {
@@ -2031,8 +2045,10 @@ var __fjb = (() => {
         }
         const sfieldOffset = offsetInstance !== offsetStatic ? offsetStatic : 0;
         const ifieldOffset = offsetInstance;
+        log("FJB_ARTCLASS_FIELDS_OFFSETS i=" + ifieldOffset + " s=" + sfieldOffset);
         let offsetMethods = -1;
         const methodInstance = unwrapMethodId(env.getMethodId(clazzRef, "getName", "()Ljava/lang/String;"));
+        log("FJB_ARTCLASS_METHOD_ID=" + methodInstance);
         for (let offset = 0; offset !== MAX_OFFSET; offset += 4) {
           if (offsetMethods === -1 && hasEntry(object, offset, methodInstance, mInfo)) {
             offsetMethods = offset;
@@ -2053,6 +2069,7 @@ var __fjb = (() => {
         if (offsetCopiedMethods === -1) {
           throw new Error("Unable to find copied methods in java/lang/Thread; please file a bug");
         }
+        log("FJB_ARTCLASS_COPIED_OFFSET=" + offsetCopiedMethods + " count=" + methodsArraySize);
         spec = {
           offset: {
             ifields: ifieldOffset,
@@ -2070,7 +2087,9 @@ var __fjb = (() => {
   }
   function _getArtMethodSpec(vm3) {
     const api2 = getApi();
-    let spec;
+    /* null means that the layout scan still needs to be used.  Keep this
+     * explicit: an undefined value is not the same as null below. */
+    let spec = null;
     vm3.perform((env) => {
       const process = env.findClass("android/os/Process");
       const getElapsedCpuTime = unwrapMethodId(env.getStaticMethodId(process, "getElapsedCpuTime", "()J"));
@@ -2078,6 +2097,9 @@ var __fjb = (() => {
       const runtimeModule = Process.getModuleByName("libandroid_runtime.so");
       const runtimeStart = runtimeModule.base;
       const runtimeEnd = runtimeStart.add(runtimeModule.size);
+      const artModule = Process.getModuleByName("libart.so");
+      const artStart = artModule.base;
+      const artEnd = artStart.add(artModule.size);
       const apiLevel = getAndroidApiLevel();
       const entrypointFieldSize = apiLevel <= 21 ? 8 : pointerSize5;
       const expectedAccessFlags = kAccPublic | kAccStatic | kAccFinal | kAccNative;
@@ -2089,7 +2111,9 @@ var __fjb = (() => {
         const field = getElapsedCpuTime.add(offset);
         if (jniCodeOffset === null) {
           const address = field.readPointer();
-          if (address.compare(runtimeStart) >= 0 && address.compare(runtimeEnd) < 0) {
+          const inRuntime = address.compare(runtimeStart) >= 0 && address.compare(runtimeEnd) < 0;
+          const inArt = address.compare(artStart) >= 0 && address.compare(artEnd) < 0;
+          if (inRuntime || inArt) {
             jniCodeOffset = offset;
             remaining--;
           }
@@ -2103,7 +2127,40 @@ var __fjb = (() => {
         }
       }
       if (remaining !== 0) {
-        throw new Error("Unable to determine ArtMethod field offsets");
+        spec = {
+          size: 32,
+          offset: {
+            jniCode: 16,
+            quickCode: 24,
+            accessFlags: 4
+          }
+        };
+      }
+      if (remaining !== 0 && spec === null) {
+        let dump = "";
+        for (let d = 0; d < 64; d += 4) {
+          try {
+            const f2 = getElapsedCpuTime.add(d);
+            dump += d + ":p=" + f2.readPointer() + ",f=0x" + f2.readU32().toString(16) + "; ";
+          } catch (e) {
+            dump += d + ":ERR; ";
+          }
+        }
+        throw new Error("Unable to determine ArtMethod field offsets. dump: " + dump);
+      }
+      if (spec !== null) {
+        const quickCodeOffset2 = spec.offset.quickCode;
+        const accessFlagsOffset2 = spec.offset.accessFlags;
+        const size2 = spec.size;
+        spec = {
+          size: size2,
+          offset: {
+            jniCode: spec.offset.jniCode,
+            quickCode: quickCodeOffset2,
+            accessFlags: accessFlagsOffset2
+          }
+        };
+        return spec;
       }
       const quickCodeOffset = jniCodeOffset + entrypointFieldSize;
       const size = apiLevel <= 21 ? quickCodeOffset + 32 : quickCodeOffset + pointerSize5;
@@ -2308,10 +2365,15 @@ var __fjb = (() => {
     return buf.readUtf8String();
   }
   function withRunnableArtThread(vm3, env, fn) {
+    log("FJB_THREAD_TRANSITION_BEGIN");
     const perform = getArtThreadStateTransitionImpl(vm3, env);
+    log("FJB_THREAD_TRANSITION_IMPL_DONE");
     const id = getArtThreadFromEnv(env).toString();
+    log("FJB_THREAD_TRANSITION_ID_DONE");
     artThreadStateTransitions[id] = fn;
+    log("FJB_THREAD_TRANSITION_CALL_BEGIN");
     perform(env.handle);
+    log("FJB_THREAD_TRANSITION_CALL_DONE");
     if (artThreadStateTransitions[id] !== void 0) {
       delete artThreadStateTransitions[id];
       throw new Error("Unable to perform state transition; please file a bug");
@@ -2353,7 +2415,9 @@ var __fjb = (() => {
   };
   function makeArtClassVisitor(visit) {
     const api2 = getApi();
-    if (api2["art::ClassLinker::VisitClasses"] instanceof NativeFunction) {
+    if (api2["art::ClassLinker::VisitClasses"] instanceof NativeFunction ||
+        (api2["art::ClassLinker::VisitClasses"] !== void 0 &&
+         api2["art::ClassLinker::VisitClasses"].__green_native_function === true)) {
       return new ArtClassVisitor(visit);
     }
     return new NativeCallback((klass) => {
@@ -2544,8 +2608,6 @@ var __fjb = (() => {
     return arch === "arm" ? thunk.or(1) : thunk;
   }
   function notifyArtMethodHooked(method, vm3) {
-    ensureArtKnowsHowToHandleMethodInstrumentation(vm3);
-    ensureArtKnowsHowToHandleReplacementMethods(vm3);
   }
   function makeArtController(api2, vm3) {
     const threadOffsets = getArtThreadSpec(vm3).offset;
@@ -2814,501 +2876,6 @@ on_leave_gc_concurrent_copying_copying_phase (GumInvocationContext * ic)
         }
       }
     };
-  }
-  function ensureArtKnowsHowToHandleMethodInstrumentation(vm3) {
-    if (taughtArtAboutMethodInstrumentation) {
-      return;
-    }
-    taughtArtAboutMethodInstrumentation = true;
-    instrumentArtQuickEntrypoints(vm3);
-    instrumentArtMethodInvocationFromInterpreter();
-    instrumentArtGarbageCollection();
-    instrumentArtFixupStaticTrampolines();
-  }
-  function instrumentArtQuickEntrypoints(vm3) {
-    const api2 = getApi();
-    const quickEntrypoints = [
-      api2.artQuickGenericJniTrampoline,
-      api2.artQuickToInterpreterBridge,
-      api2.artQuickResolutionTrampoline
-    ];
-    quickEntrypoints.forEach((entrypoint) => {
-      Memory.protect(entrypoint, 32, "rwx");
-      const interceptor = new ArtQuickCodeInterceptor(entrypoint);
-      interceptor.activate(vm3);
-      artQuickInterceptors.push(interceptor);
-    });
-  }
-  function instrumentArtMethodInvocationFromInterpreter() {
-    const api2 = getApi();
-    const apiLevel = getAndroidApiLevel();
-    const { isApiLevel34OrApexEquivalent } = api2;
-    let artInterpreterDoCallExportRegex;
-    if (apiLevel <= 22) {
-      artInterpreterDoCallExportRegex = /^_ZN3art11interpreter6DoCallILb[0-1]ELb[0-1]EEEbPNS_6mirror9ArtMethodEPNS_6ThreadERNS_11ShadowFrameEPKNS_11InstructionEtPNS_6JValueE$/;
-    } else if (apiLevel <= 33 && !isApiLevel34OrApexEquivalent) {
-      artInterpreterDoCallExportRegex = /^_ZN3art11interpreter6DoCallILb[0-1]ELb[0-1]EEEbPNS_9ArtMethodEPNS_6ThreadERNS_11ShadowFrameEPKNS_11InstructionEtPNS_6JValueE$/;
-    } else if (isApiLevel34OrApexEquivalent) {
-      artInterpreterDoCallExportRegex = /^_ZN3art11interpreter6DoCallILb[0-1]EEEbPNS_9ArtMethodEPNS_6ThreadERNS_11ShadowFrameEPKNS_11InstructionEtbPNS_6JValueE$/;
-    } else {
-      throw new Error("Unable to find method invocation in ART; please file a bug");
-    }
-    const art = api2.module;
-    const entries = [...art.enumerateExports(), ...art.enumerateSymbols()].filter((entry) => artInterpreterDoCallExportRegex.test(entry.name));
-    if (entries.length === 0) {
-      throw new Error("Unable to find method invocation in ART; please file a bug");
-    }
-    for (const entry of entries) {
-      Interceptor.attach(entry.address, artController.hooks.Interpreter.doCall);
-    }
-  }
-  function instrumentArtGarbageCollection() {
-    const api2 = getApi();
-    const art = api2.module;
-    const gc = art.findSymbolByName("_ZN3art2gc4Heap22CollectGarbageInternalENS0_9collector6GcTypeENS0_7GcCauseEbj");
-    if (gc === null) {
-      return;
-    }
-    const { artNterpEntryPoint, artQuickToInterpreterBridge } = api2;
-    const quickCodeOffset = getArtMethodSpec(api2.vm).offset.quickCode;
-    Interceptor.attach(gc, {
-      onLeave() {
-        artController.replacedMethods.synchronize(quickCodeOffset, artNterpEntryPoint, artQuickToInterpreterBridge);
-      }
-    });
-  }
-  function instrumentArtFixupStaticTrampolines() {
-    const patterns = [
-      ["_ZN3art11ClassLinker26VisiblyInitializedCallback22MarkVisiblyInitializedEPNS_6ThreadE", "e90340f8 : ff0ff0ff"],
-      ["_ZN3art11ClassLinker26VisiblyInitializedCallback29AdjustThreadVisibilityCounterEPNS_6ThreadEl", "7f0f00f9 : 1ffcffff"]
-    ];
-    const api2 = getApi();
-    const art = api2.module;
-    for (const [name, pattern] of patterns) {
-      const base = art.findSymbolByName(name);
-      if (base === null) {
-        continue;
-      }
-      const matches = Memory.scanSync(base, 8192, pattern);
-      if (matches.length === 0) {
-        return;
-      }
-      const { artNterpEntryPoint, artQuickToInterpreterBridge } = api2;
-      const quickCodeOffset = getArtMethodSpec(api2.vm).offset.quickCode;
-      Interceptor.attach(matches[0].address, function() {
-        artController.replacedMethods.synchronize(quickCodeOffset, artNterpEntryPoint, artQuickToInterpreterBridge);
-      });
-      return;
-    }
-  }
-  function ensureArtKnowsHowToHandleReplacementMethods(vm3) {
-    if (taughtArtAboutReplacementMethods) {
-      return;
-    }
-    taughtArtAboutReplacementMethods = true;
-    if (!maybeInstrumentGetOatQuickMethodHeaderInlineCopies()) {
-      const { getOatQuickMethodHeaderImpl } = artController;
-      if (getOatQuickMethodHeaderImpl === null) {
-        return;
-      }
-      try {
-        Interceptor.replace(getOatQuickMethodHeaderImpl, artController.hooks.ArtMethod.getOatQuickMethodHeader);
-      } catch (e) {
-      }
-    }
-    const apiLevel = getAndroidApiLevel();
-    let copyingPhase = null;
-    const api2 = getApi();
-    if (apiLevel > 28) {
-      copyingPhase = api2.find("_ZN3art2gc9collector17ConcurrentCopying12CopyingPhaseEv");
-    } else if (apiLevel > 22) {
-      copyingPhase = api2.find("_ZN3art2gc9collector17ConcurrentCopying12MarkingPhaseEv");
-    }
-    if (copyingPhase !== null) {
-      Interceptor.attach(copyingPhase, artController.hooks.Gc.copyingPhase);
-    }
-    let runFlip = null;
-    runFlip = api2.find("_ZN3art6Thread15RunFlipFunctionEPS0_");
-    if (runFlip === null) {
-      runFlip = api2.find("_ZN3art6Thread15RunFlipFunctionEPS0_b");
-    }
-    if (runFlip !== null) {
-      Interceptor.attach(runFlip, artController.hooks.Gc.runFlip);
-    }
-  }
-  var artGetOatQuickMethodHeaderInlinedCopyHandler = {
-    arm: {
-      signatures: [
-        {
-          pattern: [
-            "b0 68",
-            // ldr r0, [r6, #8]
-            "01 30",
-            // adds r0, #1
-            "0c d0",
-            // beq #0x16fcd4
-            "1b 98",
-            // ldr r0, [sp, #0x6c]
-            ":",
-            "c0 ff",
-            "c0 ff",
-            "00 ff",
-            "00 2f"
-          ],
-          validateMatch: validateGetOatQuickMethodHeaderInlinedMatchArm
-        },
-        {
-          pattern: [
-            "d8 f8 08 00",
-            // ldr r0, [r8, #8]
-            "01 30",
-            // adds r0, #1
-            "0c d0",
-            // beq #0x16fcd4
-            "1b 98",
-            // ldr r0, [sp, #0x6c]
-            ":",
-            "f0 ff ff 0f",
-            "ff ff",
-            "00 ff",
-            "00 2f"
-          ],
-          validateMatch: validateGetOatQuickMethodHeaderInlinedMatchArm
-        },
-        {
-          pattern: [
-            "b0 68",
-            // ldr r0, [r6, #8]
-            "01 30",
-            // adds r0, #1
-            "40 f0 c3 80",
-            // bne #0x203bf0
-            "00 25",
-            // movs r5, #0
-            ":",
-            "c0 ff",
-            "c0 ff",
-            "c0 fb 00 d0",
-            "ff f8"
-          ],
-          validateMatch: validateGetOatQuickMethodHeaderInlinedMatchArm
-        }
-      ],
-      instrument: instrumentGetOatQuickMethodHeaderInlinedCopyArm
-    },
-    arm64: {
-      signatures: [
-        {
-          pattern: [
-            /* e8 */
-            "0a 40 b9",
-            // ldr w8, [x23, #0x8]
-            "1f 05 00 31",
-            // cmn w8, #0x1
-            "40 01 00 54",
-            // b.eq 0x2e4204
-            "88 39 00 f0",
-            // adrp x8, 0xa17000
-            ":",
-            /* 00 */
-            "fc ff ff",
-            "1f fc ff ff",
-            "1f 00 00 ff",
-            "00 00 00 9f"
-          ],
-          offset: 1,
-          validateMatch: validateGetOatQuickMethodHeaderInlinedMatchArm64
-        },
-        {
-          pattern: [
-            /* e8 */
-            "0a 40 b9",
-            // ldr w8, [x?, #0x8]
-            "1f 05 00 31",
-            // cmn w8, #0x1
-            "40 01 00 54",
-            // b.eq <target>
-            "00 0e 40 f9",
-            // ldr x?, [x?, #0x18]
-            ":",
-            /* 00 */
-            "fc ff ff",
-            "1f fc ff ff",
-            "1f 00 00 ff",
-            "00 fc ff ff"
-          ],
-          offset: 1,
-          validateMatch: validateGetOatQuickMethodHeaderInlinedMatchArm64
-        },
-        {
-          pattern: [
-            /* e8 */
-            "0a 40 b9",
-            // ldr w8, [x23, #0x8]
-            "1f 05 00 31",
-            // cmn w8, #0x1
-            "01 34 00 54",
-            // b.ne 0x3d8e50
-            "e0 03 1f aa",
-            // mov x0, xzr
-            ":",
-            /* 00 */
-            "fc ff ff",
-            "1f fc ff ff",
-            "1f 00 00 ff",
-            "e0 ff ff ff"
-          ],
-          offset: 1,
-          validateMatch: validateGetOatQuickMethodHeaderInlinedMatchArm64
-        }
-      ],
-      instrument: instrumentGetOatQuickMethodHeaderInlinedCopyArm64
-    }
-  };
-  function validateGetOatQuickMethodHeaderInlinedMatchArm({ address, size }) {
-    const ldr = Instruction.parse(address.or(1));
-    const [ldrDst, ldrSrc] = ldr.operands;
-    const methodReg = ldrSrc.value.base;
-    const scratchReg = ldrDst.value;
-    const branch = Instruction.parse(ldr.next.add(2));
-    const targetWhenTrue = ptr(branch.operands[0].value);
-    const targetWhenFalse = branch.address.add(branch.size);
-    let targetWhenRegularMethod, targetWhenRuntimeMethod;
-    if (branch.mnemonic === "beq") {
-      targetWhenRegularMethod = targetWhenFalse;
-      targetWhenRuntimeMethod = targetWhenTrue;
-    } else {
-      targetWhenRegularMethod = targetWhenTrue;
-      targetWhenRuntimeMethod = targetWhenFalse;
-    }
-    return parseInstructionsAt(targetWhenRegularMethod.or(1), tryParse, { limit: 3 });
-    function tryParse(insn) {
-      const { mnemonic } = insn;
-      if (!(mnemonic === "ldr" || mnemonic === "ldr.w")) {
-        return null;
-      }
-      const { base, disp } = insn.operands[1].value;
-      if (!(base === methodReg && disp === 20)) {
-        return null;
-      }
-      return {
-        methodReg,
-        scratchReg,
-        target: {
-          whenTrue: targetWhenTrue,
-          whenRegularMethod: targetWhenRegularMethod,
-          whenRuntimeMethod: targetWhenRuntimeMethod
-        }
-      };
-    }
-  }
-  function validateGetOatQuickMethodHeaderInlinedMatchArm64({ address, size }) {
-    const [ldrDst, ldrSrc] = Instruction.parse(address).operands;
-    const methodReg = ldrSrc.value.base;
-    const scratchReg = "x" + ldrDst.value.substring(1);
-    const branch = Instruction.parse(address.add(8));
-    const targetWhenTrue = ptr(branch.operands[0].value);
-    const targetWhenFalse = address.add(12);
-    let targetWhenRegularMethod, targetWhenRuntimeMethod;
-    if (branch.mnemonic === "b.eq") {
-      targetWhenRegularMethod = targetWhenFalse;
-      targetWhenRuntimeMethod = targetWhenTrue;
-    } else {
-      targetWhenRegularMethod = targetWhenTrue;
-      targetWhenRuntimeMethod = targetWhenFalse;
-    }
-    return parseInstructionsAt(targetWhenRegularMethod, tryParse, { limit: 3 });
-    function tryParse(insn) {
-      if (insn.mnemonic !== "ldr") {
-        return null;
-      }
-      const { base, disp } = insn.operands[1].value;
-      if (!(base === methodReg && disp === 24)) {
-        return null;
-      }
-      return {
-        methodReg,
-        scratchReg,
-        target: {
-          whenTrue: targetWhenTrue,
-          whenRegularMethod: targetWhenRegularMethod,
-          whenRuntimeMethod: targetWhenRuntimeMethod
-        }
-      };
-    }
-  }
-  function maybeInstrumentGetOatQuickMethodHeaderInlineCopies() {
-    if (getAndroidApiLevel() < 31) {
-      return false;
-    }
-    const handler = artGetOatQuickMethodHeaderInlinedCopyHandler[Process.arch];
-    if (handler === void 0) {
-      return false;
-    }
-    const signatures = handler.signatures.map(({ pattern, offset = 0, validateMatch = returnEmptyObject }) => {
-      return {
-        pattern: new MatchPattern(pattern.join("")),
-        offset,
-        validateMatch
-      };
-    });
-    const impls = [];
-    for (const { base, size } of getApi().module.enumerateRanges("--x")) {
-      for (const { pattern, offset, validateMatch } of signatures) {
-        const matches = Memory.scanSync(base, size, pattern).map(({ address, size: size2 }) => {
-          return { address: address.sub(offset), size: size2 + offset };
-        }).filter((match) => {
-          const validationResult = validateMatch(match);
-          if (validationResult === null) {
-            return false;
-          }
-          match.validationResult = validationResult;
-          return true;
-        });
-        impls.push(...matches);
-      }
-    }
-    if (impls.length === 0) {
-      return false;
-    }
-    impls.forEach(handler.instrument);
-    return true;
-  }
-  function returnEmptyObject() {
-    return {};
-  }
-  var InlineHook = class {
-    constructor(address, size, trampoline) {
-      this.address = address;
-      this.size = size;
-      this.originalCode = address.readByteArray(size);
-      this.trampoline = trampoline;
-    }
-    revert() {
-      Memory.patchCode(this.address, this.size, (code2) => {
-        code2.writeByteArray(this.originalCode);
-      });
-    }
-  };
-  function instrumentGetOatQuickMethodHeaderInlinedCopyArm({ address, size, validationResult }) {
-    const { methodReg, target } = validationResult;
-    const trampoline = Memory.alloc(Process.pageSize);
-    let redirectCapacity = size;
-    Memory.patchCode(trampoline, 256, (code2) => {
-      const writer = new ThumbWriter(code2, { pc: trampoline });
-      const relocator = new ThumbRelocator(address, writer);
-      for (let i = 0; i !== 2; i++) {
-        relocator.readOne();
-      }
-      relocator.writeAll();
-      relocator.readOne();
-      relocator.skipOne();
-      writer.putBCondLabel("eq", "runtime_or_replacement_method");
-      const vpushFpRegs = [45, 237, 16, 10];
-      writer.putBytes(vpushFpRegs);
-      const savedRegs = ["r0", "r1", "r2", "r3"];
-      writer.putPushRegs(savedRegs);
-      writer.putCallAddressWithArguments(artController.replacedMethods.isReplacement, [methodReg]);
-      writer.putCmpRegImm("r0", 0);
-      writer.putPopRegs(savedRegs);
-      const vpopFpRegs = [189, 236, 16, 10];
-      writer.putBytes(vpopFpRegs);
-      writer.putBCondLabel("ne", "runtime_or_replacement_method");
-      writer.putBLabel("regular_method");
-      relocator.readOne();
-      const tailIsRegular = relocator.input.address.equals(target.whenRegularMethod);
-      writer.putLabel(tailIsRegular ? "regular_method" : "runtime_or_replacement_method");
-      relocator.writeOne();
-      while (redirectCapacity < 10) {
-        const offset = relocator.readOne();
-        if (offset === 0) {
-          redirectCapacity = 10;
-          break;
-        }
-        redirectCapacity = offset;
-      }
-      relocator.writeAll();
-      writer.putBranchAddress(address.add(redirectCapacity + 1));
-      writer.putLabel(tailIsRegular ? "runtime_or_replacement_method" : "regular_method");
-      writer.putBranchAddress(target.whenTrue);
-      writer.flush();
-    });
-    inlineHooks.push(new InlineHook(address, redirectCapacity, trampoline));
-    Memory.patchCode(address, redirectCapacity, (code2) => {
-      const writer = new ThumbWriter(code2, { pc: address });
-      writer.putLdrRegAddress("pc", trampoline.or(1));
-      writer.flush();
-    });
-  }
-  function instrumentGetOatQuickMethodHeaderInlinedCopyArm64({ address, size, validationResult }) {
-    const { methodReg, scratchReg, target } = validationResult;
-    const trampoline = Memory.alloc(Process.pageSize);
-    Memory.patchCode(trampoline, 256, (code2) => {
-      const writer = new Arm64Writer(code2, { pc: trampoline });
-      const relocator = new Arm64Relocator(address, writer);
-      for (let i = 0; i !== 2; i++) {
-        relocator.readOne();
-      }
-      relocator.writeAll();
-      relocator.readOne();
-      relocator.skipOne();
-      writer.putBCondLabel("eq", "runtime_or_replacement_method");
-      const savedRegs = [
-        "d0",
-        "d1",
-        "d2",
-        "d3",
-        "d4",
-        "d5",
-        "d6",
-        "d7",
-        "x0",
-        "x1",
-        "x2",
-        "x3",
-        "x4",
-        "x5",
-        "x6",
-        "x7",
-        "x8",
-        "x9",
-        "x10",
-        "x11",
-        "x12",
-        "x13",
-        "x14",
-        "x15",
-        "x16",
-        "x17"
-      ];
-      const numSavedRegs = savedRegs.length;
-      for (let i = 0; i !== numSavedRegs; i += 2) {
-        writer.putPushRegReg(savedRegs[i], savedRegs[i + 1]);
-      }
-      writer.putCallAddressWithArguments(artController.replacedMethods.isReplacement, [methodReg]);
-      writer.putCmpRegReg("x0", "xzr");
-      for (let i = numSavedRegs - 2; i >= 0; i -= 2) {
-        writer.putPopRegReg(savedRegs[i], savedRegs[i + 1]);
-      }
-      writer.putBCondLabel("ne", "runtime_or_replacement_method");
-      writer.putBLabel("regular_method");
-      relocator.readOne();
-      const tailInstruction = relocator.input;
-      const tailIsRegular = tailInstruction.address.equals(target.whenRegularMethod);
-      writer.putLabel(tailIsRegular ? "regular_method" : "runtime_or_replacement_method");
-      relocator.writeOne();
-      writer.putBranchAddress(tailInstruction.next);
-      writer.putLabel(tailIsRegular ? "runtime_or_replacement_method" : "regular_method");
-      writer.putBranchAddress(target.whenTrue);
-      writer.flush();
-    });
-    inlineHooks.push(new InlineHook(address, size, trampoline));
-    Memory.patchCode(address, size, (code2) => {
-      const writer = new Arm64Writer(code2, { pc: address });
-      writer.putLdrRegAddress(scratchReg, trampoline);
-      writer.putBrReg(scratchReg);
-      writer.flush();
-    });
   }
   function makeMethodMangler(methodId) {
     return new MethodMangler(methodId);
@@ -5217,14 +4784,6 @@ std_string_get_data (StdString * str)
   }
   function throwThreadStateTransitionParseError() {
     throw new Error("Unable to parse ART internals; please file a bug");
-  }
-  function fixupArtQuickDeliverExceptionBug(api2) {
-    const prettyMethod = api2["art::ArtMethod::PrettyMethod"];
-    if (prettyMethod === void 0) {
-      return;
-    }
-    Interceptor.attach(prettyMethod.impl, artController.hooks.ArtMethod.prettyMethod);
-    Interceptor.flush();
   }
   function branchLabelFromOperand(op) {
     return ptr(op.value).toString();
@@ -7626,9 +7185,18 @@ std_string_c_str (StdString * self)
   var unwrap = null;
   var Model = class _Model {
     static build(handle, env) {
+      log("FJB_MODEL_BUILD_ENTER");
       ensureInitialized(env);
+      log("FJB_MODEL_INIT_OK");
       return unwrap(handle, env, (object) => {
-        return new _Model(cm.new(handle, object, env));
+        log("FJB_MODEL_UNWRAP_OK");
+        /* NativeFunction's pointer arguments only coerce NativePointer
+         * values; passing the Env wrapper object itself becomes a null/invalid
+         * native argument in the QuickJS port.  CModule expects JNIEnv *.
+         */
+        const model = cm.new(handle, object, env.handle);
+        log("FJB_MODEL_NEW_OK");
+        return new _Model(model);
       });
     }
     static enumerateMethods(query, api2, env) {
@@ -7656,7 +7224,7 @@ std_string_c_str (StdString * self)
           boolToNative(includeSignature),
           boolToNative(ignoreCase),
           boolToNative(skipSystemClasses),
-          env
+          env.handle
         );
         try {
           result = JSON.parse(json.readUtf8String()).map((group) => {
@@ -7698,7 +7266,9 @@ std_string_c_str (StdString * self)
       return cm.has(this.handle, Memory.allocUtf8String(member)) !== 0;
     }
     find(member) {
-      return cm.find(this.handle, Memory.allocUtf8String(member)).readUtf8String();
+      const result = cm.find(this.handle, Memory.allocUtf8String(member));
+      log("FJB_MODEL_FIND member=" + member + " model=" + this.handle + " result=" + result);
+      return result.isNull() ? null : result.readUtf8String();
     }
     list() {
       const str = cm.list(this.handle);
@@ -7710,13 +7280,19 @@ std_string_c_str (StdString * self)
     }
   };
   function ensureInitialized(env) {
+    log("FJB_ENSURE_ENTER cm=" + (cm !== null));
     if (cm === null) {
+      log("FJB_COMPILE_ENTER");
       cm = compileModule(env);
+      log("FJB_COMPILE_DONE");
       unwrap = makeHandleUnwrapper(cm, env.vm);
     }
+    log("FJB_ENSURE_DONE");
   }
   function compileModule(env) {
+    log("FJB_COMPILE_START");
     const api2 = api_default();
+    log("FJB_COMPILE_API");
     const { jvmti = null } = api2;
     const { pointerSize: pointerSize9 } = Process;
     const lockSize = 8;
@@ -7728,9 +7304,15 @@ std_string_c_str (StdString * self)
     const lock = data;
     const models = lock.add(lockSize);
     const javaApi = models.add(modelsSize);
+    log("FJB_COMPILE_CLASS_BEGIN");
     const { getDeclaredMethods, getDeclaredFields } = env.javaLangClass();
+    log("FJB_COMPILE_CLASS_DONE");
+    log("FJB_COMPILE_METHOD_BEGIN");
     const method = env.javaLangReflectMethod();
+    log("FJB_COMPILE_METHOD_DONE");
+    log("FJB_COMPILE_FIELD_BEGIN");
     const field = env.javaLangReflectField();
+    log("FJB_COMPILE_FIELD_DONE");
     let j = javaApi;
     [
       jvmti !== null ? jvmti : NULL,
@@ -7750,11 +7332,17 @@ std_string_c_str (StdString * self)
       if (jvmti !== null) {
         artClassOffsets = [0, 0, 0, 0];
       } else {
+        log("FJB_COMPILE_ARTCLASS_BEGIN");
         const c = getArtClassSpec(vm3).offset;
+        log("FJB_COMPILE_ARTCLASS_DONE");
         artClassOffsets = [c.ifields, c.methods, c.sfields, c.copiedMethodsOffset];
       }
+      log("FJB_COMPILE_ARTMETHOD_BEGIN");
       const m = getArtMethodSpec(vm3);
+      log("FJB_COMPILE_ARTMETHOD_DONE");
+      log("FJB_COMPILE_ARTFIELD_BEGIN");
       const f = getArtFieldSpec(vm3);
+      log("FJB_COMPILE_ARTFIELD_DONE");
       let s = artApi;
       [
         1,
@@ -7780,6 +7368,7 @@ std_string_c_str (StdString * self)
         s = s.writePointer(value).add(pointerSize9);
       });
     }
+    log("FJB_COMPILE_CMODULE");
     const cm2 = new CModule(code, {
       lock,
       models,
@@ -7788,6 +7377,7 @@ std_string_c_str (StdString * self)
     });
     const reentrantOptions = { exceptions: "propagate" };
     const fastOptions = { exceptions: "propagate", scheduling: "exclusive" };
+    log("FJB_COMPILE_RETURN");
     return {
       handle: cm2,
       new: new NativeFunction(cm2.model_new, "pointer", ["pointer", "pointer", "pointer"], reentrantOptions),
@@ -7818,12 +7408,12 @@ std_string_c_str (StdString * self)
     }
     const decodeGlobal = api2["art::JavaVMExt::DecodeGlobal"];
     return function(handle, env, fn) {
-      let result;
-      withRunnableArtThread(vm3, env, (thread) => {
-        const object = decodeGlobal(vm3, thread, handle);
-        result = fn(object);
-      });
-      return result;
+      /* The injected QuickJS worker is already attached to ART.  On Android
+       * 15 the ExceptionClear-based state-transition thunk used by
+       * withRunnableArtThread() does not return, so decode the JNI handle
+       * directly on the current ART thread. */
+      const thread = getArtThreadFromEnv(env);
+      return fn(decodeGlobal(vm3, thread, handle));
     };
   }
   function nullUnwrap(handle, env, fn) {
@@ -11685,10 +11275,13 @@ std_string_c_str (StdString * self)
     }
     performNow(fn) {
       this._checkAvailable();
+      log("FJB_PERFORM_NOW_BEGIN");
       return this.vm.perform(() => {
         const { classFactory: factory } = this;
         if (this._isAppProcess() && factory.loader === null) {
+          log("FJB_ACTIVITY_USE_BEGIN");
           const ActivityThread = factory.use("android.app.ActivityThread");
+          log("FJB_ACTIVITY_USE_DONE");
           const app = ActivityThread.currentApplication();
           if (app !== null) {
             initFactoryFromApplication(factory, app);

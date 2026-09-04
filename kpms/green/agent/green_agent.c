@@ -20,7 +20,8 @@ struct green_range { uint64_t lo, hi; int prot; };
 static struct green_range g_maps_ranges[4096];
 static int g_maps_count;
 
-static void green_maps_refresh(void)
+__attribute__((visibility("default")))
+void green_maps_refresh(void)
 {
     FILE *f = fopen("/proc/self/maps", "re");
     char line[512];
@@ -45,7 +46,23 @@ static void green_maps_refresh(void)
     g_maps_count = n;
 }
 
-static int green_addr_ok(uint64_t addr, size_t len, int need)
+int green_addr_ok(uint64_t addr, size_t len, int need);
+
+__attribute__((visibility("default")))
+int green_maps_addr_readable(uint64_t addr, size_t len)
+{
+    if (g_maps_count == 0)
+        green_maps_refresh();
+    if (!green_addr_ok(addr, len, 1)) {
+        green_maps_refresh();
+        if (!green_addr_ok(addr, len, 1))
+            return 0;
+    }
+    return 1;
+}
+
+__attribute__((visibility("default")))
+int green_addr_ok(uint64_t addr, size_t len, int need)
 {
     int i;
 
@@ -62,6 +79,8 @@ static int green_addr_ok(uint64_t addr, size_t len, int need)
 
 #define GREEN_PROT_R 1
 #define GREEN_PROT_W 2
+
+
 
 /* dlopen() handle table: PAC-signed soinfo pointers cannot survive a JS
  * Number round-trip, so scripts only ever see 1-based table IDs. */
@@ -84,6 +103,21 @@ static void *g_dl_handles[GREEN_MAX_DLH];
 #include <unistd.h>
 
 #include <quickjs.h>
+
+/* Address arguments may arrive as Number (older scripts) or BigInt
+ * (NativePointer.__v) — Numbers above 2^53 lose precision. */
+static int js_to_addr(JSContext *ctx, JSValueConst v, uint64_t *out)
+{
+    if (JS_IsBigInt(ctx, v)) {
+        JS_ToBigInt64(ctx, (int64_t *)out, v);
+        return 0;
+    }
+    int64_t n = 0;
+    if (JS_ToInt64(ctx, &n, v) != 0)
+        return -1;
+    *out = (uint64_t)n;
+    return 0;
+}
 #include <gum/arch-arm64/gumarm64writer.h>
 #include <gum/arch-arm64/gumarm64relocator.h>
 #include <gum/arch-arm64/gumarm64reader.h>
@@ -114,6 +148,15 @@ JSContext *g_js_ctx;
 pthread_mutex_t g_js_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static JSValue g_js_fn;
 static int g_js_ready;
+static int green_js_to_i64(JSContext *ctx, JSValueConst value, int64_t *out)
+{
+    /* QuickJS keeps pointer-sized/native return values as BigInt.  Its
+     * Number conversion helper does not reliably accept BigInt and may
+     * silently write zero, which breaks Interceptor.onLeave return flow. */
+    if (JS_IsBigInt(ctx, value))
+        return JS_ToBigInt64(ctx, out, value);
+    return JS_ToInt64(ctx, out, value);
+}
 static int green_agent_test_target(int value);
 static int green_agent_broker_request_full(uint32_t command, uint64_t addr,
                                            uint64_t arg, const void *payload,
@@ -150,7 +193,7 @@ __attribute__((noinline)) int64_t green_agent_js_trampoline(
     args = JS_NewArray(g_js_ctx);
     for (int i = 0; i < 8; i++)
         JS_SetPropertyUint32(g_js_ctx, args, (uint32_t)i,
-                             JS_NewInt64(g_js_ctx, vals[i]));
+                             JS_NewBigInt64(g_js_ctx, vals[i]));
     argv[0] = args;
     rv = JS_Call(g_js_ctx, g_js_fn, JS_UNDEFINED, 1, argv);
     if (JS_IsException(rv)) {
@@ -163,7 +206,7 @@ __attribute__((noinline)) int64_t green_agent_js_trampoline(
         JS_FreeValue(g_js_ctx, exc);
     } else {
         int64_t v = 0;
-        JS_ToInt64(g_js_ctx, &v, rv);
+        green_js_to_i64(g_js_ctx, rv, &v);
         out = v;
     }
     JS_FreeValue(g_js_ctx, rv);
@@ -1003,7 +1046,7 @@ static JSValue js_native_mem_read(JSContext *ctx, JSValueConst this_val,
     ssize_t n;
 
     (void)this_val;
-    if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0 ||
+    if (argc < 2 || js_to_addr(ctx, argv[0], &address) != 0 ||
         JS_ToInt64(ctx, &length, argv[1]) != 0 || length <= 0 ||
         length > (int64_t)sizeof(membuf))
         return JS_NULL;
@@ -1029,7 +1072,7 @@ static JSValue js_native_read_utf8(JSContext *ctx, JSValueConst this_val,
     ssize_t n;
 
     (void)this_val;
-    if (argc < 1 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0)
+    if (argc < 1 || js_to_addr(ctx, argv[0], &address) != 0)
         return JS_NULL;
     address = GREEN_UNTAG(address);
     if (argc >= 2 &&
@@ -1071,6 +1114,9 @@ static int js_ensure_runtime(char *err, size_t errlen)
             snprintf(err, errlen, "JS_NewRuntime failed");
             return -1;
         }
+        /* fjb's class-load path goes JS -> JNI -> JS callbacks; the
+         * default stack limit is too small on the eval thread. */
+        JS_SetMaxStackSize(g_js_rt, 8 * 1024 * 1024);
         g_js_ctx = JS_NewContext(g_js_rt);
         if (!g_js_ctx) {
             JS_FreeRuntime(g_js_rt);
@@ -1180,8 +1226,14 @@ static int js_ensure_runtime(char *err, size_t errlen)
                                                           JSValue);
                 extern void green_insn_register_natives(JSContext *,
                                                         JSValue);
+                extern void green_relocator_register_natives(JSContext *,
+                                                             JSValue);
+                extern void green_java_register_natives(JSContext *,
+                                                        JSValue);
                 green_writer_register_natives(g_js_ctx, global);
                 green_insn_register_natives(g_js_ctx, global);
+                green_relocator_register_natives(g_js_ctx, global);
+                green_java_register_natives(g_js_ctx, global);
             }
             JS_FreeValue(g_js_ctx, global);
         }
@@ -1226,7 +1278,15 @@ static int js_ensure_runtime(char *err, size_t errlen)
         {
             static const char kFjbGlue[] =
                 "globalThis.Java = globalThis.__fjb.default; "
-                "delete globalThis.__fjb;";
+                "delete globalThis.__fjb; "
+                "try { Java.vm.attachCurrentThread(); } catch (e) {} "
+                "try { var __env = Java.vm.getEnv(); "
+                "var __ep = Object.getPrototypeOf(__env); "
+                "__ep.releaseStringChars = function () {}; "
+                "__ep.releaseStringUTFChars = function () {}; "
+                "} catch (e) {} "
+                "if (typeof __gj_install_use_wrapper === 'function') "
+                "__gj_install_use_wrapper();";
             JSValue glue = JS_Eval(g_js_ctx, kFjbGlue, strlen(kFjbGlue),
                                    "<fjb-glue>", JS_EVAL_TYPE_GLOBAL);
             if (JS_IsException(glue)) {
@@ -1935,8 +1995,15 @@ __attribute__((naked)) int64_t green_call_asm(const void *fn,
 #define GREEN_MAX_CBS 32
 
 static uint8_t *g_slots;
-static volatile uint32_t g_current_hook_id;
-static volatile uint32_t g_current_cb_id;
+/* The per-slot stubs publish their id in x17 immediately before branching
+ * here.  Do not use a process-global "current id": Java/native callbacks
+ * may run concurrently on different threads. */
+static inline uint32_t green_stub_id(void)
+{
+    uint64_t id;
+    __asm__ volatile("mov %0, x17" : "=r"(id));
+    return (uint32_t)id;
+}
 
 struct green_attach_ctx {
     int used;
@@ -1972,15 +2039,16 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
                                       int64_t a6, int64_t a7)
 {
     struct green_attach_ctx *c;
+    uint32_t hook_id = green_stub_id();
     int64_t vals[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
     int64_t ret;
     JSValue args;
     JSValue argv[1];
     JSValue rv;
 
-    if (g_current_hook_id >= GREEN_MAX_HOOKS)
+    if (hook_id >= GREEN_MAX_HOOKS)
         return 0;
-    c = &g_attach[g_current_hook_id];
+    c = &g_attach[hook_id];
     if (!c->used || !c->orig_cont)
         return 0;
 
@@ -1990,7 +2058,7 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
         args = JS_NewArray(g_js_ctx);
         for (int i = 0; i < 8; i++)
             JS_SetPropertyUint32(g_js_ctx, args, (uint32_t)i,
-                                 JS_NewInt64(g_js_ctx, vals[i]));
+                                 JS_NewBigInt64(g_js_ctx, vals[i]));
         argv[0] = args;
         rv = JS_Call(g_js_ctx, c->onenter, JS_UNDEFINED, 1, argv);
         JS_FreeValue(g_js_ctx, rv);
@@ -2003,7 +2071,7 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
     if (!JS_IsUndefined(c->onleave)) {
         pthread_mutex_lock(&g_js_lock);
         JS_UpdateStackTop(g_js_rt);
-        argv[0] = JS_NewInt64(g_js_ctx, ret);
+        argv[0] = JS_NewBigInt64(g_js_ctx, ret);
         rv = JS_Call(g_js_ctx, c->onleave, JS_UNDEFINED, 1, argv);
         if (JS_IsException(rv)) {
             JSValue exc = JS_GetException(g_js_ctx);
@@ -2014,7 +2082,7 @@ int64_t green_agent_attach_trampoline(int64_t a0, int64_t a1, int64_t a2,
             JS_FreeValue(g_js_ctx, exc);
         } else if (!JS_IsUndefined(rv)) {
             int64_t v = ret;
-            JS_ToInt64(g_js_ctx, &v, rv);
+            green_js_to_i64(g_js_ctx, rv, &v);
             ret = v;
         }
         JS_FreeValue(g_js_ctx, rv);
@@ -2029,15 +2097,16 @@ int64_t green_agent_callback_trampoline(int64_t a0, int64_t a1, int64_t a2,
                                         int64_t a6, int64_t a7)
 {
     struct green_cb_ctx *c;
+    uint32_t cb_id = green_stub_id();
     int64_t vals[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
     int64_t out = 0;
     JSValue args;
     JSValue argv[1];
     JSValue rv;
 
-    if (g_current_cb_id >= GREEN_MAX_CBS)
+    if (cb_id >= GREEN_MAX_CBS)
         return 0;
-    c = &g_cbs[g_current_cb_id];
+    c = &g_cbs[cb_id];
     if (!c->used)
         return 0;
 
@@ -2046,7 +2115,7 @@ int64_t green_agent_callback_trampoline(int64_t a0, int64_t a1, int64_t a2,
     args = JS_NewArray(g_js_ctx);
     for (int i = 0; i < 8; i++)
         JS_SetPropertyUint32(g_js_ctx, args, (uint32_t)i,
-                             JS_NewInt64(g_js_ctx, vals[i]));
+                             JS_NewBigInt64(g_js_ctx, vals[i]));
     argv[0] = args;
     rv = JS_Call(g_js_ctx, c->fn, JS_UNDEFINED, 1, argv);
     if (JS_IsException(rv)) {
@@ -2058,7 +2127,7 @@ int64_t green_agent_callback_trampoline(int64_t a0, int64_t a1, int64_t a2,
             JS_FreeCString(g_js_ctx, msg);
         JS_FreeValue(g_js_ctx, exc);
     } else {
-        JS_ToInt64(g_js_ctx, &out, rv);
+        green_js_to_i64(g_js_ctx, rv, &out);
     }
     JS_FreeValue(g_js_ctx, rv);
     JS_FreeValue(g_js_ctx, args);
@@ -2259,7 +2328,7 @@ static JSValue js_native_mem_write(JSContext *ctx, JSValueConst this_val,
     uint8_t *data;
 
     (void)this_val;
-    if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0)
+    if (argc < 2 || js_to_addr(ctx, argv[0], &address) != 0)
         return JS_FALSE;
     address = GREEN_UNTAG(address);
     data = JS_GetArrayBuffer(ctx, &abuf_size, argv[1]);
@@ -2315,9 +2384,10 @@ static JSValue js_native_mprotect(JSContext *ctx, JSValueConst this_val,
     (void)this_val;
     if (argc < 3 || JS_ToInt64(ctx, (int64_t *)&address, argv[0]) != 0 ||
         JS_ToInt64(ctx, &length, argv[1]) != 0 ||
-        JS_ToInt64(ctx, &prot, argv[2]) != 0)
-    address = GREEN_UNTAG(address);
+        JS_ToInt64(ctx, &prot, argv[2]) != 0) {
         return JS_FALSE;
+    }
+    address = GREEN_UNTAG(address);
     return mprotect((void *)(uintptr_t)address, (size_t)length,
                     (int)prot) == 0 ? JS_TRUE : JS_FALSE;
 }
@@ -2454,15 +2524,20 @@ static JSValue js_native_call(JSContext *ctx, JSValueConst this_val,
     int64_t ret;
 
     (void)this_val;
-    if (argc < 2 || JS_ToInt64(ctx, (int64_t *)&fn, argv[0]) != 0 ||
+    if (argc < 2 || js_to_addr(ctx, argv[0], &fn) != 0 ||
         !JS_IsArray(ctx, argv[1]))
         return JS_ThrowInternalError(ctx, "native_call(fn, args[])");
     for (i = 0; i < 8; i++) {
         item = JS_GetPropertyUint32(ctx, argv[1], (uint32_t)i);
         if (JS_IsException(item))
             return JS_EXCEPTION;
-        if (!JS_IsUndefined(item) && JS_ToInt64(ctx, &v, item) == 0)
+        if (!JS_IsUndefined(item)) {
+            if (JS_IsBigInt(ctx, item))
+                JS_ToBigInt64(ctx, &v, item);
+            else if (JS_ToInt64(ctx, &v, item) != 0)
+                v = 0;
             args[i] = v;
+        }
         JS_FreeValue(ctx, item);
     }
     ret = green_call_asm((const void *)(uintptr_t)fn, args, 8);
