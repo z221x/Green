@@ -29,12 +29,12 @@
     });
     run("memory.primitives", function () {
         var p = Memory.alloc(32);
-        p.writeU8(0xab, 0);
-        p.writeS32(-123456, 4);
-        p.writeU64(0x1234567890n, 8);
+        p.writeU8(0xab);
+        p.add(4).writeS32(-123456);
+        p.add(8).writeU64(uint64("0x1234567890"));
         return eq("u8", p.readU8(), 0xab) &&
-            eq("s32", p.readS32(4), -123456) &&
-            eq("u64", p.readU64(8).toString(16), "1234567890");
+            eq("s32", p.add(4).readS32(), -123456) &&
+            eq("u64", p.add(8).readU64().toString(16), "1234567890");
     });
     run("memory.strings", function () {
         var u8 = Memory.allocUtf8String("green-native");

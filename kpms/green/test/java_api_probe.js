@@ -118,7 +118,7 @@
                     body++;
                     if (depth !== 0) return "<recursion>";
                     depth++;
-                    var original = this.toString();
+                    var original = toString.call(this);
                     depth--;
                     return original + "|hook";
                 };
