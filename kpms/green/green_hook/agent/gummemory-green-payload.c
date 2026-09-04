@@ -50,6 +50,7 @@
 #include <unistd.h>
 
 #define GREEN_GUM_MAX_SNAPSHOT_PAGES 64
+#define GREEN_GUM_MAX_ALLOCATIONS 1024
 
 typedef struct _GreenGumRemap GreenGumRemap;
 
@@ -62,6 +63,104 @@ struct _GreenGumRemap
 
 static GreenGumRemap green_gum_remaps[GREEN_GUM_MAX_SNAPSHOT_PAGES];
 static pthread_mutex_t green_gum_remap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* mprotect() is a permission-changing operation, but allowing it for an
+ * arbitrary address would give a script a direct way to make a target code
+ * page writable and bypass KPM shadow.  Keep a small registry of allocations
+ * owned by Gum so allocator bookkeeping (including Memory.protect on a private
+ * page) continues to work while target mappings are rejected. */
+typedef struct _GreenGumAllocation GreenGumAllocation;
+
+struct _GreenGumAllocation
+{
+  gpointer base;
+  gsize size;
+};
+
+static GreenGumAllocation green_gum_allocations[GREEN_GUM_MAX_ALLOCATIONS];
+static pthread_mutex_t green_gum_allocation_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static gboolean
+green_gum_allocation_add (gpointer base,
+                          gsize size)
+{
+  guint i;
+  gboolean added = FALSE;
+
+  pthread_mutex_lock (&green_gum_allocation_lock);
+  for (i = 0; i != GREEN_GUM_MAX_ALLOCATIONS; i++)
+  {
+    if (green_gum_allocations[i].base == NULL)
+    {
+      green_gum_allocations[i].base = base;
+      green_gum_allocations[i].size = size;
+      added = TRUE;
+      break;
+    }
+  }
+  pthread_mutex_unlock (&green_gum_allocation_lock);
+
+  return added;
+}
+
+static gboolean
+green_gum_allocation_contains (gpointer address,
+                               gsize size)
+{
+  guint i;
+  guintptr start = GPOINTER_TO_SIZE (address);
+  guintptr end;
+  gboolean found = FALSE;
+
+  if (address == NULL || size == 0 ||
+      start > ~(guintptr) 0 - (size - 1))
+    return FALSE;
+  end = start + size;
+
+  pthread_mutex_lock (&green_gum_allocation_lock);
+  for (i = 0; i != GREEN_GUM_MAX_ALLOCATIONS; i++)
+  {
+    guintptr alloc_start;
+    guintptr alloc_end;
+
+    if (green_gum_allocations[i].base == NULL)
+      continue;
+    alloc_start = GPOINTER_TO_SIZE (green_gum_allocations[i].base);
+    alloc_end = alloc_start + green_gum_allocations[i].size;
+    if (start >= alloc_start && end <= alloc_end)
+    {
+      found = TRUE;
+      break;
+    }
+  }
+  pthread_mutex_unlock (&green_gum_allocation_lock);
+
+  return found;
+}
+
+static gboolean
+green_gum_allocation_remove (gpointer base,
+                             gsize size)
+{
+  guint i;
+  gboolean removed = FALSE;
+
+  pthread_mutex_lock (&green_gum_allocation_lock);
+  for (i = 0; i != GREEN_GUM_MAX_ALLOCATIONS; i++)
+  {
+    if (green_gum_allocations[i].base == base &&
+        green_gum_allocations[i].size == size)
+    {
+      green_gum_allocations[i].base = NULL;
+      green_gum_allocations[i].size = 0;
+      removed = TRUE;
+      break;
+    }
+  }
+  pthread_mutex_unlock (&green_gum_allocation_lock);
+
+  return removed;
+}
 
 /* ------------------------------------------------------------------ */
 /* gum backend bootstrap                                              */
@@ -503,10 +602,13 @@ gum_try_mprotect (gpointer address,
   gpointer aligned_address;
   gsize aligned_size;
 
-  if (size == 0)
+  if (address == NULL || size == 0 ||
+      !green_gum_allocation_contains (address, size))
     return FALSE;
 
   page_size = gum_query_page_size ();
+  if (GPOINTER_TO_SIZE (address) > ~(guintptr) 0 - (size - 1))
+    return FALSE;
   aligned_address = GSIZE_TO_POINTER (
       GPOINTER_TO_SIZE (address) & ~(page_size - 1));
   aligned_size =
@@ -560,15 +662,25 @@ gum_memory_allocate (gpointer address,
                      GumPageProtection prot)
 {
   gsize page_size = gum_query_page_size ();
-  gsize allocation_size = (size + page_size - 1) & ~(page_size - 1);
+  gsize allocation_size;
   gpointer base;
 
   (void) alignment;
+
+  if (size == 0 || size > ~(gsize) 0 - (page_size - 1))
+    return NULL;
+  allocation_size = (size + page_size - 1) & ~(page_size - 1);
 
   base = mmap (address, allocation_size, _gum_page_protection_to_posix (prot),
       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (base == MAP_FAILED)
     return NULL;
+
+  if (!green_gum_allocation_add (base, allocation_size))
+  {
+    munmap (base, allocation_size);
+    return NULL;
+  }
 
   return base;
 }
@@ -578,9 +690,22 @@ gum_memory_free (gpointer address,
                  gsize size)
 {
   gsize page_size = gum_query_page_size ();
-  gsize allocation_size = (size + page_size - 1) & ~(page_size - 1);
+  gsize allocation_size;
 
-  return munmap (address, allocation_size) == 0;
+  if (address == NULL || size == 0 ||
+      size > ~(gsize) 0 - (page_size - 1))
+    return FALSE;
+  allocation_size = (size + page_size - 1) & ~(page_size - 1);
+  if (!green_gum_allocation_remove (address, allocation_size))
+    return FALSE;
+
+  if (munmap (address, allocation_size) != 0)
+  {
+    /* Preserve allocator bookkeeping if the kernel rejected the unmap. */
+    (void) green_gum_allocation_add (address, allocation_size);
+    return FALSE;
+  }
+  return TRUE;
 }
 
 gboolean

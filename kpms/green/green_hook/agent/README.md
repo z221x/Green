@@ -19,3 +19,8 @@ prctl(PR_GREEN_SHADOW_REQUEST, token, &rpc, 0, 0);
 ```
 
 There is no broker protocol in this payload.
+
+`Memory.protect()` is retained for pages allocated by Gum itself (for example
+the private code allocator used by Interceptor).  The backend rejects
+unregistered target ranges; changing a target page's bytes or code permissions
+must therefore go through the authenticated shadow path.

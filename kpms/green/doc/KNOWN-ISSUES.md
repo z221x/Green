@@ -12,8 +12,10 @@ not a compatibility claim for every Android kernel.
 - Script evaluation is serialized through the agent control socket and result
   text is bounded by the fixed control response size.
 - The Gum memory backend routes target writes and code patches through KPM.
-  `mmap`/`mprotect` are still used for Gum-owned allocator pages and do not
-  modify another module's code page.
+  `mmap`/`mprotect` are still used for Gum-owned allocator pages.  The
+  `mprotect` seam keeps an allocation registry and rejects ranges that were
+  not allocated by Gum, so a script cannot use `Memory.protect()` to make a
+  target module writable behind the shadow ABI.
 
 ## KPM shadow
 
