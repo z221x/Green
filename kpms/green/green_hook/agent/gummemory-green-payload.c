@@ -40,6 +40,7 @@
 #include <green/abi.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -59,6 +60,7 @@ struct _GreenGumRemap
 };
 
 static GreenGumRemap green_gum_remaps[GREEN_GUM_MAX_SNAPSHOT_PAGES];
+static pthread_mutex_t green_gum_remap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ------------------------------------------------------------------ */
 /* gum backend bootstrap                                              */
@@ -324,6 +326,7 @@ gum_memory_try_remap_writable_pages (gpointer first_page,
       n_pages > GREEN_GUM_MAX_SNAPSHOT_PAGES)
     return NULL;
 
+  pthread_mutex_lock (&green_gum_remap_lock);
   for (i = 0; i != GREEN_GUM_MAX_SNAPSHOT_PAGES; i++)
   {
     if (green_gum_remaps[i].writable == NULL)
@@ -333,7 +336,10 @@ gum_memory_try_remap_writable_pages (gpointer first_page,
     }
   }
   if (slot == NULL)
+  {
+    pthread_mutex_unlock (&green_gum_remap_lock);
     return NULL;
+  }
 
   size = (gsize) n_pages * 4096;
   snapshot = g_malloc (size);
@@ -345,6 +351,7 @@ gum_memory_try_remap_writable_pages (gpointer first_page,
       (gssize) size)
   {
     g_free (snapshot);
+    pthread_mutex_unlock (&green_gum_remap_lock);
     return NULL;
   }
 
@@ -352,6 +359,7 @@ gum_memory_try_remap_writable_pages (gpointer first_page,
   slot->target_page = first_page;
   slot->n_pages = n_pages;
 
+  pthread_mutex_unlock (&green_gum_remap_lock);
   return snapshot;
 }
 
@@ -359,14 +367,20 @@ void
 gum_memory_dispose_writable_pages (gpointer first_page,
                                    guint n_pages)
 {
-  GreenGumRemap * remap = green_gum_remap_find (first_page);
+  GreenGumRemap * remap;
+  gpointer snapshot;
   guint i;
 
+  pthread_mutex_lock (&green_gum_remap_lock);
+  remap = green_gum_remap_find (first_page);
   if (remap == NULL)
   {
+    pthread_mutex_unlock (&green_gum_remap_lock);
     g_free (first_page);
     return;
   }
+
+  snapshot = remap->writable;
 
   /* Commit only bytes changed by the patch callback. A full snapshot read from
    * an execute-only page is the original PFN; sending it back wholesale would
@@ -395,10 +409,11 @@ gum_memory_dispose_writable_pages (gpointer first_page,
     }
   }
 
-  g_free (remap->writable);
   remap->writable = NULL;
   remap->target_page = NULL;
   remap->n_pages = 0;
+  pthread_mutex_unlock (&green_gum_remap_lock);
+  g_free (snapshot);
 }
 
 /* ------------------------------------------------------------------ */
