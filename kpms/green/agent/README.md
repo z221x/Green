@@ -7,6 +7,10 @@
 - `green hook`：root 侧 CLI，负责注入、协议通信、跨进程页面快照、
   GumArm64Writer 重定向编码和 KPM `prctl` 调用。
 
+Java 相关实现集中在 `agent/frida-java-bridge/`：其中的 IIFE 是官方
+`frida-java-bridge` 的 Green 适配构建产物，JNI 辅助代码也位于同一目录；
+`prelude.js` 和 Gum/CModule 绑定属于 Java、Native 共用的宿主兼容层。
+
 ## 权限模型
 
 目标进程内的 agent 不执行特权操作：

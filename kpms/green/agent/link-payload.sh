@@ -29,10 +29,10 @@ out[-1] += ';'
 open('build/prelude.inc','w').write('\n'.join(out) + '\n')
 PYGEN
 
-# Generate fjb.inc from the bundled frida-java-bridge IIFE
+# Generate fjb.inc from the patched frida-java-bridge IIFE
 python3 - <<'PYGEN2'
-src = open('agent/fjb.iife.js').read()
-out = ['/* Auto-generated from fjb.iife.js (frida-java-bridge) - do not edit. */',
+src = open('agent/frida-java-bridge/fjb.iife.js').read()
+out = ['/* Auto-generated from agent/frida-java-bridge/fjb.iife.js (frida-java-bridge) - do not edit. */',
        'static const char kFjbBundle[] =']
 for line in src.split('\n'):
     esc = line.replace('\\','\\\\').replace('"','\\"')
@@ -56,7 +56,7 @@ $CC -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -pthread \
   -I$ROOT/tmp/prefix/include/glib-2.0 -I$ROOT/tmp/prefix/lib/glib-2.0/include \
   -Ivendor/prefix/include/quickjs \
   -o build/libgreen_agent.so \
-  agent/green_agent.c agent/gummemory-green-payload.c agent/gumwriter.c agent/insn.c agent/relocator.c agent/java_bridge.c \
+  agent/green_agent.c agent/gummemory-green-payload.c agent/gumwriter.c agent/insn.c agent/relocator.c agent/frida-java-bridge/java_bridge.c \
   -Wl,--allow-multiple-definition \
   -Wl,--start-group \
   build/gumprofiler-stub.o \

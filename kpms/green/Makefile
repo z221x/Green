@@ -109,8 +109,9 @@ agent: $(AGENT_PAYLOAD)
 
 $(AGENT_PAYLOAD): agent/green_agent.c agent/green_agent.h \
 		agent/gumwriter.c agent/gummemory-green-payload.c \
-		agent/java_bridge.c agent/insn.c agent/relocator.c agent/prelude.js \
-		agent/fjb.iife.js agent/link-payload.sh
+		agent/frida-java-bridge/java_bridge.c agent/insn.c \
+		agent/relocator.c agent/prelude.js \
+		agent/frida-java-bridge/fjb.iife.js agent/link-payload.sh
 	@test -n "$(ANDROID_NDK)" || (echo "ANDROID_NDK not set"; exit 1)
 	@mkdir -p $(dir $@)
 	ANDROID_NDK="$(ANDROID_NDK)" $(SHELL) agent/link-payload.sh

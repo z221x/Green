@@ -43,6 +43,9 @@ kpms/green/
 │   ├── green_agent.c        #   transport + QuickJS + JS API
 │   ├── green_agent.h        #   agent/broker 协议
 │   ├── prelude.js           #   JS API 层（Interceptor/Memory/Module）
+│   ├── frida-java-bridge/   #   官方 bridge bundle + Green Java 适配
+│   │   ├── fjb.iife.js
+│   │   └── java_bridge.c
 │   ├── gummemory-green-payload.c  # broker 内存后端
 │   ├── gumprofiler-stub.c   #   profiler 符号桩
 │   ├── link-payload.sh      #   payload 链接脚本
