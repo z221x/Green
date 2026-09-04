@@ -52,7 +52,7 @@ kpms/green/build/libgreen_agent.so
 
 ```sh
 adb push libgreen_agent.so /data/local/tmp/libgreen_agent.so
-adb push example_hook.js   /data/local/tmp/hook.js
+adb push test/example_hook.js   /data/local/tmp/hook.js
 ```
 
 然后一条命令完成注入 + broker + 脚本加载：

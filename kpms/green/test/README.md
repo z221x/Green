@@ -26,3 +26,4 @@ kpms/green/test/test_java_hook.sh com.example.app
 - `java_api_probe.js`：Java 对象、重载、静态方法/字段、数组、集合和枚举；
 - `java_hook_probe.js`：`String.hashCode` 原始调用与 hook 回归；
 - `native_api_probe.js`：NativePointer、Memory、NativeFunction 和 attach。
+- `example_hook.js`、`demo_app_hook.js`：通用 Native/应用 hook 示例。

@@ -46,10 +46,11 @@ kpms/green/
 │   ├── gummemory-green-payload.c  # broker 内存后端
 │   ├── gumprofiler-stub.c   #   profiler 符号桩
 │   ├── link-payload.sh      #   payload 链接脚本
-│   ├── example_hook.js      #   hook 脚本示例
 │   └── README.md
 ├── test/                    # 回归测试与设备探针
 │   ├── test_hook.c          #   KPM 回归测试
+│   ├── demo_app_hook.js     #   应用 hook 示例
+│   ├── example_hook.js      #   Native hook 示例
 │   ├── test_java_hook.sh    #   设备部署/attach 驱动脚本
 │   ├── java_api_probe.js    #   Java API 回归探针
 │   ├── java_hook_probe.js   #   Java hashCode hook 探针
@@ -112,8 +113,8 @@ Interceptor.attach(openPtr, {
 ```
 
 ```sh
-python3 cli/green.py attach -p <pid> -l agent/example_hook.js
-python3 cli/green.py attach -f com.example.app -l agent/example_hook.js
+python3 cli/green.py attach -p <pid> -l test/example_hook.js
+python3 cli/green.py attach -f com.example.app -l test/example_hook.js
 ```
 
 ## JS API
